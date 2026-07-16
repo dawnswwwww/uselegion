@@ -4,13 +4,14 @@ use async_trait::async_trait;
 
 use crate::auto_extract::AutoExtractor;
 use crate::commitments::CommitmentExtractor;
-use crate::compaction::Compactor;
+use crate::compaction::TwoPassCompactor;
 use crate::memory::MemoryBackend;
 use crate::messenger::AgentMessenger;
 use crate::recall_selector::LlmRecallSelector;
 use crate::subagent::SubagentSpawner;
 use crate::surfaced::SurfacedStore;
 use crate::swarm::SwarmManager;
+use crate::todo_gate::TodoGate;
 use crate::tools::ToolRegistry;
 use crate::types::{RunRequest, RunStream, RuntimeError};
 use legion_core::config::{Config, RecallConfig};
@@ -46,7 +47,7 @@ pub trait ContextEngine: Send + Sync {
 pub struct LegacyContextEngine {
     tool_registry: Arc<dyn ToolRegistry>,
     memory_backend: Arc<dyn MemoryBackend>,
-    compactor: Arc<Compactor>,
+    compactor: Arc<TwoPassCompactor>,
     config: Config,
     plugin_skills: Vec<Skill>,
     auto_extractor: Option<Arc<AutoExtractor>>,
@@ -57,6 +58,7 @@ pub struct LegacyContextEngine {
     spawner: Option<Arc<dyn SubagentSpawner>>,
     messenger: Option<Arc<dyn AgentMessenger>>,
     swarm: Option<Arc<SwarmManager>>,
+    todo_gate: TodoGate,
 }
 
 impl LegacyContextEngine {
@@ -65,8 +67,13 @@ impl LegacyContextEngine {
         memory_backend: Arc<dyn MemoryBackend>,
         config: Config,
     ) -> Self {
-        let compactor = Arc::new(Compactor::new(config.compaction.clone()));
+        let compactor = Arc::new(TwoPassCompactor::new(config.compaction.clone()));
         let recall_config = config.memory.recall.clone();
+        let todo_gate = if config.todos.enabled && config.todos.gate.enabled {
+            TodoGate::new(config.todos.gate.required_patterns.clone())
+        } else {
+            TodoGate::default()
+        };
         Self {
             tool_registry,
             memory_backend,
@@ -81,6 +88,7 @@ impl LegacyContextEngine {
             spawner: None,
             messenger: None,
             swarm: None,
+            todo_gate,
         }
     }
 
@@ -178,6 +186,7 @@ impl ContextEngine for LegacyContextEngine {
         let spawner = self.spawner.clone();
         let messenger = self.messenger.clone();
         let swarm = self.swarm.clone();
+        let todo_gate = self.todo_gate.clone();
 
         let (mut tx, rx) = channel::<crate::types::RunEvent>(128);
 
@@ -199,6 +208,7 @@ impl ContextEngine for LegacyContextEngine {
                 spawner,
                 messenger,
                 swarm,
+                todo_gate,
                 &mut tx,
             )
             .await

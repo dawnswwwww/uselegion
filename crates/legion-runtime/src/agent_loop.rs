@@ -8,7 +8,7 @@ use futures::{SinkExt, StreamExt};
 use crate::approval::{ApprovalCtx, ApprovalGate, NoOpApprovalNotifier, PermissionMode};
 use crate::auto_extract::AutoExtractor;
 use crate::commitments::CommitmentExtractor;
-use crate::compaction::Compactor;
+use crate::compaction::TwoPassCompactor;
 use crate::context::{
     Filesystem, SessionContext, TokioFs, assemble_system_prompt_report, resolve_workspace,
 };
@@ -22,6 +22,7 @@ use crate::skills_prompt::skill_body_block;
 use crate::subagent::SubagentSpawner;
 use crate::surfaced::SurfacedStore;
 use crate::swarm::SwarmManager;
+use crate::todo_gate::{TodoGate, todo_gate_reminder};
 use crate::tool_pipeline::{partition_tool_calls, run_tool_batches};
 use crate::tools::{ToolCall, ToolRegistry, ToolResult, build_policy_decider};
 use crate::types::{LifecyclePhase, RunEvent, RunRequest, RunStream, RuntimeError};
@@ -260,7 +261,7 @@ pub(crate) async fn run_loop(
     provider_router: Arc<ProviderRouter>,
     tool_registry: Arc<dyn ToolRegistry>,
     memory_backend: Arc<dyn MemoryBackend>,
-    compactor: Arc<Compactor>,
+    compactor: Arc<TwoPassCompactor>,
     config: Config,
     request: RunRequest,
     max_iterations: Option<usize>,
@@ -273,6 +274,7 @@ pub(crate) async fn run_loop(
     spawner: Option<Arc<dyn SubagentSpawner>>,
     messenger: Option<Arc<dyn AgentMessenger>>,
     swarm: Option<Arc<SwarmManager>>,
+    todo_gate: TodoGate,
     tx: &mut Sender<RunEvent>,
 ) -> Result<(), RuntimeError> {
     send(
@@ -306,6 +308,20 @@ pub(crate) async fn run_loop(
         }
     } else {
         None
+    };
+
+    // Snapshot of the todo list for the turn-end gate. Reloaded after each tool
+    // batch so the gate sees the latest state written by todo_write.
+    let mut current_todos = if let Some(store) = &todo_store {
+        match store.load().await {
+            Ok(list) => list,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load todo list");
+                crate::todo::TodoList::default()
+            }
+        }
+    } else {
+        crate::todo::TodoList::default()
     };
 
     // Plan-mode tracker. Load persisted state for the session when available;
@@ -518,6 +534,7 @@ pub(crate) async fn run_loop(
                 return Err(RuntimeError::MaxIterations(limit));
             }
         }
+        iteration += 1;
 
         if let Some((summary, boundary)) = compactor
             .compact_if_needed(
@@ -565,8 +582,20 @@ pub(crate) async fn run_loop(
         messages.push(assistant_msg);
 
         if pending_tool_calls.is_empty() {
-            // Final answer reached.
-            break;
+            // Turn-end gating: if required todo patterns are not satisfied,
+            // remind the model instead of ending the turn.
+            match todo_gate.check(&current_todos, &assistant_text) {
+                crate::todo_gate::TodoGateResult::Pass => {
+                    // Final answer reached.
+                    break;
+                }
+                other => {
+                    if let Some(reminder) = todo_gate_reminder(&other) {
+                        messages.push(ChatMessage::system(reminder));
+                    }
+                    continue;
+                }
+            }
         }
 
         let runtime_calls: Vec<ToolCall> = pending_tool_calls.iter().map(ToolCall::from).collect();
@@ -636,6 +665,13 @@ pub(crate) async fn run_loop(
         )
         .await;
         messages.extend(tool_messages);
+
+        if let Some(store) = &todo_store {
+            match store.load().await {
+                Ok(list) => current_todos = list,
+                Err(err) => tracing::warn!(error = %err, "failed to reload todo list"),
+            }
+        }
 
         // Complete any pending plan-mode exit now that the turn has finished,
         // and persist the tracker state.
@@ -717,8 +753,6 @@ pub(crate) async fn run_loop(
                 }
             }
         }
-
-        iteration += 1;
     }
 
     if let Some(extractor) = auto_extractor {
@@ -1706,6 +1740,85 @@ mod tests {
                 error: None
             }
         )));
+    }
+
+    /// Provider that returns a final text answer and records how many times it
+    /// was invoked.
+    struct CountingTextProvider {
+        text: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for CountingTextProvider {
+        fn id(&self) -> &str {
+            "counting-text"
+        }
+
+        fn supported_models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunk = ChatChunk {
+                index: 0,
+                delta: self.text.clone(),
+                finish_reason: Some(FinishReason::Stop),
+                tool_calls: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        async fn embed(&self, _req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_gate_prevents_turn_end_until_required_pattern_completed() {
+        let provider = Arc::new(CountingTextProvider {
+            text: "done".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with_config(
+            provider.clone(),
+            r#"{
+                "gateway": { "auth": { "token": "x" } },
+                "todos": {
+                    "gate": {
+                        "enabled": true,
+                        "requiredPatterns": ["completed"]
+                    }
+                },
+                "agents": { "defaults": { "maxIterations": 2 } }
+            }"#,
+        );
+
+        let request = RunRequest::new("session-gate", "main", "finish", "counting-text/gpt");
+        let events = collect_events(runtime.run(request).unwrap()).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RunEvent::AssistantDelta { delta } if delta == "done")),
+            "provider should emit at least one assistant delta"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(RunEvent::Lifecycle {
+                    phase: LifecyclePhase::Error,
+                    ..
+                })
+            ),
+            "turn should hit max iterations because the gate never passes: {events:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "gate should force the provider to be called on every allowed iteration"
+        );
     }
 
     #[tokio::test]

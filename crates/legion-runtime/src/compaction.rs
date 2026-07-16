@@ -232,43 +232,15 @@ impl Compactor {
             });
         }
 
-        let mut compacted = Vec::with_capacity(messages.len() - boundary + 2);
-        // Preserve the original system prompt if it was the first message.
-        if let Some(first) = messages.first() {
-            if first.role == ChatRole::System {
-                let mut preserved = first.clone();
-                if self.config.use_prompt_cache {
-                    preserved.cache_breakpoint = true;
-                }
-                compacted.push(preserved);
-            }
-        }
-
-        let mut summary_msg =
-            ChatMessage::system(format!("Earlier conversation summary:\n\n{summary}"));
-        if self.config.use_prompt_cache {
-            summary_msg.cache_breakpoint = true;
-        }
-        compacted.push(summary_msg);
-
-        // Build and inject reattachments so the model retains its capabilities.
-        let reattachments = if let Some(ctx) = session_ctx {
-            match ctx.build_reattachments(query).await {
-                Ok(items) => items,
-                Err(err) => {
-                    warn!(error = %err, "failed to build compaction reattachments");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        for item in &reattachments {
-            compacted.extend(item.to_messages());
-        }
-
-        compacted.extend(messages[boundary..].iter().cloned());
-
+        let compacted = build_compacted_messages(
+            &messages,
+            boundary,
+            &summary,
+            self.config.use_prompt_cache,
+            session_ctx,
+            query,
+        )
+        .await;
         let tokens_after = estimate_total_tokens(&compacted, system_prompt);
 
         let boundary_mark = BoundaryMark {
@@ -283,10 +255,320 @@ impl Compactor {
             tokens_before,
             tokens_after,
             compacted: true,
-            reattachments,
+            reattachments: Vec::new(),
             boundary: Some(boundary_mark),
         })
     }
+}
+
+/// Two-stage conversation compactor.
+///
+/// When enabled, it first summarizes the prefix of the compaction window, then
+/// rewrites that prefix summary together with the remaining tail into a denser
+/// final summary. If any stage fails or produces an empty result, the
+/// implementation falls back to the single-stage [`Compactor`].
+#[derive(Debug)]
+pub struct TwoPassCompactor {
+    inner: Compactor,
+}
+
+impl TwoPassCompactor {
+    /// Create a new two-pass compactor from the supplied configuration.
+    pub fn new(config: CompactionConfig) -> Self {
+        Self {
+            inner: Compactor::new(config),
+        }
+    }
+
+    /// Check whether compaction is needed and, if so, replace the oldest eligible
+    /// messages in `messages` with a summary.
+    ///
+    /// On success, returns `Some(summary)` when compaction occurred and `None`
+    /// when the window is still below the threshold.
+    pub async fn compact_if_needed(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        system_prompt: &str,
+        provider: &ProviderRouter,
+        model_ref: &str,
+        session_ctx: Option<&SessionContext>,
+        query: &str,
+    ) -> Result<Option<(String, Option<BoundaryMark>)>, RuntimeError> {
+        if !self.inner.should_compact(messages, system_prompt) {
+            return Ok(None);
+        }
+
+        if !self.inner.breaker.allow() {
+            warn!(
+                consecutive_failures = self.inner.breaker.consecutive_failures(),
+                "compaction circuit breaker is open; skipping auto-compaction"
+            );
+            return Ok(None);
+        }
+
+        if !self.inner.config.two_pass_enabled {
+            return self
+                .inner
+                .compact_if_needed(
+                    messages,
+                    system_prompt,
+                    provider,
+                    model_ref,
+                    session_ctx,
+                    query,
+                )
+                .await;
+        }
+
+        match self
+            .compact_conversation_two_pass(
+                messages.clone(),
+                system_prompt,
+                provider,
+                model_ref,
+                session_ctx,
+                query,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                self.inner.breaker.record_success();
+                if outcome.compacted {
+                    info!(
+                        tokens_before = outcome.tokens_before,
+                        tokens_after = outcome.tokens_after,
+                        summary_len = outcome.summary.len(),
+                        consecutive_failures = self.inner.breaker.consecutive_failures(),
+                        "two-pass compaction succeeded"
+                    );
+                    let summary = outcome.summary.clone();
+                    let boundary = outcome.boundary.clone();
+                    *messages = outcome.messages;
+                    Ok(Some((summary, boundary)))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(err) => {
+                let just_opened = self.inner.breaker.record_failure();
+                if just_opened {
+                    warn!(
+                        error = %err,
+                        max_consecutive_failures = self.inner.config.max_consecutive_failures,
+                        "two-pass compaction failed; circuit breaker opened"
+                    );
+                } else {
+                    warn!(
+                        error = %err,
+                        consecutive_failures = self.inner.breaker.consecutive_failures(),
+                        "two-pass compaction failed; falling back to single-stage"
+                    );
+                }
+                self.inner
+                    .compact_if_needed(
+                        messages,
+                        system_prompt,
+                        provider,
+                        model_ref,
+                        session_ctx,
+                        query,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Run the two-pass algorithm. Returns a non-compacted result when the
+    /// window is too small or when the split is degenerate.
+    async fn compact_conversation_two_pass(
+        &self,
+        messages: Vec<ChatMessage>,
+        system_prompt: &str,
+        provider: &ProviderRouter,
+        model_ref: &str,
+        session_ctx: Option<&SessionContext>,
+        query: &str,
+    ) -> Result<CompactionResult, RuntimeError> {
+        let tokens_before = estimate_total_tokens(&messages, system_prompt);
+
+        let boundary =
+            select_compaction_boundary(&messages, self.inner.config.min_messages_to_keep);
+        if boundary == 0 {
+            return Ok(CompactionResult {
+                summary: String::new(),
+                messages,
+                tokens_before,
+                tokens_after: tokens_before,
+                compacted: false,
+                reattachments: Vec::new(),
+                boundary: None,
+            });
+        }
+
+        let split_fraction = self.inner.config.split_fraction.clamp(0.01, 0.99);
+        let split_at =
+            ((boundary as f32 * split_fraction) as usize).clamp(1, boundary.saturating_sub(1));
+        if split_at == 0 || split_at >= boundary {
+            return self
+                .inner
+                .compact_conversation(
+                    messages,
+                    system_prompt,
+                    provider,
+                    model_ref,
+                    session_ctx,
+                    query,
+                )
+                .await;
+        }
+
+        let summary_model_ref = self
+            .inner
+            .config
+            .summary_model
+            .as_deref()
+            .unwrap_or(model_ref);
+
+        // Pass 1: summarize the prefix of the compaction window.
+        let mut prefix: Vec<ChatMessage> = messages[..split_at].to_vec();
+        strip_attachments(
+            &mut prefix,
+            self.inner.config.strip_images,
+            self.inner.config.strip_documents,
+        );
+        let note1 = generate_summary(
+            provider,
+            summary_model_ref,
+            &prefix,
+            self.inner.config.max_summary_tokens,
+        )
+        .await?;
+        if note1.is_empty() {
+            return self
+                .inner
+                .compact_conversation(
+                    messages,
+                    system_prompt,
+                    provider,
+                    model_ref,
+                    session_ctx,
+                    query,
+                )
+                .await;
+        }
+
+        // Pass 2: rewrite the pass-1 note together with the tail.
+        let mut tail: Vec<ChatMessage> = messages[split_at..boundary].to_vec();
+        strip_attachments(
+            &mut tail,
+            self.inner.config.strip_images,
+            self.inner.config.strip_documents,
+        );
+        let mut pass2_source = vec![ChatMessage::system(format!(
+            "Earlier conversation summary draft:\n\n{note1}"
+        ))];
+        pass2_source.extend(tail);
+        let summary = generate_summary(
+            provider,
+            summary_model_ref,
+            &pass2_source,
+            self.inner.config.max_summary_tokens,
+        )
+        .await?;
+        if summary.is_empty() {
+            return self
+                .inner
+                .compact_conversation(
+                    messages,
+                    system_prompt,
+                    provider,
+                    model_ref,
+                    session_ctx,
+                    query,
+                )
+                .await;
+        }
+
+        let compacted = build_compacted_messages(
+            &messages,
+            boundary,
+            &summary,
+            self.inner.config.use_prompt_cache,
+            session_ctx,
+            query,
+        )
+        .await;
+        let tokens_after = estimate_total_tokens(&compacted, system_prompt);
+
+        let boundary_mark = BoundaryMark {
+            entry_index: 0,
+            timestamp_iso: iso_now(),
+            tokens_compacted: tokens_before.saturating_sub(tokens_after),
+        };
+
+        Ok(CompactionResult {
+            summary,
+            messages: compacted,
+            tokens_before,
+            tokens_after,
+            compacted: true,
+            reattachments: Vec::new(),
+            boundary: Some(boundary_mark),
+        })
+    }
+}
+
+/// Build the replacement message list after a summary has been produced.
+///
+/// Preserves the original leading system message, injects the summary as a new
+/// system message, appends state reattachments, and finally appends the kept
+/// tail. This helper is shared between single-stage and two-stage compaction.
+async fn build_compacted_messages(
+    messages: &[ChatMessage],
+    boundary: usize,
+    summary: &str,
+    use_prompt_cache: bool,
+    session_ctx: Option<&SessionContext>,
+    query: &str,
+) -> Vec<ChatMessage> {
+    // Build and inject reattachments so the model retains its capabilities.
+    let reattachments = if let Some(ctx) = session_ctx {
+        match ctx.build_reattachments(query).await {
+            Ok(items) => items,
+            Err(err) => {
+                warn!(error = %err, "failed to build compaction reattachments");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut compacted = Vec::with_capacity(messages.len() - boundary + 2);
+    // Preserve the original system prompt if it was the first message.
+    if let Some(first) = messages.first() {
+        if first.role == ChatRole::System {
+            let mut preserved = first.clone();
+            if use_prompt_cache {
+                preserved.cache_breakpoint = true;
+            }
+            compacted.push(preserved);
+        }
+    }
+
+    let mut summary_msg =
+        ChatMessage::system(format!("Earlier conversation summary:\n\n{summary}"));
+    if use_prompt_cache {
+        summary_msg.cache_breakpoint = true;
+    }
+    compacted.push(summary_msg);
+
+    for item in &reattachments {
+        compacted.extend(item.to_messages());
+    }
+
+    compacted.extend(messages[boundary..].iter().cloned());
+    compacted
 }
 
 /// Find the index at which to split `messages` so that the tail can stay
@@ -492,6 +774,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         }
     }
 
@@ -507,6 +790,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         }
     }
 
@@ -549,6 +833,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         };
         let messages = vec![
             ChatMessage::system("you are helpful"),
@@ -596,6 +881,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         };
         let messages = vec![
             ChatMessage::system("you are helpful"),
@@ -807,6 +1093,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         });
 
         let result = compactor
@@ -839,6 +1126,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         };
         let compactor = Compactor::new(cfg);
         compactor.breaker.record_failure();
@@ -907,6 +1195,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         };
         let compactor = Compactor::new(cfg);
 
@@ -952,6 +1241,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         };
         let compactor = Compactor::new(cfg);
 
@@ -1032,6 +1322,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: false,
+            ..Default::default()
         });
 
         let messages = vec![
@@ -1067,6 +1358,7 @@ mod tests {
             strip_documents: true,
             summary_model: None,
             use_prompt_cache: true,
+            ..Default::default()
         });
 
         let messages = vec![
@@ -1099,5 +1391,128 @@ mod tests {
                 .content
                 .contains("Earlier conversation summary")
         );
+    }
+
+    /// Provider that distinguishes pass 1 from pass 2 of two-stage compaction:
+    /// pass 2 sees the "Earlier conversation summary draft" system message.
+    struct TwoPassSummaryProvider;
+
+    #[async_trait]
+    impl Provider for TwoPassSummaryProvider {
+        fn id(&self) -> &str {
+            "two-pass-summary"
+        }
+
+        fn supported_models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+
+        async fn chat(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+            let is_pass2 = req
+                .messages
+                .iter()
+                .skip(1)
+                .any(|m| m.content.contains("Earlier conversation summary draft"));
+            let delta = if is_pass2 { "FINAL" } else { "NOTE1" }.to_string();
+            Ok(Box::pin(futures::stream::iter(vec![Ok(ChatChunk {
+                index: 0,
+                delta,
+                finish_reason: Some(FinishReason::Stop),
+                tool_calls: None,
+            })])))
+        }
+
+        async fn embed(&self, _req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn two_pass_compactor_runs_two_summary_stages() {
+        let mut router = ProviderRouter::new();
+        router.register_provider(std::sync::Arc::new(TwoPassSummaryProvider));
+
+        let cfg = CompactionConfig {
+            context_window: 1_000,
+            threshold_ratio: 0.0, // force compaction
+            min_messages_to_keep: 1,
+            max_summary_tokens: 256,
+            buffer_tokens: 0,
+            max_consecutive_failures: 3,
+            strip_images: true,
+            strip_documents: true,
+            summary_model: None,
+            use_prompt_cache: false,
+            two_pass_enabled: true,
+            split_fraction: 0.5,
+            prefire_lead_percent: 10,
+        };
+        let compactor = TwoPassCompactor::new(cfg);
+
+        // Boundary = 4 (keep 1), split_at = 2 with split_fraction 0.5.
+        let mut messages = vec![
+            ChatMessage::user("one"),
+            ChatMessage::assistant("two"),
+            ChatMessage::user("three"),
+            ChatMessage::assistant("four"),
+            ChatMessage::user("recent"),
+        ];
+
+        let result = compactor
+            .compact_if_needed(&mut messages, "", &router, "two-pass-summary/gpt", None, "")
+            .await
+            .unwrap();
+
+        assert!(result.is_some(), "two-pass compaction should occur");
+        let (summary, _) = result.unwrap();
+        assert_eq!(summary, "FINAL", "pass 2 should produce the final summary");
+        assert_eq!(
+            messages.len(),
+            2,
+            "compacted list is summary + kept tail (1 message)"
+        );
+        assert!(
+            messages[0].content.contains("Earlier conversation summary"),
+            "first message should be the final summary"
+        );
+        assert_eq!(messages[1].content, "recent");
+    }
+
+    #[tokio::test]
+    async fn two_pass_compactor_falls_back_when_disabled() {
+        let mut router = ProviderRouter::new();
+        router.register_provider(std::sync::Arc::new(TwoPassSummaryProvider));
+
+        let cfg = CompactionConfig {
+            context_window: 1_000,
+            threshold_ratio: 0.0,
+            min_messages_to_keep: 1,
+            max_summary_tokens: 256,
+            buffer_tokens: 0,
+            max_consecutive_failures: 3,
+            strip_images: true,
+            strip_documents: true,
+            summary_model: None,
+            use_prompt_cache: false,
+            two_pass_enabled: false,
+            split_fraction: 0.5,
+            prefire_lead_percent: 10,
+        };
+        let compactor = TwoPassCompactor::new(cfg);
+
+        let mut messages = vec![
+            ChatMessage::user("one"),
+            ChatMessage::assistant("two"),
+            ChatMessage::user("recent"),
+        ];
+
+        let result = compactor
+            .compact_if_needed(&mut messages, "", &router, "two-pass-summary/gpt", None, "")
+            .await
+            .unwrap();
+
+        assert!(result.is_some());
+        // Single-stage path calls the provider once and gets NOTE1.
+        assert_eq!(result.unwrap().0, "NOTE1");
     }
 }

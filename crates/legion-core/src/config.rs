@@ -845,6 +845,23 @@ pub struct TodosConfig {
     /// Set to 0 to disable auto-hide.
     #[serde(default = "default_todos_auto_hide_seconds")]
     pub auto_hide_seconds: u64,
+    /// Turn-end gate that prevents the agent from ending a turn while required
+    /// todo patterns are not yet completed.
+    #[serde(default)]
+    pub gate: TodoGateConfig,
+}
+
+/// Turn-end completion gate tied to the session todo list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoGateConfig {
+    /// Master switch. When `false` (default), the gate always passes.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Required substrings that must appear in at least one completed todo.
+    /// The gate is satisfied when every pattern is matched by a completed item.
+    #[serde(default)]
+    pub required_patterns: Vec<String>,
 }
 
 impl Default for TodosConfig {
@@ -853,6 +870,7 @@ impl Default for TodosConfig {
             enabled: default_true(),
             max_display: default_todos_max_display(),
             auto_hide_seconds: default_todos_auto_hide_seconds(),
+            gate: TodoGateConfig::default(),
         }
     }
 }
@@ -959,6 +977,20 @@ pub struct CompactionConfig {
     /// conversation model is used.
     #[serde(default)]
     pub summary_model: Option<String>,
+    /// Enable two-pass compaction: first summarize the prefix, then rewrite the
+    /// prefix summary together with the tail into a denser final summary.
+    #[serde(default = "default_two_pass_enabled")]
+    pub two_pass_enabled: bool,
+    /// Fraction of the compaction window that is summarized in pass 1.
+    /// The remaining tail is fed into pass 2 together with the pass-1 note.
+    #[serde(default = "default_split_fraction")]
+    pub split_fraction: f32,
+    /// How far ahead of the compaction threshold the prefire pass starts,
+    /// expressed as a percentage point lead (default 10).
+    /// Currently only used as a configuration placeholder; background prefire
+    /// caching is not yet implemented.
+    #[serde(default = "default_prefire_lead_percent")]
+    pub prefire_lead_percent: u8,
 }
 
 impl Default for CompactionConfig {
@@ -974,6 +1006,9 @@ impl Default for CompactionConfig {
             strip_documents: default_strip_documents(),
             use_prompt_cache: default_use_prompt_cache(),
             summary_model: None,
+            two_pass_enabled: default_two_pass_enabled(),
+            split_fraction: default_split_fraction(),
+            prefire_lead_percent: default_prefire_lead_percent(),
         }
     }
 }
@@ -1012,6 +1047,18 @@ fn default_strip_documents() -> bool {
 
 fn default_use_prompt_cache() -> bool {
     true
+}
+
+fn default_two_pass_enabled() -> bool {
+    false
+}
+
+fn default_split_fraction() -> f32 {
+    0.95
+}
+
+fn default_prefire_lead_percent() -> u8 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1800,6 +1847,9 @@ mod tests {
         assert_eq!(cfg.compaction.max_consecutive_failures, 3);
         assert!(cfg.compaction.strip_images);
         assert!(cfg.compaction.strip_documents);
+        assert!(!cfg.compaction.two_pass_enabled);
+        assert_eq!(cfg.compaction.split_fraction, 0.95);
+        assert_eq!(cfg.compaction.prefire_lead_percent, 10);
     }
 
     #[test]
@@ -1816,7 +1866,10 @@ mod tests {
                 "stripImages": false,
                 "stripDocuments": false,
                 "usePromptCache": false,
-                "summaryModel": "anthropic/claude-3-haiku"
+                "summaryModel": "anthropic/claude-3-haiku",
+                "twoPassEnabled": true,
+                "splitFraction": 0.9,
+                "prefireLeadPercent": 15
             }
         }"#;
         let cfg = Config::from_json(json).unwrap();
@@ -1833,6 +1886,9 @@ mod tests {
             cfg.compaction.summary_model,
             Some("anthropic/claude-3-haiku".to_string())
         );
+        assert!(cfg.compaction.two_pass_enabled);
+        assert_eq!(cfg.compaction.split_fraction, 0.9);
+        assert_eq!(cfg.compaction.prefire_lead_percent, 15);
     }
 
     #[test]
@@ -1900,6 +1956,34 @@ mod tests {
         assert_eq!(
             cfg.agents.defaults.skills.selector_model,
             Some("openai/gpt-4o-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn todos_gate_config_defaults_to_disabled() {
+        let json = r#"{ "gateway": { "auth": { "token": "x" } } }"#;
+        let cfg = Config::from_json(json).unwrap();
+        assert!(cfg.todos.enabled);
+        assert!(!cfg.todos.gate.enabled);
+        assert!(cfg.todos.gate.required_patterns.is_empty());
+    }
+
+    #[test]
+    fn todos_gate_config_parses_explicit_values() {
+        let json = r#"{
+            "gateway": { "auth": { "token": "x" } },
+            "todos": {
+                "gate": {
+                    "enabled": true,
+                    "requiredPatterns": ["tests pass", "docs updated"]
+                }
+            }
+        }"#;
+        let cfg = Config::from_json(json).unwrap();
+        assert!(cfg.todos.gate.enabled);
+        assert_eq!(
+            cfg.todos.gate.required_patterns,
+            vec!["tests pass".to_string(), "docs updated".to_string()]
         );
     }
 

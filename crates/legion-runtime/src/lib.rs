@@ -20,6 +20,7 @@ pub mod subagent;
 pub mod surfaced;
 pub mod swarm;
 pub mod todo;
+pub mod todo_gate;
 pub mod token_counter;
 pub mod tool_pipeline;
 pub mod tools;
@@ -58,6 +59,7 @@ pub use subagent::{
 pub use surfaced::SurfacedStore;
 pub use swarm::{SwarmError, SwarmManager, SwarmMessage, TeammateInfo, TeammateStatus};
 pub use todo::{JsonTodoStore, SharedTodoStore, TodoItem, TodoList, TodoStatus, TodoStore};
+pub use todo_gate::{TodoGate, TodoGateResult, todo_gate_reminder};
 pub use tools::{
     BackgroundTaskOutput, BackgroundTaskRegistry, BackgroundTaskResult, Tool, ToolCall,
     ToolContext, ToolError, ToolRegistry, ToolResult,

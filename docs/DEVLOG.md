@@ -68,6 +68,37 @@
 
 ## 开发日志(最新在上)
 
+### 2026-07-16 · Phase 3 完成：双阶段 compaction + TodoGate
+- **type**: feature
+- **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 3）
+- **目标**:实现 Grok CLI 风格的双阶段上下文压缩（two-pass compaction）与基于 todo 列表的轮次结束门控（TodoGate），并合并回 `main`。
+- **改动**:
+  - 双阶段 compaction：
+    - `crates/legion-core/src/config.rs`：`CompactionConfig` 新增 `twoPassEnabled`（默认 `false`）、`splitFraction`（默认 `0.95`）、`prefireLeadPercent`（默认 `10`，当前仅作配置占位）。
+    - `crates/legion-runtime/src/compaction.rs`（新建 `TwoPassCompactor`）：封装现有 `Compactor`；启用后先总结前缀得到 `NOTE1`，再将 `NOTE1` 与 tail 合并重写为最终摘要；任一阶段失败或结果为空时回退到单阶段压缩；复用现有 circuit breaker。
+    - `crates/legion-runtime/src/context_engine.rs` / `agent_loop.rs`：将 `Compactor` 替换为 `TwoPassCompactor`，接口保持兼容。
+    - 新增单元测试覆盖 two-pass 启用/禁用路径。
+  - TodoGate：
+    - `crates/legion-core/src/config.rs`：`TodosConfig` 新增 `gate: TodoGateConfig`（`enabled` + `requiredPatterns`）。
+    - `crates/legion-runtime/src/todo_gate.rs`（新建）：`TodoGate` / `TodoGateResult` / `todo_gate_reminder`；按已完成 todo 的内容子串匹配必需模式。
+    - `crates/legion-runtime/src/context_engine.rs`：根据 `todos.enabled && todos.gate.enabled` 构造 `TodoGate`。
+    - `crates/legion-runtime/src/agent_loop.rs`：每轮工具执行结束后重新加载 todo 列表；若模型准备结束 turn 但 gate 未通过，则追加 system reminder 并继续循环（不再提前 break）；将 `iteration += 1` 前移到 max-iterations 检查之后，避免 `continue` 跳过计数导致无限循环。
+    - 新增单元测试覆盖 gate 的空/无 todo/缺模式/全部完成路径，以及 agent_loop 集成测试验证 gate 会强制命中 max-iterations。
+  - 机械修复：补齐所有 `CompactionConfig` 字面量以包含新字段（使用 `..Default::default()`）。
+- **决策**:
+  - 默认关闭 `twoPassEnabled`，保持向后兼容；可通过配置开启以利用更高密度的摘要。
+  - Prefire 后台缓存暂不实现，仅保留配置字段，避免在当前 turn loop 中引入复杂异步预计算。
+  - TodoGate 只检查已完成 todo 的内容子串，不依赖模型最后的文本表态，确保可验证、可重复。
+  - Gate 失败时通过 system reminder 让模型自行继续，而不是自动创建 todo，避免越权改写 todo 列表。
+- **验证**:
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+  - `cargo test --workspace --all-targets` 全量通过（E2E 需要 `MINIMAX_API_KEY` 的测试正确忽略）
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
+- **遗留**:
+  - Phase 4：`legion-telemetry` crate + unified log + session metrics
+  - Phase 5：Tool taxonomy + LSP + 多媒体工具扩展
+
 ### 2026-07-16 · Phase 2 完成：Plan mode + Scheduler tools + 后台任务工具
 - **type**: feature
 - **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 2）
