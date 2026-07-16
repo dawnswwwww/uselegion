@@ -12,6 +12,7 @@ use crate::mcp::McpTool;
 
 use crate::ask_user::AskUserTool;
 use crate::browser::BrowserTool;
+use crate::grep::GrepTool;
 use crate::policy::{Approval, Policy};
 use crate::sandbox::{
     CubeSandboxBackend, ExecResult, LocalSandboxBackend, RestrictedConfig,
@@ -120,6 +121,9 @@ impl CoreToolRegistry {
 
         let read_policy = Policy::from_config(config.tools.get("read"), Approval::Off);
         tools.insert("read".to_string(), Arc::new(ReadTool::new(read_policy)));
+
+        let grep_policy = Policy::from_config(config.tools.get("grep"), Approval::Off);
+        tools.insert("grep".to_string(), Arc::new(GrepTool::new(grep_policy)));
 
         tools.insert("ask_user".to_string(), Arc::new(AskUserTool::new()));
 
@@ -295,6 +299,7 @@ mod tests {
 
         for name in [
             "read",
+            "grep",
             "write",
             "edit",
             "apply_patch",

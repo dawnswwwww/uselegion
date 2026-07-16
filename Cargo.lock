@@ -1948,6 +1948,7 @@ dependencies = [
  "async-trait",
  "base64",
  "futures",
+ "glob",
  "legion-core",
  "legion-mcp",
  "legion-plugin-sdk",
