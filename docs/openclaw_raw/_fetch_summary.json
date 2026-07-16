@@ -1,0 +1,14 @@
+{
+  "total": 713,
+  "ok": 711,
+  "errors": [
+    [
+      "https://docs.openclaw.ai/robots.txt",
+      "HTTP Error 404: Not Found"
+    ],
+    [
+      "https://docs.openclaw.ai/sitemap.xml",
+      "HTTP Error 404: Not Found"
+    ]
+  ]
+}

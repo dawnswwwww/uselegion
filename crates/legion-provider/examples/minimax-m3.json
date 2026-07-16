@@ -1,0 +1,30 @@
+{
+  "models": {
+    "providers": {
+      "minimax-openai": {
+        "id": "minimax-openai",
+        "kind": "openai",
+        "baseUrl": "https://api.minimaxi.com/v1",
+        "authProfile": "minimax-default",
+        "defaultModel": "MiniMax-M3",
+        "timeoutSeconds": 120
+      },
+      "minimax-anthropic": {
+        "id": "minimax-anthropic",
+        "kind": "anthropic",
+        "baseUrl": "https://api.minimaxi.com/anthropic",
+        "authProfile": "minimax-default",
+        "defaultModel": "MiniMax-M3",
+        "timeoutSeconds": 120
+      }
+    },
+    "aliases": {
+      "minimax": "minimax-openai/MiniMax-M3",
+      "m3": "minimax-openai/MiniMax-M3"
+    },
+    "fallbacks": [
+      "minimax-openai/MiniMax-M3",
+      "minimax-anthropic/MiniMax-M3"
+    ]
+  }
+}

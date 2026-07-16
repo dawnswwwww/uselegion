@@ -1,0 +1,34 @@
+[package]
+name = "legion-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+legion-core = { path = "../legion-core" }
+legion-protocol = { path = "../legion-protocol" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk" }
+legion-provider = { path = "../legion-provider" }
+legion-runtime = { path = "../legion-runtime" }
+legion-mcp = { path = "../legion-mcp" }
+legion-memory = { path = "../legion-memory" }
+legion-tools = { path = "../legion-tools" }
+legion-automation = { path = "../legion-automation" }
+legion-acp = { path = "../legion-acp" }
+legion-channel = { path = "../legion-channel" }
+legion-skills = { path = "../legion-skills" }
+
+async-trait = "0.1"
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+dirs = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

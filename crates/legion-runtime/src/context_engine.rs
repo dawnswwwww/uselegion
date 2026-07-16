@@ -1,0 +1,218 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::auto_extract::AutoExtractor;
+use crate::commitments::CommitmentExtractor;
+use crate::compaction::Compactor;
+use crate::memory::MemoryBackend;
+use crate::messenger::AgentMessenger;
+use crate::recall_selector::LlmRecallSelector;
+use crate::subagent::SubagentSpawner;
+use crate::surfaced::SurfacedStore;
+use crate::swarm::SwarmManager;
+use crate::tools::ToolRegistry;
+use crate::types::{RunRequest, RunStream, RuntimeError};
+use legion_core::config::{Config, RecallConfig};
+use legion_provider::router::ProviderRouter;
+use legion_skills::Skill;
+
+/// Strategy for assembling, compacting, and executing the agent context.
+///
+/// This trait is the PRD R6 hook point: future implementations can replace the
+/// legacy hard-coded loop with alternative context management (e.g. a Codex-style
+/// engine) without changing `AgentRuntime`.
+#[async_trait]
+pub trait ContextEngine: Send + Sync {
+    /// Stable engine identifier.
+    fn id(&self) -> &str;
+
+    /// Execute an agent run and return the event stream.
+    ///
+    /// The caller supplies the resolved provider router and iteration limit so
+    /// that `AgentRuntime` can continue to own per-agent routing.
+    fn run(
+        &self,
+        provider_router: Arc<ProviderRouter>,
+        request: RunRequest,
+        max_iterations: Option<usize>,
+    ) -> Result<RunStream, RuntimeError>;
+}
+
+/// The built-in context engine.
+///
+/// This is a thin wrapper around the existing agent loop; it preserves the
+/// current behavior while making the strategy pluggable.
+pub struct LegacyContextEngine {
+    tool_registry: Arc<dyn ToolRegistry>,
+    memory_backend: Arc<dyn MemoryBackend>,
+    compactor: Arc<Compactor>,
+    config: Config,
+    plugin_skills: Vec<Skill>,
+    auto_extractor: Option<Arc<AutoExtractor>>,
+    commitment_extractor: Option<Arc<dyn CommitmentExtractor>>,
+    recall_config: RecallConfig,
+    selector: Option<Arc<LlmRecallSelector>>,
+    surfaced: SurfacedStore,
+    spawner: Option<Arc<dyn SubagentSpawner>>,
+    messenger: Option<Arc<dyn AgentMessenger>>,
+    swarm: Option<Arc<SwarmManager>>,
+}
+
+impl LegacyContextEngine {
+    pub fn new(
+        tool_registry: Arc<dyn ToolRegistry>,
+        memory_backend: Arc<dyn MemoryBackend>,
+        config: Config,
+    ) -> Self {
+        let compactor = Arc::new(Compactor::new(config.compaction.clone()));
+        let recall_config = config.memory.recall.clone();
+        Self {
+            tool_registry,
+            memory_backend,
+            compactor,
+            config,
+            plugin_skills: Vec::new(),
+            auto_extractor: None,
+            commitment_extractor: None,
+            recall_config,
+            selector: None,
+            surfaced: SurfacedStore::default(),
+            spawner: None,
+            messenger: None,
+            swarm: None,
+        }
+    }
+
+    /// Register skills provided by plugins so they are merged into the agent's
+    /// skill registry for every run.
+    pub fn with_plugin_skills(mut self, skills: Vec<Skill>) -> Self {
+        self.plugin_skills = skills;
+        self
+    }
+
+    /// Attach a background auto-extractor forwarded to each run loop.
+    pub fn with_auto_extractor(mut self, extractor: Option<Arc<AutoExtractor>>) -> Self {
+        self.auto_extractor = extractor;
+        self
+    }
+
+    /// Attach a background commitment extractor forwarded to each run loop
+    /// (automation-advanced Phase B). `None` disables inferred commitments.
+    pub fn with_commitment_extractor(
+        mut self,
+        extractor: Option<Arc<dyn CommitmentExtractor>>,
+    ) -> Self {
+        self.commitment_extractor = extractor;
+        self
+    }
+
+    /// Override the recall configuration forwarded to each run loop (Phase C).
+    pub fn with_recall_config(mut self, recall_config: RecallConfig) -> Self {
+        self.recall_config = recall_config;
+        self
+    }
+
+    /// Attach an optional LLM recall re-ranker (Phase C).
+    pub fn with_selector(mut self, selector: Option<Arc<LlmRecallSelector>>) -> Self {
+        self.selector = selector;
+        self
+    }
+
+    /// Override the surfaced-ids store used to suppress memories already injected
+    /// in earlier turns of the same session (Phase C).
+    pub fn with_surfaced(mut self, surfaced: SurfacedStore) -> Self {
+        self.surfaced = surfaced;
+        self
+    }
+
+    /// Attach the sub-agent spawner forwarded to each run loop (multi-agent
+    /// Phase A). `None` disables `spawn_subagent` (the tool reports unavailable).
+    pub fn with_spawner(mut self, spawner: Option<Arc<dyn SubagentSpawner>>) -> Self {
+        self.spawner = spawner;
+        self
+    }
+
+    /// Attach the agent messenger forwarded to each run loop (tools-p1p2
+    /// Phase B). `None` disables `agent_to_agent_send` (the tool reports
+    /// unavailable).
+    pub fn with_messenger(mut self, messenger: Option<Arc<dyn AgentMessenger>>) -> Self {
+        self.messenger = messenger;
+        self
+    }
+
+    /// Attach the swarm manager forwarded to each run loop (multi-agent
+    /// Phase D). `None` disables the `swarm_*` tools (they report
+    /// unavailable).
+    pub fn with_swarm(mut self, swarm: Option<Arc<SwarmManager>>) -> Self {
+        self.swarm = swarm;
+        self
+    }
+}
+
+#[async_trait]
+impl ContextEngine for LegacyContextEngine {
+    fn id(&self) -> &str {
+        "legacy"
+    }
+
+    fn run(
+        &self,
+        provider_router: Arc<ProviderRouter>,
+        request: RunRequest,
+        max_iterations: Option<usize>,
+    ) -> Result<RunStream, RuntimeError> {
+        use futures::SinkExt;
+        use futures::channel::mpsc::channel;
+
+        let tool_registry = self.tool_registry.clone();
+        let memory_backend = self.memory_backend.clone();
+        let compactor = self.compactor.clone();
+        let config = self.config.clone();
+        let plugin_skills = self.plugin_skills.clone();
+        let auto_extractor = self.auto_extractor.clone();
+        let commitment_extractor = self.commitment_extractor.clone();
+        let recall_config = self.recall_config.clone();
+        let selector = self.selector.clone();
+        let surfaced = self.surfaced.clone();
+        let spawner = self.spawner.clone();
+        let messenger = self.messenger.clone();
+        let swarm = self.swarm.clone();
+
+        let (mut tx, rx) = channel::<crate::types::RunEvent>(128);
+
+        tokio::spawn(async move {
+            if let Err(err) = crate::agent_loop::run_loop(
+                provider_router,
+                tool_registry,
+                memory_backend,
+                compactor,
+                config,
+                request,
+                max_iterations,
+                plugin_skills,
+                auto_extractor,
+                commitment_extractor,
+                recall_config,
+                selector,
+                surfaced,
+                spawner,
+                messenger,
+                swarm,
+                &mut tx,
+            )
+            .await
+            {
+                let _ = tx
+                    .send(crate::types::RunEvent::Lifecycle {
+                        phase: crate::types::LifecyclePhase::Error,
+                        error: Some(err.to_string()),
+                    })
+                    .await;
+                tracing::error!(error = %err, "agent run failed");
+            }
+        });
+
+        Ok(Box::pin(rx))
+    }
+}

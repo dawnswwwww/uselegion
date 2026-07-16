@@ -1,0 +1,61 @@
+[package]
+name = "legion-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+legion-core = { path = "../legion-core" }
+legion-automation = { path = "../legion-automation" }
+legion-host = { path = "../legion-host" }
+legion-mcp = { path = "../legion-mcp" }
+legion-memory = { path = "../legion-memory" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk" }
+legion-protocol = { path = "../legion-protocol" }
+legion-provider = { path = "../legion-provider" }
+legion-runtime = { path = "../legion-runtime" }
+legion-skills = { path = "../legion-skills" }
+legion-tools = { path = "../legion-tools" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+dirs = { workspace = true }
+reqwest = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = { version = "2", features = ["serde"] }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = "0.4"
+semver = "1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+fs2 = "0.4"
+uuid = { version = "1", features = ["v4"] }
+atty = "0.2"
+ratatui = "0.29"
+crossterm = "0.28"
+unicode-width = "0.2"
+rand = "0.9"
+libc = { workspace = true }
+pulldown-cmark = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+libc = { workspace = true }
+
+[[bin]]
+name = "legion"
+path = "src/main.rs"

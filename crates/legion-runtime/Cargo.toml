@@ -1,0 +1,29 @@
+[package]
+name = "legion-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+legion-core = { path = "../legion-core" }
+legion-provider = { path = "../legion-provider" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk" }
+legion-skills = { path = "../legion-skills" }
+async-trait = "0.1"
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jsonschema = { workspace = true }
+regex = { workspace = true }
+tiktoken-rs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-test = "0.4"

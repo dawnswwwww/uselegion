@@ -1,0 +1,43 @@
+[package]
+name = "legion-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+legion-core = { path = "../legion-core" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk" }
+legion-protocol = { path = "../legion-protocol" }
+legion-host = { path = "../legion-host" }
+legion-runtime = { path = "../legion-runtime" }
+legion-tools = { path = "../legion-tools" }
+legion-memory = { path = "../legion-memory" }
+legion-provider = { path = "../legion-provider" }
+legion-channel = { path = "../legion-channel" }
+legion-web = { path = "../legion-web" }
+legion-acp = { path = "../legion-acp" }
+legion-automation = { path = "../legion-automation" }
+legion-mcp = { path = "../legion-mcp" }
+
+async-trait = "0.1"
+axum = { workspace = true }
+base64 = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tokio-tungstenite = "0.26"
+serial_test = "3.2"
+tempfile = { workspace = true }
+temp-env = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name = "legion-automation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+legion-core = { path = "../legion-core" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk" }
+legion-runtime = { path = "../legion-runtime" }
+legion-provider = { path = "../legion-provider" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+dirs = { workspace = true }
+futures = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }

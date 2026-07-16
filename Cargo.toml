@@ -1,0 +1,78 @@
+[workspace]
+members = [
+    "crates/legion-core",
+    "crates/legion-plugin-sdk",
+    "crates/legion-protocol",
+    "crates/legion-gateway",
+    "crates/legion-host",
+    "crates/legion-provider",
+    "crates/legion-runtime",
+    "crates/legion-channel",
+    "crates/legion-memory",
+    "crates/legion-tools",
+    "crates/legion-automation",
+    "crates/legion-acp",
+    "crates/legion-cli",
+    "crates/legion-web",
+    "crates/legion-skills",
+    "crates/legion-mcp",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Legion Contributors"]
+rust-version = "1.86"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.44", features = ["full"] }
+
+# serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_json5 = "0.2"
+dirs = "6.0"
+
+# error handling
+thiserror = "2.0"
+
+# crypto (AWS SigV4 request signing)
+sha2 = "0.10"
+hmac = "0.12"
+
+# logging
+tracing = "0.1"
+
+# web / http
+reqwest = { version = "0.12", features = ["json"] }
+eventsource-stream = "0.2"
+regex = "1.12"
+axum = { version = "0.8", features = ["ws"] }
+mime = "0.3"
+base64 = "0.22"
+
+# cli
+clap = { version = "4.5", features = ["derive"] }
+tokio-tungstenite = "0.26"
+
+# validation
+jsonschema = "0.29"
+
+# tokenization
+tiktoken-rs = "0.12"
+serde_yaml = "0.9"
+glob = "0.3"
+
+# testing
+rstest = "0.25"
+tempfile = "3.21"
+temp-env = "0.3"
+wiremock = "0.6"
+assert_cmd = "2.0"
+predicates = "3.1"
+futures = "0.3"
+libc = "0.2"
+pulldown-cmark = "0.13"
