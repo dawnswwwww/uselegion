@@ -145,6 +145,7 @@ mod tests {
             question_gate: None,
             todo_store: Some(store),
             background_tasks: None,
+            plan_mode_tracker: None,
         }
     }
 

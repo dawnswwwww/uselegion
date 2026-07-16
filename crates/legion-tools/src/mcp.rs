@@ -134,6 +134,7 @@ mod tests {
                     question_gate: None,
                     todo_store: None,
                     background_tasks: None,
+                    plan_mode_tracker: None,
                 },
             )
             .await

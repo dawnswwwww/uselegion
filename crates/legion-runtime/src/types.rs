@@ -220,6 +220,9 @@ pub struct RunRequest {
     /// and resolve from config. The memory backend is unaffected (always
     /// `~/.legion`).
     pub workspace_override: Option<std::path::PathBuf>,
+    /// Optional pre-constructed plan-mode tracker. When `None`, the runtime
+    /// loads or creates a tracker in `~/.legion/sessions/<session_id>`.
+    pub plan_mode_tracker: Option<Arc<tokio::sync::Mutex<crate::plan_mode::PlanModeTracker>>>,
 }
 
 impl std::fmt::Debug for RunRequest {
@@ -240,6 +243,7 @@ impl std::fmt::Debug for RunRequest {
             .field("max_iterations", &self.max_iterations)
             .field("dump_prompts", &self.dump_prompts)
             .field("workspace_override", &self.workspace_override)
+            .field("plan_mode_tracker", &self.plan_mode_tracker.is_some())
             .finish()
     }
 }
@@ -267,6 +271,7 @@ impl RunRequest {
             max_iterations: None,
             dump_prompts: false,
             workspace_override: None,
+            plan_mode_tracker: None,
         }
     }
 
@@ -322,6 +327,14 @@ impl RunRequest {
 
     pub fn with_workspace_override(mut self, workspace: Option<std::path::PathBuf>) -> Self {
         self.workspace_override = workspace;
+        self
+    }
+
+    pub fn with_plan_mode_tracker(
+        mut self,
+        tracker: Arc<tokio::sync::Mutex<crate::plan_mode::PlanModeTracker>>,
+    ) -> Self {
+        self.plan_mode_tracker = Some(tracker);
         self
     }
 }

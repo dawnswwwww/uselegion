@@ -9,6 +9,7 @@ use legion_provider::types::{ChatMessage, ChatRole, ToolCall as ProviderToolCall
 use crate::approval::{ApprovalCtx, ApprovalRequest, PermissionMode};
 use crate::memory::MemoryBackend;
 use crate::messenger::AgentMessenger;
+use crate::plan_mode::PlanModeTracker;
 use crate::question::QuestionCtx;
 use crate::subagent::SubagentSpawner;
 use crate::swarm::SwarmManager;
@@ -121,6 +122,7 @@ pub async fn execute_tool_call(
     parent_history: Option<Arc<Vec<ChatMessage>>>,
     todo_store: Option<crate::SharedTodoStore>,
     background_tasks: Option<Arc<dyn crate::tools::BackgroundTaskRegistry>>,
+    plan_mode_tracker: Option<Arc<tokio::sync::Mutex<PlanModeTracker>>>,
 ) -> ToolResult {
     let tool = match registry.get(&call.name) {
         Some(t) => t,
@@ -180,6 +182,39 @@ pub async fn execute_tool_call(
         }
     }
 
+    // Plan-mode enforcement: when active, mutating tools must target the plan
+    // file. Read-only tools pass through. This applies regardless of the
+    // session permission mode so that plan mode remains a hard boundary.
+    if let Some(tracker) = &plan_mode_tracker {
+        let guard = tracker.lock().await;
+        if guard.is_active() {
+            let restricted = matches!(tool.name(), "write" | "edit" | "apply_patch" | "exec");
+            if restricted {
+                let allowed = match tool.name() {
+                    "write" | "edit" | "apply_patch" => {
+                        input.get("path").and_then(|v| v.as_str()).is_some_and(|p| {
+                            let resolved = if Path::new(p).is_absolute() {
+                                PathBuf::from(p)
+                            } else {
+                                workspace.join(p)
+                            };
+                            guard.should_auto_approve_edit(&resolved)
+                        })
+                    }
+                    "exec" => false,
+                    _ => false,
+                };
+                if !allowed {
+                    return ToolResult::error(format!(
+                        "tool '{}' is blocked in plan mode except when targeting the plan file ({})",
+                        tool.name(),
+                        guard.plan_file_path().display()
+                    ));
+                }
+            }
+        }
+    }
+
     let ctx = ToolContext {
         workspace: workspace.to_path_buf(),
         session_id: session_id.to_string(),
@@ -196,6 +231,7 @@ pub async fn execute_tool_call(
         question_gate: question.map(|q| q.gate),
         todo_store,
         background_tasks,
+        plan_mode_tracker,
     };
 
     match tool.execute(input, ctx).await {
@@ -228,6 +264,7 @@ pub async fn run_tool_batches(
     parent_history: Option<Arc<Vec<ChatMessage>>>,
     todo_store: Option<crate::SharedTodoStore>,
     background_tasks: Option<Arc<dyn crate::tools::BackgroundTaskRegistry>>,
+    plan_mode_tracker: Option<Arc<tokio::sync::Mutex<PlanModeTracker>>>,
     tx: &mut Sender<RunEvent>,
 ) -> Vec<ChatMessage> {
     let mut results = Vec::new();
@@ -256,6 +293,7 @@ pub async fn run_tool_batches(
                 let parent_history = parent_history.clone();
                 let todo_store = todo_store.clone();
                 let background_tasks = background_tasks.clone();
+                let plan_mode_tracker = plan_mode_tracker.clone();
 
                 handles.push(tokio::spawn(async move {
                     execute_tool_call(
@@ -278,6 +316,7 @@ pub async fn run_tool_batches(
                         parent_history,
                         todo_store,
                         background_tasks,
+                        plan_mode_tracker,
                     )
                     .await
                 }));
@@ -338,6 +377,7 @@ pub async fn run_tool_batches(
                     parent_history.clone(),
                     todo_store.clone(),
                     background_tasks.clone(),
+                    plan_mode_tracker.clone(),
                 )
                 .await;
 
@@ -388,6 +428,7 @@ impl ToolCall {
 mod tests {
     use super::*;
     use crate::approval::{ApprovalGate, NoOpApprovalNotifier};
+    use crate::plan_mode::PlanModeTracker;
     use crate::tools::{Approval, Policy, ToolDefinitionExt, build_policy_decider};
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -731,6 +772,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_error);
@@ -769,6 +811,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             None,
@@ -831,6 +874,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_error);
@@ -878,6 +922,7 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -930,6 +975,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(!result.is_error);
@@ -975,6 +1021,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             None,
@@ -1029,6 +1076,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(!result.is_error);
@@ -1077,6 +1125,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         // Unattended prompt must fail closed.
@@ -1120,6 +1169,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             None,
@@ -1218,6 +1268,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(!result.is_error);
@@ -1249,6 +1300,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             None,
@@ -1286,6 +1338,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             None,
@@ -1374,6 +1427,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut tx,
         )
         .await;
@@ -1386,5 +1440,129 @@ mod tests {
             "concurrent execution took too long: {elapsed:?}"
         );
         assert_eq!(SLEEP_COUNTER.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_write_to_non_plan_file() {
+        let registry = registry();
+        let session_dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(tokio::sync::Mutex::new(PlanModeTracker::new(
+            session_dir.path(),
+        )));
+        tracker.lock().await.activate();
+
+        let can_use_tool: CanUseToolFn =
+            Arc::new(|_name, _input, _sender| Box::pin(async move { Permission::Allow }));
+        let call = call("c1", "write", r#"{"path":"other.md","content":"x"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(tracker),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("blocked in plan mode"));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_write_to_plan_file() {
+        let session_dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(tokio::sync::Mutex::new(PlanModeTracker::new(
+            session_dir.path(),
+        )));
+        tracker.lock().await.activate();
+
+        let registry = registry();
+        let can_use_tool: CanUseToolFn =
+            Arc::new(|_name, _input, _sender| Box::pin(async move { Permission::Allow }));
+        let plan_path = session_dir.path().join("plan.md");
+        let args = format!(
+            "{{\"path\":\"{}\",\"content\":\"# plan\"}}",
+            plan_path.display()
+        );
+        let call = call("c1", "write", &args);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(tracker),
+        )
+        .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("wrote"));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_read_only_tool() {
+        let registry = registry();
+        let session_dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(tokio::sync::Mutex::new(PlanModeTracker::new(
+            session_dir.path(),
+        )));
+        tracker.lock().await.activate();
+
+        let can_use_tool: CanUseToolFn =
+            Arc::new(|_name, _input, _sender| Box::pin(async move { Permission::Allow }));
+        let call = call("c1", "read", r#"{"path":"a"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(tracker),
+        )
+        .await;
+
+        assert!(!result.is_error);
     }
 }

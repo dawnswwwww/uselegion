@@ -324,6 +324,7 @@ async fn execute_tool_call(
         question_gate: None,
         todo_store: None,
         background_tasks: None,
+        plan_mode_tracker: None,
     };
 
     match tool.execute(params, ctx).await {

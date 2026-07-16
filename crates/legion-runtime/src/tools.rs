@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::approval::PermissionMode;
 use crate::memory::MemoryBackend;
+use crate::plan_mode::PlanModeTracker;
 use crate::question::QuestionGate;
 use crate::todo::SharedTodoStore;
 
@@ -110,6 +111,10 @@ pub struct ToolContext {
     /// Optional registry for background tasks spawned by the `exec` tool and
     /// managed by `wait_tasks`, `kill_task`, and `get_task_output`.
     pub background_tasks: Option<Arc<dyn BackgroundTaskRegistry>>,
+    /// Optional plan-mode tracker. When present, tools such as
+    /// `enter_plan_mode` and `exit_plan_mode` can mutate session planning
+    /// state, and the runtime enforces plan-mode write restrictions.
+    pub plan_mode_tracker: Option<Arc<tokio::sync::Mutex<PlanModeTracker>>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -133,6 +138,7 @@ impl std::fmt::Debug for ToolContext {
             .field("question_gate", &self.question_gate.is_some())
             .field("todo_store", &self.todo_store.is_some())
             .field("background_tasks", &self.background_tasks.is_some())
+            .field("plan_mode_tracker", &self.plan_mode_tracker.is_some())
             .finish()
     }
 }

@@ -4,6 +4,7 @@ pub mod browser;
 pub mod grep;
 pub mod list_dir;
 pub mod mcp;
+pub mod plan_mode;
 pub mod policy;
 pub mod registry;
 pub mod sandbox;
