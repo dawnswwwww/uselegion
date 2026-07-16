@@ -155,6 +155,7 @@ impl Worker {
                 id: commitment_id(agent_id, &commitment.description, &commitment.due),
                 agent_id: agent_id.to_string(),
                 message: commitment.description,
+                name: String::new(),
                 schedule: "__at__".to_string(),
                 at: Some(commitment.due),
                 enabled: true,

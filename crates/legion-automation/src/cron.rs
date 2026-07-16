@@ -41,6 +41,10 @@ pub struct CronJob {
     pub id: String,
     pub agent_id: String,
     pub message: String,
+    /// Human-readable name for the job, introduced by the `scheduler_create`
+    /// tool. Older records may leave this empty.
+    #[serde(default)]
+    pub name: String,
     /// Either a cron expression or the sentinel value `"__at__"` for one-shot jobs.
     pub schedule: String,
     /// For one-shot jobs, the scheduled run time.
@@ -286,6 +290,7 @@ impl CronScheduler {
             id,
             agent_id: req.agent_id,
             message: req.message,
+            name: String::new(),
             schedule,
             at: req.at,
             enabled: true,
@@ -674,6 +679,7 @@ mod tests {
             id: "j1".to_string(),
             agent_id: "main".to_string(),
             message: "daily".to_string(),
+            name: String::new(),
             schedule: "0 9 * * *".to_string(),
             at: None,
             enabled: true,
@@ -693,6 +699,7 @@ mod tests {
             id: "j2".to_string(),
             agent_id: "main".to_string(),
             message: "once".to_string(),
+            name: String::new(),
             schedule: "__at__".to_string(),
             at: Some(future),
             enabled: true,
@@ -714,6 +721,7 @@ mod tests {
             id: "j-atomic".to_string(),
             agent_id: "main".to_string(),
             message: "hello".to_string(),
+            name: String::new(),
             schedule: "0 9 * * *".to_string(),
             at: None,
             enabled: true,
@@ -933,6 +941,7 @@ mod tests {
             id: "one-shot-1".to_string(),
             agent_id: "main".to_string(),
             message: "once".to_string(),
+            name: String::new(),
             schedule: "__at__".to_string(),
             at: Some(due),
             enabled: true,
@@ -964,6 +973,7 @@ mod tests {
             id: "recurring-1".to_string(),
             agent_id: "main".to_string(),
             message: "daily".to_string(),
+            name: String::new(),
             schedule: "0 9 * * *".to_string(),
             at: None,
             enabled: true,
@@ -999,6 +1009,7 @@ mod tests {
             id: "disabled-1".to_string(),
             agent_id: "main".to_string(),
             message: "never".to_string(),
+            name: String::new(),
             schedule: "0 9 * * *".to_string(),
             at: None,
             enabled: false,

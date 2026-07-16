@@ -12,6 +12,7 @@ legion-plugin-sdk = { path = "../legion-plugin-sdk" }
 legion-runtime = { path = "../legion-runtime" }
 legion-provider = { path = "../legion-provider" }
 legion-mcp = { path = "../legion-mcp" }
+legion-automation = { path = "../legion-automation" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -24,6 +25,9 @@ glob = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+dirs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

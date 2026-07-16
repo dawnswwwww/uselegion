@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod policy;
 pub mod registry;
 pub mod sandbox;
+pub mod scheduler;
 pub mod todo;
 pub mod tools;
 

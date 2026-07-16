@@ -1947,8 +1947,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "chrono",
+ "cron",
+ "dirs",
  "futures",
  "glob",
+ "legion-automation",
  "legion-core",
  "legion-mcp",
  "legion-plugin-sdk",
