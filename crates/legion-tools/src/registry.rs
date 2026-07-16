@@ -22,6 +22,7 @@ use crate::sandbox::{
     RestrictedSandboxBackend, SandboxBackend, SandboxBackendConfig, SandboxCapabilities,
     SandboxError, SandboxMode, SandboxUnavailableReason, sandbox_available,
 };
+use crate::scheduler::{SchedulerCreateTool, SchedulerDeleteTool, SchedulerListTool};
 use crate::todo::TodoWriteTool;
 use crate::tools::{
     AgentToAgentSendTool, ApplyPatchTool, EditTool, ExecTool, MemoryGetTool, MemoryIndexTool,
@@ -220,6 +221,22 @@ impl CoreToolRegistry {
             Arc::new(SwarmStatusTool::new(swarm_status_policy)),
         );
 
+        // Scheduler tools (automation Phase A). Creating and deleting jobs
+        // mutate persisted automation state, so they default to Prompt; listing
+        // is read-only and defaults to Off.
+        tools.insert(
+            "scheduler_create".to_string(),
+            Arc::new(SchedulerCreateTool::new()),
+        );
+        tools.insert(
+            "scheduler_delete".to_string(),
+            Arc::new(SchedulerDeleteTool::new()),
+        );
+        tools.insert(
+            "scheduler_list".to_string(),
+            Arc::new(SchedulerListTool::new()),
+        );
+
         // browser (tools-p1p2 Phase C). Defaults to Approval::Required: it
         // drives a real browser over the network (gap doc §4.4/§6.2). The
         // backend config rides in the opaque ToolConfig.extra: `cdpUrl`
@@ -349,6 +366,9 @@ mod tests {
             "memory_index",
             "enter_plan_mode",
             "exit_plan_mode",
+            "scheduler_create",
+            "scheduler_delete",
+            "scheduler_list",
         ] {
             assert!(registry.get(name).is_some(), "missing tool {}", name);
         }
