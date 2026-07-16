@@ -6,7 +6,7 @@ use futures::SinkExt;
 use futures::channel::mpsc::Sender;
 use legion_provider::types::{ChatMessage, ChatRole, ToolCall as ProviderToolCall};
 
-use crate::approval::{ApprovalCtx, ApprovalRequest};
+use crate::approval::{ApprovalCtx, ApprovalRequest, PermissionMode};
 use crate::memory::MemoryBackend;
 use crate::messenger::AgentMessenger;
 use crate::question::QuestionCtx;
@@ -14,6 +14,7 @@ use crate::subagent::SubagentSpawner;
 use crate::swarm::SwarmManager;
 use crate::tools::{
     CanUseToolFn, Permission, Tool, ToolCall, ToolContext, ToolError, ToolRegistry, ToolResult,
+    apply_permission_mode,
 };
 use crate::types::RunEvent;
 
@@ -139,7 +140,13 @@ pub async fn execute_tool_call(
     }
 
     if let Some(decider) = can_use_tool {
-        match decider(tool.name(), &input, sender).await {
+        let permission = decider(tool.name(), &input, sender).await;
+        let mode = approval
+            .as_ref()
+            .map(|ctx| ctx.permission_mode)
+            .unwrap_or(PermissionMode::Default);
+        let permission = apply_permission_mode(mode, permission, tool.as_ref(), &input);
+        match permission {
             Permission::Allow => {}
             Permission::Prompt { message } => match approval {
                 Some(ctx) => {
@@ -374,8 +381,8 @@ impl ToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::ApprovalGate;
-    use crate::tools::{Approval, Policy, ToolDefinitionExt};
+    use crate::approval::{ApprovalGate, NoOpApprovalNotifier};
+    use crate::tools::{Approval, Policy, ToolDefinitionExt, build_policy_decider};
     use async_trait::async_trait;
     use futures::StreamExt;
     use legion_provider::types::ToolDefinition;
@@ -389,6 +396,7 @@ mod tests {
         static POLICY: OnceLock<Policy> = OnceLock::new();
         POLICY.get_or_init(|| Policy {
             approval: Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })
@@ -804,6 +812,7 @@ mod tests {
             Some(ApprovalCtx {
                 gate,
                 interactive: false,
+                permission_mode: PermissionMode::Default,
             }),
             None,
             None,
@@ -852,6 +861,7 @@ mod tests {
                 Some(ApprovalCtx {
                     gate,
                     interactive: true,
+                    permission_mode: PermissionMode::Default,
                 }),
                 None,
                 None,
@@ -867,6 +877,333 @@ mod tests {
         let prompt_id = rx.recv().await.expect("notifier should fire");
         gate_for_resolve.resolve(&prompt_id, true).await;
         let result = handle.await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("read a"));
+    }
+
+    #[tokio::test]
+    async fn session_mode_bypass_permissions_executes_without_prompt() {
+        let registry = registry();
+        let gate = Arc::new(ApprovalGate::new(
+            Arc::new(NoOpApprovalNotifier),
+            Duration::from_secs(5),
+        ));
+        let can_use_tool: CanUseToolFn = Arc::new(|_n, _i, _s| {
+            Box::pin(async {
+                Permission::Prompt {
+                    message: "needs approval".to_string(),
+                }
+            })
+        });
+        let call = call("c1", "read", r#"{"path":"a"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            Some(ApprovalCtx {
+                gate,
+                interactive: false,
+                permission_mode: PermissionMode::BypassPermissions,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("read a"));
+    }
+
+    #[tokio::test]
+    async fn session_mode_dont_ask_denies_without_prompt() {
+        let registry = registry();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(ApprovalGate::new(
+            Arc::new(CapturingNotifier {
+                ids: Mutex::new(tx),
+            }),
+            Duration::from_secs(5),
+        ));
+        let can_use_tool: CanUseToolFn = Arc::new(|_n, _i, _s| {
+            Box::pin(async {
+                Permission::Prompt {
+                    message: "needs approval".to_string(),
+                }
+            })
+        });
+        let call = call("c1", "read", r#"{"path":"a"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            Some(ApprovalCtx {
+                gate,
+                interactive: true,
+                permission_mode: PermissionMode::DontAsk,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("dontAsk"),
+            "unexpected error: {}",
+            result.content
+        );
+        // No prompt should have been fired.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_mode_auto_allows_read_only_tool() {
+        let registry = registry();
+        let gate = Arc::new(ApprovalGate::new(
+            Arc::new(NoOpApprovalNotifier),
+            Duration::from_secs(5),
+        ));
+        let can_use_tool: CanUseToolFn = Arc::new(|_n, _i, _s| {
+            Box::pin(async {
+                Permission::Prompt {
+                    message: "needs approval".to_string(),
+                }
+            })
+        });
+        let call = call("c1", "read", r#"{"path":"a"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            Some(ApprovalCtx {
+                gate,
+                interactive: false,
+                permission_mode: PermissionMode::Auto,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("read a"));
+    }
+
+    #[tokio::test]
+    async fn session_mode_auto_prompts_for_mutating_tool() {
+        let registry = registry();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(ApprovalGate::new(
+            Arc::new(CapturingNotifier {
+                ids: Mutex::new(tx),
+            }),
+            Duration::from_secs(5),
+        ));
+        let can_use_tool: CanUseToolFn = Arc::new(|_n, _i, _s| {
+            Box::pin(async {
+                Permission::Prompt {
+                    message: "needs approval".to_string(),
+                }
+            })
+        });
+        let call = call("c1", "write", r#"{"path":"a","content":"x"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            Some(ApprovalCtx {
+                gate,
+                interactive: false,
+                permission_mode: PermissionMode::Auto,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
+        // Unattended prompt must fail closed.
+        assert!(result.is_error);
+        assert!(result.content.contains("approval denied"));
+    }
+
+    #[tokio::test]
+    async fn session_mode_accept_edits_allows_write_tool() {
+        let registry = registry();
+        let gate = Arc::new(ApprovalGate::new(
+            Arc::new(NoOpApprovalNotifier),
+            Duration::from_secs(5),
+        ));
+        let can_use_tool: CanUseToolFn = Arc::new(|_n, _i, _s| {
+            Box::pin(async {
+                Permission::Prompt {
+                    message: "needs approval".to_string(),
+                }
+            })
+        });
+        let call = call("c1", "write", r#"{"path":"a","content":"x"}"#);
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&can_use_tool),
+            None,
+            None,
+            Some(ApprovalCtx {
+                gate,
+                interactive: false,
+                permission_mode: PermissionMode::AcceptEdits,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("wrote"));
+    }
+
+    #[tokio::test]
+    async fn per_tool_permission_mode_overrides_approval() {
+        // A tool whose policy approval is Required but permissionMode is Auto
+        // should be auto-approved when it is read-only.
+        struct AutoReadTool;
+        #[async_trait]
+        impl Tool for AutoReadTool {
+            fn name(&self) -> &str {
+                "auto_read"
+            }
+            fn description(&self) -> &str {
+                "auto_read"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
+            }
+            fn policy(&self) -> &Policy {
+                use std::sync::OnceLock;
+                static POLICY: OnceLock<Policy> = OnceLock::new();
+                POLICY.get_or_init(|| Policy {
+                    approval: Approval::Required,
+                    permission_mode: Some(PermissionMode::Auto),
+                    allow_from: vec![],
+                    workspace_only: false,
+                })
+            }
+            fn is_read_only(&self, _input: &serde_json::Value) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                params: serde_json::Value,
+                _ctx: ToolContext,
+            ) -> Result<ToolResult, ToolError> {
+                let path = params["path"].as_str().unwrap_or("");
+                Ok(ToolResult::ok(format!("read {path}")))
+            }
+        }
+
+        struct AutoRegistry;
+        #[async_trait]
+        impl ToolRegistry for AutoRegistry {
+            fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+                if name == "auto_read" {
+                    Some(Arc::new(AutoReadTool))
+                } else {
+                    None
+                }
+            }
+            fn definitions(&self) -> Vec<ToolDefinition> {
+                vec![]
+            }
+        }
+
+        let registry: Arc<dyn ToolRegistry> = Arc::new(AutoRegistry);
+        let gate = Arc::new(ApprovalGate::new(
+            Arc::new(NoOpApprovalNotifier),
+            Duration::from_secs(5),
+        ));
+        let decider = build_policy_decider(registry.clone());
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "auto_read".to_string(),
+            arguments: r#"{"path":"a"}"#.to_string(),
+        };
+        let result = execute_tool_call(
+            &call,
+            Path::new("/tmp"),
+            "s1",
+            "a1",
+            None,
+            registry.as_ref(),
+            Some(&decider),
+            None,
+            None,
+            Some(ApprovalCtx {
+                gate,
+                interactive: false,
+                permission_mode: PermissionMode::Default,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+        )
+        .await;
         assert!(!result.is_error);
         assert!(result.content.contains("read a"));
     }

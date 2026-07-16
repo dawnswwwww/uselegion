@@ -189,6 +189,7 @@ mod tests {
     fn open_policy() -> Policy {
         Policy {
             approval: legion_runtime::tools::Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         }

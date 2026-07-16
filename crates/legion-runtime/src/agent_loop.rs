@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use futures::channel::mpsc::Sender;
 use futures::{SinkExt, StreamExt};
 
-use crate::approval::{ApprovalCtx, ApprovalGate, NoOpApprovalNotifier};
+use crate::approval::{ApprovalCtx, ApprovalGate, NoOpApprovalNotifier, PermissionMode};
 use crate::auto_extract::AutoExtractor;
 use crate::commitments::CommitmentExtractor;
 use crate::compaction::Compactor;
@@ -575,6 +575,7 @@ pub(crate) async fn run_loop(
         let approval_ctx = ApprovalCtx {
             gate: approval_gate,
             interactive: request.interactive,
+            permission_mode: PermissionMode::Default,
         };
         let question_gate = request.question_gate.clone().unwrap_or_else(|| {
             Arc::new(QuestionGate::new(
@@ -821,6 +822,7 @@ mod tests {
         static POLICY: OnceLock<Policy> = OnceLock::new();
         POLICY.get_or_init(|| Policy {
             approval: Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })
@@ -880,6 +882,7 @@ mod tests {
         static POLICY: OnceLock<Policy> = OnceLock::new();
         POLICY.get_or_init(|| Policy {
             approval: Approval::Required,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })

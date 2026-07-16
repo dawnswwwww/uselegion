@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::approval::PermissionMode;
 use crate::memory::MemoryBackend;
 use crate::question::QuestionGate;
 use crate::todo::SharedTodoStore;
@@ -179,10 +180,27 @@ impl FromStr for Approval {
     }
 }
 
+impl From<Approval> for PermissionMode {
+    /// Behavior-preserving mapping from the legacy approval enum.
+    ///
+    /// `Approval::Required` maps to `PermissionMode::Default` so that existing
+    /// interactive prompts are preserved; unattended runs continue to fail
+    /// closed at the approval gate.
+    fn from(approval: Approval) -> Self {
+        match approval {
+            Approval::Off => PermissionMode::BypassPermissions,
+            Approval::Prompt | Approval::Required => PermissionMode::Default,
+        }
+    }
+}
+
 /// Per-tool policy derived from configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
     pub approval: Approval,
+    /// Optional richer permission mode. When `None`, the effective mode is
+    /// derived from [`Policy::approval`].
+    pub permission_mode: Option<PermissionMode>,
     pub allow_from: Vec<String>,
     pub workspace_only: bool,
 }
@@ -191,6 +209,8 @@ impl Policy {
     /// Build a policy from the raw config for a specific tool.
     ///
     /// `default_approval` is used when no explicit `approval` key is present.
+    /// If `permissionMode` is present it takes precedence; otherwise the mode
+    /// is derived from `approval`.
     pub fn from_config(config: Option<&ToolConfig>, default_approval: Approval) -> Self {
         let config = config.cloned().unwrap_or_default();
         let approval = config
@@ -198,12 +218,26 @@ impl Policy {
             .as_deref()
             .and_then(|s| s.parse::<Approval>().ok())
             .unwrap_or(default_approval);
+        let permission_mode = config
+            .permission_mode
+            .as_deref()
+            .and_then(|s| s.parse::<PermissionMode>().ok());
 
         Self {
             approval,
+            permission_mode,
             allow_from: config.allow_from,
             workspace_only: config.workspace_only.unwrap_or(false),
         }
+    }
+
+    /// The effective permission mode for this policy.
+    ///
+    /// When a `permission_mode` is configured explicitly it wins. Otherwise the
+    /// legacy `approval` value is converted with the behavior-preserving
+    /// mapping: `Off` -> `BypassPermissions`, `Prompt`/`Required` -> `Default`.
+    pub fn effective_permission_mode(&self) -> PermissionMode {
+        self.permission_mode.unwrap_or(self.approval.into())
     }
 
     /// Returns `true` if the sender is explicitly allowed.
@@ -237,25 +271,73 @@ pub fn check_policy(policy: &Policy, sender: Option<&str>) -> Result<(), String>
     }
 }
 
+/// Apply a [`PermissionMode`] to a permission decision returned by the policy
+/// decider. Hard denials are never overridden; `Prompt` may be promoted to
+/// `Allow` or demoted to `Deny` depending on the mode and the tool.
+pub fn apply_permission_mode(
+    mode: PermissionMode,
+    permission: Permission,
+    tool: &dyn Tool,
+    input: &serde_json::Value,
+) -> Permission {
+    match permission {
+        Permission::Allow | Permission::Deny { .. } => permission,
+        Permission::Prompt { message } => match mode {
+            PermissionMode::Default => Permission::Prompt { message },
+            PermissionMode::BypassPermissions => Permission::Allow,
+            PermissionMode::DontAsk => Permission::Deny {
+                reason: format!(
+                    "tool '{}' requires approval but permission mode is dontAsk",
+                    tool.name()
+                ),
+            },
+            PermissionMode::AcceptEdits => {
+                if matches!(tool.name(), "write" | "edit" | "apply_patch") {
+                    Permission::Allow
+                } else {
+                    Permission::Prompt { message }
+                }
+            }
+            PermissionMode::Auto | PermissionMode::Plan => {
+                if tool.is_read_only(input) {
+                    Permission::Allow
+                } else {
+                    Permission::Prompt { message }
+                }
+            }
+        },
+    }
+}
+
 /// Build a decider that uses each tool's configured [`Policy`] to decide whether
 /// execution is allowed, should prompt for approval, or is denied.
+///
+/// When a tool's policy specifies a [`PermissionMode`], the mode is resolved
+/// here so that `execute_tool_call` only needs to handle the session-level
+/// override.
 pub fn build_policy_decider(registry: Arc<dyn ToolRegistry>) -> CanUseToolFn {
-    Arc::new(move |name, _input, sender| {
+    Arc::new(move |name, input, sender| {
         let registry = registry.clone();
         let name = name.to_string();
         let sender = sender.map(|s| s.to_string());
+        let input = input.clone();
         Box::pin(async move {
             match registry.get(&name) {
                 Some(tool) => {
                     let policy = tool.policy();
                     match check_policy(policy, sender.as_deref()) {
                         Ok(()) => Permission::Allow,
-                        Err(_) => match policy.approval {
-                            Approval::Off => Permission::Allow,
-                            Approval::Prompt | Approval::Required => Permission::Prompt {
-                                message: format!("tool '{name}' requires approval"),
-                            },
-                        },
+                        Err(_) => {
+                            let mode = policy.effective_permission_mode();
+                            apply_permission_mode(
+                                mode,
+                                Permission::Prompt {
+                                    message: format!("tool '{name}' requires approval"),
+                                },
+                                tool.as_ref(),
+                                &input,
+                            )
+                        }
                     }
                 }
                 None => Permission::Deny {
@@ -383,6 +465,7 @@ mod tests {
     fn approval_off_allows_anyone() {
         let policy = Policy {
             approval: Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         };
@@ -394,6 +477,7 @@ mod tests {
     fn required_blocks_unknown_sender() {
         let policy = Policy {
             approval: Approval::Required,
+            permission_mode: None,
             allow_from: vec!["local".to_string()],
             workspace_only: false,
         };
@@ -405,6 +489,7 @@ mod tests {
     fn required_allows_matching_sender() {
         let policy = Policy {
             approval: Approval::Required,
+            permission_mode: None,
             allow_from: vec!["tg:123".to_string()],
             workspace_only: false,
         };
@@ -443,9 +528,36 @@ mod tests {
     }
 
     #[test]
+    fn from_config_parses_permission_mode() {
+        let cfg = ToolConfig {
+            permission_mode: Some("auto".to_string()),
+            ..Default::default()
+        };
+        let policy = Policy::from_config(Some(&cfg), Approval::Prompt);
+        assert_eq!(policy.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(policy.effective_permission_mode(), PermissionMode::Auto);
+    }
+
+    #[test]
+    fn from_config_permission_mode_takes_precedence_over_approval() {
+        let cfg = ToolConfig {
+            approval: Some("required".to_string()),
+            permission_mode: Some("bypass_permissions".to_string()),
+            ..Default::default()
+        };
+        let policy = Policy::from_config(Some(&cfg), Approval::Prompt);
+        assert_eq!(policy.approval, Approval::Required);
+        assert_eq!(
+            policy.effective_permission_mode(),
+            PermissionMode::BypassPermissions
+        );
+    }
+
+    #[test]
     fn sender_allowed_is_case_insensitive() {
         let policy = Policy {
             approval: Approval::Required,
+            permission_mode: None,
             allow_from: vec!["alice".to_string()],
             workspace_only: false,
         };
@@ -458,11 +570,13 @@ mod tests {
     fn check_policy_treats_prompt_like_required() {
         let prompt = Policy {
             approval: Approval::Prompt,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         };
         let required = Policy {
             approval: Approval::Required,
+            permission_mode: None,
             ..prompt.clone()
         };
         // Unknown senders are rejected identically, whether attended or not
@@ -530,6 +644,7 @@ mod tests {
                 tool_name: "fake",
                 policy: Policy {
                     approval,
+                    permission_mode: None,
                     allow_from,
                     workspace_only: false,
                 },
@@ -576,5 +691,240 @@ mod tests {
         let decider = build_policy_decider(registry);
         let decision = decider("missing", &serde_json::json!({}), None).await;
         assert!(matches!(decision, Permission::Deny { .. }));
+    }
+
+    fn read_only_policy() -> &'static Policy {
+        use std::sync::OnceLock;
+        static POLICY: OnceLock<Policy> = OnceLock::new();
+        POLICY.get_or_init(|| Policy {
+            approval: Approval::Prompt,
+            permission_mode: None,
+            allow_from: vec![],
+            workspace_only: false,
+        })
+    }
+
+    struct ReadOnlyFakeTool;
+
+    #[async_trait]
+    impl Tool for ReadOnlyFakeTool {
+        fn name(&self) -> &str {
+            "read_only_fake"
+        }
+        fn description(&self) -> &str {
+            "read only fake"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn policy(&self) -> &Policy {
+            read_only_policy()
+        }
+        fn is_read_only(&self, _input: &serde_json::Value) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::ok(""))
+        }
+    }
+
+    struct MutatingFakeTool;
+
+    #[async_trait]
+    impl Tool for MutatingFakeTool {
+        fn name(&self) -> &str {
+            "write"
+        }
+        fn description(&self) -> &str {
+            "write"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn policy(&self) -> &Policy {
+            read_only_policy()
+        }
+        fn is_read_only(&self, _input: &serde_json::Value) -> bool {
+            false
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::ok(""))
+        }
+    }
+
+    #[test]
+    fn apply_mode_default_keeps_prompt() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::Default,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(matches!(result, Permission::Prompt { .. }));
+    }
+
+    #[test]
+    fn apply_mode_bypass_allows_prompt() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::BypassPermissions,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn apply_mode_bypass_respects_deny() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Deny {
+            reason: "no".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::BypassPermissions,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(matches!(result, Permission::Deny { .. }));
+    }
+
+    #[test]
+    fn apply_mode_dont_ask_denies_prompt() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::DontAsk,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(matches!(result, Permission::Deny { .. }));
+    }
+
+    #[test]
+    fn apply_mode_auto_allows_read_only() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::Auto,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn apply_mode_auto_keeps_prompt_for_mutating() {
+        let tool = MutatingFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::Auto,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(matches!(result, Permission::Prompt { .. }));
+    }
+
+    #[test]
+    fn apply_mode_accept_edits_allows_write_tools() {
+        let tool = MutatingFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::AcceptEdits,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn apply_mode_accept_edits_keeps_prompt_for_non_edit() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::AcceptEdits,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(matches!(result, Permission::Prompt { .. }));
+    }
+
+    #[test]
+    fn apply_mode_plan_allows_read_only() {
+        let tool = ReadOnlyFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::Plan,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn apply_mode_plan_keeps_prompt_for_mutating() {
+        let tool = MutatingFakeTool;
+        let permission = Permission::Prompt {
+            message: "ask".to_string(),
+        };
+        let result = apply_permission_mode(
+            PermissionMode::Plan,
+            permission,
+            &tool,
+            &serde_json::json!({}),
+        );
+        assert!(matches!(result, Permission::Prompt { .. }));
+    }
+
+    #[test]
+    fn approval_to_permission_mode_preserves_existing_behavior() {
+        assert_eq!(
+            PermissionMode::from(Approval::Off),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            PermissionMode::from(Approval::Prompt),
+            PermissionMode::Default
+        );
+        // Required maps to Default so that interactive prompts and unattended
+        // gate denials are preserved.
+        assert_eq!(
+            PermissionMode::from(Approval::Required),
+            PermissionMode::Default
+        );
     }
 }

@@ -853,6 +853,7 @@ mod tests {
         static POLICY: OnceLock<Policy> = OnceLock::new();
         POLICY.get_or_init(|| Policy {
             approval: Approval::Required,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })

@@ -890,6 +890,9 @@ fn default_true() -> bool {
 pub struct ToolConfig {
     #[serde(default)]
     pub approval: Option<String>,
+    /// Richer permission mode that replaces `approval` when present.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     #[serde(default)]
     pub allow_from: Vec<String>,
     #[serde(default)]

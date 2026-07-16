@@ -23,6 +23,7 @@ impl AskUserTool {
         Self {
             policy: Policy {
                 approval: Approval::Off,
+                permission_mode: None,
                 allow_from: Vec::new(),
                 workspace_only: false,
             },
