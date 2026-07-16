@@ -68,6 +68,75 @@
 
 ## 开发日志(最新在上)
 
+### 2026-07-16 · Phase 5 完成：Tool taxonomy + LSP + 多媒体工具扩展
+- **type**: feature
+- **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 5）
+- **目标**:补齐 Grok CLI 风格的工具生态差距：统一工具分类与 canonical envelope、新增 LSP 工具、新增 `image_edit`/`video_generate` 多媒体工具，并修复 Phase 5 并行开发中遗留的编译/测试问题。
+- **改动**:
+  - 工具分类（tool taxonomy）：
+    - `crates/legion-runtime/src/tool_taxonomy.rs`（新建）：`ToolKind`、`ToolNamespace`、`CanonicalToolMeta`，定义统一工具身份与分类。
+    - `crates/legion-runtime/src/tools.rs`：`Tool` trait 新增 `kind()`/`namespace()`/`canonical_meta()` 默认方法；修复 `canonical_meta` 默认实现的生命周期问题（使用 `Cow::Owned`）。
+    - `crates/legion-runtime/src/lib.rs`：在根重新导出 `ToolKind` / `ToolNamespace` / `CanonicalToolMeta`。
+    - `crates/legion-runtime/src/types.rs`：`RunEvent::ToolEnd` 增加 `canonical_meta` 字段，供 TUI/telemetry 统一展示。
+    - `crates/legion-tools/src/tools.rs`：引入 `legion_tool_taxonomy!` 宏，为所有 built-in 工具（read/write/edit/exec/web_search/web_fetch/memory_*/spawn_subagent/run_coordinator/swarm_*/ask_user/...）标记 `ToolKind` 与 `ToolNamespace::Legion`。
+    - `crates/legion-tools/src/{background_task,list_dir,grep,browser,ask_user,mcp,plan_mode,scheduler,todo}.rs`：为新增/已有工具补充 `kind()`/`namespace()` 实现。
+    - `crates/legion-runtime/src/tool_pipeline.rs`：在 `ToolEnd` 事件中填充 `canonical_meta`。
+  - LSP 工具：
+    - `crates/legion-tools/src/lsp.rs`（新建）：`LspTool` + `LspBackend` trait + `StdioLspBackend`；支持 `definition`/`references`/`diagnostics`/`format` 四种 action；format 结果通过 `apply_text_edits` 写回文件。
+    - `crates/legion-tools/src/registry.rs`：注册 `lsp`，支持通过 `tools.lsp.extra.server/args` 配置 LSP server。
+    - 修复 `apply_edit`/`apply_text_edits` 测试中的列号 off-by-one，使其与 LSP 字符列语义一致。
+  - 多媒体工具：
+    - `crates/legion-provider/src/{provider.rs,types.rs,router.rs}`：扩展 `Provider` trait，新增 `generate_video` 默认返回 `VideoNotSupported`；`ProviderRouter` 新增 `generate_video` 路由；补充 `VideoRequest`/`VideoResponse`/`GeneratedVideo` 类型。
+    - `crates/legion-tools/src/image_edit.rs`（新建）：`ImageEditTool`，基于 `ProviderRouter::generate_image`，将生成结果物化到 `workspace/generated/`。
+    - `crates/legion-tools/src/video_generate.rs`（新建）：`VideoGenerateTool`，基于 `ProviderRouter::generate_video`。
+    - `crates/legion-tools/src/registry.rs`：在传入 `ProviderRouter` 时注册 `image_edit` 与 `video_generate`，默认 `Approval::Required`。
+    - `crates/legion-host/src/assembly.rs`：`assemble_agent_host` 使用 `new_with_mcp_and_router`，将 `main_router` 注入 core tool registry。
+  - 稳定性修复：
+    - `crates/legion-tools/src/tools.rs`：`ctx_with_background_tasks` 使用唯一 `session_id`（基于 TempDir 名称），避免并发 background-task 测试因共享 `~/.legion/sessions/s1/tasks/` 目录而互相覆盖日志。
+    - 补齐所有 `RunEvent::ToolEnd` 构造点（`agent_loop.rs` denied calls、`legion-acp/src/harness.rs`、`legion-host/src/turn.rs` 测试）的 `canonical_meta` 字段。
+- **决策**:
+  - `image_edit` 当前复用 `generate_image` 路由而非独立 provider endpoint：设计文档允许“复用 generate_image 的 edit 变体”，且 Legion 暂无 provider 实现原生 image-edit；后续 provider 支持后可在 `ImageRequest` 中加入 mask/reference 字段而无需改工具名。
+  - `canonical_meta` 附加在 `ToolEnd` 事件上而非工具结果中，避免 provider wire 格式膨胀；TUI/telemetry 可按需读取。
+  - LSP format 默认 `Approval::Prompt`，其余 action 默认 `Approval::Off`，与文件变更权限模型一致。
+- **验证**:
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+  - `cargo test --workspace --all-targets` 全量通过（E2E 需要 `MINIMAX_API_KEY` 的测试正确忽略）
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
+- **遗留**: —
+
+### 2026-07-16 · Phase 4 完成：`legion-telemetry` + unified log + session metrics
+- **type**: feature
+- **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 4）
+- **目标**:补齐 Grok CLI 风格的可观测性层：新建 `legion-telemetry` crate，实现统一 JSONL 日志（5 MB 轮替）与 session 生命周期/turn/tool/compaction 埋点，并在 `MetricsRegistry` 暴露对应的 Prometheus 业务指标。
+- **改动**:
+  - 新建 `crates/legion-telemetry/`：
+    - `src/unified_log.rs`：`UnifiedLog` / `LogEntry` / `LogSource` / `LogLevel`；按 `max_log_bytes` 大小触发轮替，保留一份 `.1` 备份；提供 `emit`（结构化）与 `emit_raw`（任意 JSON）。
+    - `src/session_metrics.rs`：`SessionMetric` enum，覆盖 `SessionStarted` / `Turn` / `TurnCompleted` / `ToolCalled` / `Compaction` / `DoomLoopRecovery`。
+    - `src/client.rs`：`TelemetryClient::from_config(&TelemetryConfig)`，按配置开启 unified log 与 session metrics；提供 `log` / `log_session_event`。
+    - 单元测试覆盖 JSONL 写入、轮替、`disabled` 模式不创建文件。
+  - `crates/legion-core/src/config.rs`：新增 `TelemetryConfig`（`enabled`/`mode`/`unifiedLog`/`sessionMetrics`/`unifiedLogPath`/`sessionMetricsPath`/`maxLogBytes`/`eventsUrl`/`mixpanelToken`），默认路径 `~/.legion/logs/unified.jsonl` 与 `~/.legion/logs/session-metrics.jsonl`；加入顶层 `Config.telemetry`。
+  - `crates/legion-runtime/src/agent_loop.rs` / `context_engine.rs`：
+    - `AgentRuntime` 与 `LegacyContextEngine` 增加 `with_telemetry(Option<Arc<TelemetryClient>>)`。
+    - `run_loop` 在 Lifecycle Start 后 emit `SessionStarted`；每轮 emit `Turn`（含 `input_tokens`）；模型响应后 emit `TurnCompleted`（含 `output_tokens`、`tool_calls`、`duration_ms`）；compaction 后 emit `Compaction`（含 `tokens_before`/`tokens_after`）。
+    - `run_tool_batches` 增加 `telemetry` 与 `turn_number` 参数；每个工具调用前后计时，emit `ToolCalled`（含 `read_only`、`duration_ms`）。
+    - 新增 `agent_loop::tests::telemetry_emits_session_metrics_to_configured_log` 集成测试，验证 metrics 文件包含 `session_started` 与 `turn_completed`。
+  - `crates/legion-host/src/metrics.rs`：新增 `MetricsRegistry::record_session_metric(&SessionMetric)`，将事件转换为 `legion_sessions_started_total` / `legion_turns_total` / `legion_turns_completed_total` / `legion_output_tokens_total` / `legion_tool_calls_total` / `legion_compactions_total` 等 Prometheus 指标。
+  - 依赖：`legion-runtime` 与 `legion-host` 的 `Cargo.toml` 加入 `legion-telemetry`。
+- **决策**:
+  - 远程 sink（Mixpanel / events HTTP / OTLP / Sentry）本次仅保留配置字段，不引入额外依赖；默认只写本地 JSONL，保持运行时依赖面最小。
+  - `MetricsRegistry` 与 runtime 之间避免循环依赖：`SessionMetric` 定义在 `legion-telemetry`，`MetricsRegistry::record_session_metric` 供 host/gateway 在消费事件流时调用，runtime 只负责 emit。
+  - Token 计数复用现有 `token_counter::estimate_total_tokens` / `count_tokens`（cl100k 近似），确保 telemetry 数据与 compaction 决策一致。
+- **验证**:
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy -p legion-telemetry -p legion-core -p legion-runtime -p legion-host -- -D warnings` 零警告
+  - `cargo test -p legion-telemetry` 5 个测试通过
+  - `cargo test -p legion-core` 67 个测试通过
+  - `cargo test -p legion-runtime` 258 个测试通过
+  - `cargo test -p legion-host` 79 个测试通过
+  - 全量 workspace 验证将在 Phase 5 合并后统一执行
+- **遗留**: —
+
 ### 2026-07-16 · Phase 3 完成：双阶段 compaction + TodoGate
 - **type**: feature
 - **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 3）

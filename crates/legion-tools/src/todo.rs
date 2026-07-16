@@ -1,10 +1,23 @@
 //! Todo list tool: lets the agent update a visible session checklist.
 
 use async_trait::async_trait;
-use legion_runtime::{TodoItem, TodoList, Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::{
+    TodoItem, TodoList, Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult,
+};
 use serde_json::json;
 
 use crate::policy::Policy;
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// Update the session todo list.
 pub struct TodoWriteTool {
@@ -78,6 +91,8 @@ impl Tool for TodoWriteTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::Other);
 
     async fn execute(
         &self,

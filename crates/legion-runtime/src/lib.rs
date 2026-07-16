@@ -23,6 +23,7 @@ pub mod todo;
 pub mod todo_gate;
 pub mod token_counter;
 pub mod tool_pipeline;
+pub mod tool_taxonomy;
 pub mod tools;
 pub mod types;
 
@@ -60,6 +61,7 @@ pub use surfaced::SurfacedStore;
 pub use swarm::{SwarmError, SwarmManager, SwarmMessage, TeammateInfo, TeammateStatus};
 pub use todo::{JsonTodoStore, SharedTodoStore, TodoItem, TodoList, TodoStatus, TodoStore};
 pub use todo_gate::{TodoGate, TodoGateResult, todo_gate_reminder};
+pub use tool_taxonomy::{CanonicalToolMeta, ToolKind, ToolNamespace};
 pub use tools::{
     BackgroundTaskOutput, BackgroundTaskRegistry, BackgroundTaskResult, Tool, ToolCall,
     ToolContext, ToolError, ToolRegistry, ToolResult,

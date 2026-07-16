@@ -11,6 +11,7 @@ legion-core = { path = "../legion-core" }
 legion-provider = { path = "../legion-provider" }
 legion-plugin-sdk = { path = "../legion-plugin-sdk" }
 legion-skills = { path = "../legion-skills" }
+legion-telemetry = { path = "../legion-telemetry" }
 async-trait = "0.1"
 futures = { workspace = true }
 serde = { workspace = true }

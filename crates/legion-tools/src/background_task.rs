@@ -6,12 +6,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use legion_runtime::{
     BackgroundTaskOutput, BackgroundTaskRegistry as BackgroundTaskRegistryTrait,
-    BackgroundTaskResult, Tool, ToolContext, ToolError, ToolResult,
+    BackgroundTaskResult, Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::policy::{Approval, Policy};
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// Default base directory for session-local task logs.
 pub fn default_task_log_dir(session_id: &str) -> PathBuf {
@@ -286,6 +297,8 @@ impl Tool for WaitTasksTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::WaitTasksAction);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -378,6 +391,8 @@ impl Tool for KillTaskTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::KillTaskAction);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -451,6 +466,8 @@ impl Tool for GetTaskOutputTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::Other);
 
     async fn execute(
         &self,

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::SinkExt;
 use futures::channel::mpsc::Sender;
@@ -18,6 +19,7 @@ use crate::tools::{
     apply_permission_mode,
 };
 use crate::types::RunEvent;
+use legion_telemetry::{SessionMetric, TelemetryClient};
 
 /// A batch of tool calls that share the same concurrency mode.
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +267,8 @@ pub async fn run_tool_batches(
     todo_store: Option<crate::SharedTodoStore>,
     background_tasks: Option<Arc<dyn crate::tools::BackgroundTaskRegistry>>,
     plan_mode_tracker: Option<Arc<tokio::sync::Mutex<PlanModeTracker>>>,
+    telemetry: Option<Arc<TelemetryClient>>,
+    turn_number: usize,
     tx: &mut Sender<RunEvent>,
 ) -> Vec<ChatMessage> {
     let mut results = Vec::new();
@@ -294,9 +298,16 @@ pub async fn run_tool_batches(
                 let todo_store = todo_store.clone();
                 let background_tasks = background_tasks.clone();
                 let plan_mode_tracker = plan_mode_tracker.clone();
+                let input =
+                    serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+                let read_only = registry
+                    .get(&call.name)
+                    .map(|t| t.is_read_only(&input))
+                    .unwrap_or(false);
+                let start = Instant::now();
 
                 handles.push(tokio::spawn(async move {
-                    execute_tool_call(
+                    let result = execute_tool_call(
                         &call,
                         &workspace,
                         &session_id,
@@ -318,7 +329,8 @@ pub async fn run_tool_batches(
                         background_tasks,
                         plan_mode_tracker,
                     )
-                    .await
+                    .await;
+                    (result, start.elapsed().as_millis() as u64, read_only)
                 }));
             }
 
@@ -331,16 +343,35 @@ pub async fn run_tool_batches(
                 )
                 .await;
 
-                let result = match handle.await {
+                let (result, duration_ms, read_only) = match handle.await {
                     Ok(res) => res,
-                    Err(join_err) => ToolResult::error(format!("tool task panicked: {join_err}")),
+                    Err(join_err) => (
+                        ToolResult::error(format!("tool task panicked: {join_err}")),
+                        0,
+                        false,
+                    ),
                 };
+
+                log_tool_call(
+                    &telemetry,
+                    session_id,
+                    turn_number,
+                    &call.name,
+                    read_only,
+                    duration_ms,
+                )
+                .await;
+
+                let input =
+                    serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+                let canonical_meta = registry.get(&call.name).map(|t| t.canonical_meta(&input));
 
                 send(
                     tx,
                     RunEvent::ToolEnd {
                         tool_call: call.clone(),
                         result: result.clone(),
+                        canonical_meta,
                     },
                 )
                 .await;
@@ -357,6 +388,13 @@ pub async fn run_tool_batches(
                 )
                 .await;
 
+                let input =
+                    serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+                let read_only = registry
+                    .get(&call.name)
+                    .map(|t| t.is_read_only(&input))
+                    .unwrap_or(false);
+                let start = Instant::now();
                 let result = execute_tool_call(
                     &call,
                     workspace,
@@ -380,12 +418,26 @@ pub async fn run_tool_batches(
                     plan_mode_tracker.clone(),
                 )
                 .await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+
+                log_tool_call(
+                    &telemetry,
+                    session_id,
+                    turn_number,
+                    &call.name,
+                    read_only,
+                    duration_ms,
+                )
+                .await;
+
+                let canonical_meta = registry.get(&call.name).map(|t| t.canonical_meta(&input));
 
                 send(
                     tx,
                     RunEvent::ToolEnd {
                         tool_call: call.clone(),
                         result: result.clone(),
+                        canonical_meta,
                     },
                 )
                 .await;
@@ -411,6 +463,27 @@ fn tool_result_message(tool_call_id: &str, result: &ToolResult) -> ChatMessage {
 
 async fn send(tx: &mut Sender<RunEvent>, event: RunEvent) {
     let _ = tx.send(event).await;
+}
+
+async fn log_tool_call(
+    telemetry: &Option<Arc<TelemetryClient>>,
+    session_id: &str,
+    turn_number: usize,
+    tool: &str,
+    read_only: bool,
+    duration_ms: u64,
+) {
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .log_session_event(SessionMetric::ToolCalled {
+                session_id: session_id.to_string(),
+                turn_number,
+                tool: tool.to_string(),
+                read_only,
+                duration_ms,
+            })
+            .await;
+    }
 }
 
 impl ToolCall {
@@ -1342,6 +1415,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            1,
             &mut tx,
         )
         .await;
@@ -1428,6 +1503,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            1,
             &mut tx,
         )
         .await;

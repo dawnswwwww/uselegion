@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::approval::ApprovalGate;
 use crate::memory::MemoryError;
 use crate::question::QuestionGate;
-use crate::tools::{ToolCall, ToolError, ToolResult};
+use crate::tools::{CanonicalToolMeta, ToolCall, ToolError, ToolResult};
 use legion_provider::types::ProviderError;
 
 /// Errors that can occur during an agent run.
@@ -62,6 +62,8 @@ pub enum RunEvent {
     ToolEnd {
         tool_call: ToolCall,
         result: ToolResult,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        canonical_meta: Option<CanonicalToolMeta>,
     },
     Compaction {
         summary: String,

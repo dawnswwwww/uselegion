@@ -2,12 +2,23 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use glob::Pattern;
-use legion_runtime::{Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use regex::Regex;
 use serde_json::json;
 
 use crate::policy::Policy;
 use crate::tools::resolve_tool_path;
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // grep
@@ -74,6 +85,8 @@ impl Tool for GrepTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::Search);
 
     async fn execute(
         &self,

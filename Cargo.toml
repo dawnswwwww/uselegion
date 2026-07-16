@@ -16,6 +16,7 @@ members = [
     "crates/legion-web",
     "crates/legion-skills",
     "crates/legion-mcp",
+    "crates/legion-telemetry",
 ]
 resolver = "3"
 
@@ -45,6 +46,7 @@ hmac = "0.12"
 
 # logging
 tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
 
 # web / http
 reqwest = { version = "0.12", features = ["json"] }

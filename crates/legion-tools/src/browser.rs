@@ -24,12 +24,23 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use legion_runtime::{Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use serde_json::{Value, json};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::policy::Policy;
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// Maximum characters returned by the `read` action.
 const MAX_READ_CHARS: usize = 8000;
@@ -421,6 +432,8 @@ impl Tool for BrowserTool {
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::Other);
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<ToolResult, ToolError> {
         let action = params

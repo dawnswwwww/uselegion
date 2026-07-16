@@ -174,6 +174,7 @@ async fn run_acp(
                             RunEvent::ToolEnd {
                                 tool_call: runtime_call,
                                 result: result.clone(),
+                                canonical_meta: None,
                             },
                         )
                         .await;

@@ -19,6 +19,7 @@ legion-automation = { path = "../legion-automation" }
 legion-acp = { path = "../legion-acp" }
 legion-channel = { path = "../legion-channel" }
 legion-skills = { path = "../legion-skills" }
+legion-telemetry = { path = "../legion-telemetry" }
 
 async-trait = "0.1"
 base64 = { workspace = true }

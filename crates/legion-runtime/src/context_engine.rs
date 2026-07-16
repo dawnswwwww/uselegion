@@ -17,6 +17,7 @@ use crate::types::{RunRequest, RunStream, RuntimeError};
 use legion_core::config::{Config, RecallConfig};
 use legion_provider::router::ProviderRouter;
 use legion_skills::Skill;
+use legion_telemetry::TelemetryClient;
 
 /// Strategy for assembling, compacting, and executing the agent context.
 ///
@@ -59,6 +60,7 @@ pub struct LegacyContextEngine {
     messenger: Option<Arc<dyn AgentMessenger>>,
     swarm: Option<Arc<SwarmManager>>,
     todo_gate: TodoGate,
+    telemetry: Option<Arc<TelemetryClient>>,
 }
 
 impl LegacyContextEngine {
@@ -89,6 +91,7 @@ impl LegacyContextEngine {
             messenger: None,
             swarm: None,
             todo_gate,
+            telemetry: None,
         }
     }
 
@@ -156,6 +159,12 @@ impl LegacyContextEngine {
         self.swarm = swarm;
         self
     }
+
+    /// Attach the telemetry client forwarded to each run loop.
+    pub fn with_telemetry(mut self, telemetry: Option<Arc<TelemetryClient>>) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
 }
 
 #[async_trait]
@@ -187,6 +196,7 @@ impl ContextEngine for LegacyContextEngine {
         let messenger = self.messenger.clone();
         let swarm = self.swarm.clone();
         let todo_gate = self.todo_gate.clone();
+        let telemetry = self.telemetry.clone();
 
         let (mut tx, rx) = channel::<crate::types::RunEvent>(128);
 
@@ -209,6 +219,7 @@ impl ContextEngine for LegacyContextEngine {
                 messenger,
                 swarm,
                 todo_gate,
+                telemetry,
                 &mut tx,
             )
             .await

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ use crate::question::QuestionGate;
 use crate::todo::SharedTodoStore;
 
 pub use legion_core::config::ToolConfig;
+
+pub use crate::tool_taxonomy::{CanonicalToolMeta, ToolKind, ToolNamespace};
 
 /// Result of a background task once it has completed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -460,6 +463,36 @@ pub trait Tool: Send + Sync {
     /// until they explicitly opt-in to being read-only.
     fn is_read_only(&self, _input: &serde_json::Value) -> bool {
         false
+    }
+
+    /// Semantic kind of this tool.
+    ///
+    /// Default is [`ToolKind::Other`] so existing tools keep compiling.
+    fn kind(&self) -> ToolKind {
+        ToolKind::Other
+    }
+
+    /// Namespace identifying where this tool originates.
+    ///
+    /// Default is [`ToolNamespace::Legion`] so existing tools keep compiling.
+    fn namespace(&self) -> ToolNamespace {
+        ToolNamespace::Legion
+    }
+
+    /// Build a canonical metadata envelope for this invocation.
+    ///
+    /// The default implementation uses the tool's name, kind, namespace, and
+    /// read-only flag. Tools may override this if they need a richer label or
+    /// input snapshot.
+    fn canonical_meta(&self, input: &serde_json::Value) -> CanonicalToolMeta {
+        CanonicalToolMeta::new(
+            self.name().to_string(),
+            self.kind(),
+            self.namespace(),
+            Cow::Owned(self.name().to_string()),
+            self.is_read_only(input),
+            Some(input.clone()),
+        )
     }
 
     /// Returns `true` if this tool is destructive (e.g. deletes data).

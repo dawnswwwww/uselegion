@@ -1,11 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use legion_runtime::{Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use serde_json::json;
 
 use crate::policy::Policy;
 use crate::tools::resolve_tool_path;
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// Maximum recursion depth for `list_dir` when `recursive` is true.
 const DEFAULT_MAX_DEPTH: usize = 3;
@@ -60,6 +71,8 @@ impl Tool for ListDirTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::ListDir);
 
     async fn execute(
         &self,

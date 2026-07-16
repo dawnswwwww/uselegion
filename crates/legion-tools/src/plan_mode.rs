@@ -5,10 +5,21 @@
 //! plan file.
 
 use async_trait::async_trait;
-use legion_runtime::{Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use serde_json::json;
 
 use crate::policy::{Approval, Policy};
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// Activate plan mode for the current session.
 pub struct EnterPlanModeTool {
@@ -59,6 +70,8 @@ impl Tool for EnterPlanModeTool {
         // Mutates the session plan-mode state.
         false
     }
+
+    legion_tool_taxonomy!(ToolKind::Plan);
 
     async fn execute(
         &self,
@@ -134,6 +147,8 @@ impl Tool for ExitPlanModeTool {
     fn is_read_only(&self, _input: &serde_json::Value) -> bool {
         false
     }
+
+    legion_tool_taxonomy!(ToolKind::Plan);
 
     async fn execute(
         &self,

@@ -173,7 +173,7 @@ async fn acp_harness_round_trips_tool_call() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            RunEvent::ToolEnd { tool_call, result }
+            RunEvent::ToolEnd { tool_call, result, .. }
             if tool_call.name == "echo" && result.content == "echo: hello"
         )),
         "expected tool end with echo result"

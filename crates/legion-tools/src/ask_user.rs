@@ -6,11 +6,23 @@
 
 use async_trait::async_trait;
 use legion_runtime::{
-    AskUserInput, AskUserOutput, QuestionRequest, Tool, ToolContext, ToolError, ToolResult,
+    AskUserInput, AskUserOutput, QuestionRequest, Tool, ToolContext, ToolError, ToolKind,
+    ToolNamespace, ToolResult,
 };
 use serde_json::json;
 
 use crate::policy::{Approval, Policy};
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// A tool that asks the user one or more multiple-choice questions.
 #[derive(Debug)]
@@ -118,6 +130,8 @@ impl Tool for AskUserTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::AskUser);
 
     fn validate_input(&self, input: &serde_json::Value) -> Result<(), ToolError> {
         let parsed: AskUserInput = serde_json::from_value(input.clone())

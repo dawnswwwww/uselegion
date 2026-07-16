@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 use legion_mcp::McpToolAdapter;
-use legion_runtime::tools::{Policy, Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::tools::{
+    Policy, Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult,
+};
 
 use crate::policy::Approval;
 
@@ -45,6 +47,16 @@ impl Tool for McpTool {
 
     fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Other
+    }
+
+    fn namespace(&self) -> ToolNamespace {
+        ToolNamespace::Mcp {
+            server: self.adapter.server().to_string(),
+        }
     }
 
     async fn execute(

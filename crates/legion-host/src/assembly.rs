@@ -97,7 +97,11 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
         build_commitment_extractor(&config, main_router.clone(), cron_store.clone());
     let recall_selector = build_recall_selector(&config, main_router.clone());
     let session_store = Arc::new(SessionStore::default());
-    let mut core_tools = CoreToolRegistry::new_with_mcp(&config, Some(mcp_manager.tools()));
+    let mut core_tools = CoreToolRegistry::new_with_mcp_and_router(
+        &config,
+        Some(mcp_manager.tools()),
+        Some(main_router.clone()),
+    );
     // Session self-inspection tools (tools-p1p2 Phase A). Read-only, so
     // they default to Approval::Off. Permission boundary (gap doc §6.6):
     // each tool only ever accesses sessions of ctx.agent_id; cross-agent

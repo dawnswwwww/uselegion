@@ -39,6 +39,8 @@ pub enum ProviderError {
     ImageNotSupported(String),
     #[error("speech synthesis not supported by provider '{0}'")]
     SpeechNotSupported(String),
+    #[error("video generation not supported by provider '{0}'")]
+    VideoNotSupported(String),
 }
 
 fn is_false(b: &bool) -> bool {
@@ -258,6 +260,32 @@ pub struct SpeechRequest {
 pub struct SpeechResponse {
     pub audio: Vec<u8>,
     pub format: String,
+}
+
+/// Video generation request (Grok CLI gap Phase 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+}
+
+/// Video generation response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VideoResponse {
+    pub videos: Vec<GeneratedVideo>,
+}
+
+/// A single generated video: either a hosted URL or local path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GeneratedVideo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Metadata about a model supported by a provider.

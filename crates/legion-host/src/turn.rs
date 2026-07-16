@@ -190,12 +190,27 @@ pub fn run_event_to_payload(run_id: &str, event: &RunEvent) -> Value {
         RunEvent::ToolStart { tool_call } => {
             json!({"stream": "tool", "state": "start", "tool_call": tool_call})
         }
-        RunEvent::ToolEnd { tool_call, result } => json!({
-            "stream": "tool",
-            "state": "end",
-            "tool_call": tool_call,
-            "result": result
-        }),
+        RunEvent::ToolEnd {
+            tool_call,
+            result,
+            canonical_meta,
+        } => {
+            let mut payload = json!({
+                "stream": "tool",
+                "state": "end",
+                "tool_call": tool_call,
+                "result": result
+            });
+            if let Some(meta) = canonical_meta {
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert(
+                        "canonical_meta".to_string(),
+                        serde_json::to_value(meta).unwrap_or_default(),
+                    );
+                }
+            }
+            payload
+        }
         RunEvent::Compaction {
             summary, boundary, ..
         } => {
@@ -333,7 +348,9 @@ impl SessionAccumulator {
                     },
                 });
             }
-            RunEvent::ToolEnd { tool_call, result } => {
+            RunEvent::ToolEnd {
+                tool_call, result, ..
+            } => {
                 self.seen_tool_end_this_turn = true;
                 self.pending_tool_results.push(ProviderChatMessage {
                     role: ChatRole::Tool,
@@ -401,6 +418,7 @@ mod tests {
         acc.on_event(&RunEvent::ToolEnd {
             tool_call: runtime_tool("call_1", "exec", r#"{"cmd":"ls"}"#),
             result: ToolResult::ok("file1\nfile2\n"),
+            canonical_meta: None,
         });
         acc.on_event(&RunEvent::Lifecycle {
             phase: LifecyclePhase::End,
@@ -427,6 +445,7 @@ mod tests {
         acc.on_event(&RunEvent::ToolEnd {
             tool_call: runtime_tool("call_1", "exec", r#"{"cmd":"pwd"}"#),
             result: ToolResult::ok("/home"),
+            canonical_meta: None,
         });
         acc.on_event(&RunEvent::ToolStart {
             tool_call: runtime_tool("call_2", "exec", r#"{"cmd":"ls"}"#),
@@ -434,6 +453,7 @@ mod tests {
         acc.on_event(&RunEvent::ToolEnd {
             tool_call: runtime_tool("call_2", "exec", r#"{"cmd":"ls"}"#),
             result: ToolResult::ok("file1"),
+            canonical_meta: None,
         });
         acc.on_event(&RunEvent::Lifecycle {
             phase: LifecyclePhase::End,
@@ -464,6 +484,7 @@ mod tests {
         acc.on_event(&RunEvent::ToolEnd {
             tool_call: runtime_tool("call_1", "exec", r#"{"cmd":"ls"}"#),
             result: ToolResult::ok("file1"),
+            canonical_meta: None,
         });
         acc.on_event(&RunEvent::AssistantDelta {
             delta: "Done.".to_string(),
@@ -555,6 +576,7 @@ mod tests {
             RunEvent::ToolEnd {
                 tool_call,
                 result: ToolResult::ok("done"),
+                canonical_meta: None,
             },
             RunEvent::Compaction {
                 summary: "s".to_string(),

@@ -33,7 +33,8 @@ use legion_provider::types::{
     ToolCall as ProviderToolCall,
 };
 use legion_skills::{Skill, SkillRegistry, SkillRegistryImpl};
-use std::time::Duration;
+use legion_telemetry::{SessionMetric, TelemetryClient};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_ITERATIONS: usize = 10;
 
@@ -66,6 +67,9 @@ pub struct AgentRuntime {
     /// Late-bound swarm manager (multi-agent Phase D). Same late-binding
     /// pattern as the spawner; `None` until `set_swarm` is called.
     swarm: Mutex<Option<Arc<SwarmManager>>>,
+    /// Optional telemetry client (observability Phase 4). When `None`, no
+    /// session metrics or unified log entries are emitted for this runtime.
+    telemetry: Option<Arc<TelemetryClient>>,
 }
 
 impl AgentRuntime {
@@ -94,6 +98,7 @@ impl AgentRuntime {
             spawner: Mutex::new(None),
             messenger: Mutex::new(None),
             swarm: Mutex::new(None),
+            telemetry: None,
         }
     }
 
@@ -116,6 +121,13 @@ impl AgentRuntime {
 
     pub fn with_max_iterations(mut self, max_iterations: Option<usize>) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Attach a telemetry client that will receive session lifecycle, turn, and
+    /// tool-call events for every run started from this runtime.
+    pub fn with_telemetry(mut self, telemetry: Option<Arc<TelemetryClient>>) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -228,7 +240,8 @@ impl AgentRuntime {
                 .with_surfaced(self.surfaced.clone())
                 .with_spawner(self.spawner())
                 .with_messenger(self.messenger())
-                .with_swarm(self.swarm()),
+                .with_swarm(self.swarm())
+                .with_telemetry(self.telemetry.clone()),
             ),
             Some(other) => {
                 tracing::warn!(
@@ -249,7 +262,8 @@ impl AgentRuntime {
                     .with_surfaced(self.surfaced.clone())
                     .with_spawner(self.spawner())
                     .with_messenger(self.messenger())
-                    .with_swarm(self.swarm()),
+                    .with_swarm(self.swarm())
+                    .with_telemetry(self.telemetry.clone()),
                 )
             }
         }
@@ -275,6 +289,7 @@ pub(crate) async fn run_loop(
     messenger: Option<Arc<dyn AgentMessenger>>,
     swarm: Option<Arc<SwarmManager>>,
     todo_gate: TodoGate,
+    telemetry: Option<Arc<TelemetryClient>>,
     tx: &mut Sender<RunEvent>,
 ) -> Result<(), RuntimeError> {
     send(
@@ -285,6 +300,16 @@ pub(crate) async fn run_loop(
         },
     )
     .await;
+
+    if let Some(telemetry) = &telemetry {
+        telemetry
+            .log_session_event(SessionMetric::SessionStarted {
+                session_id: request.session_id.clone(),
+                agent_id: request.agent_id.clone(),
+                model_ref: request.model_ref.clone(),
+            })
+            .await;
+    }
 
     let workspace = resolve_workspace(
         &config,
@@ -536,6 +561,21 @@ pub(crate) async fn run_loop(
         }
         iteration += 1;
 
+        let input_tokens = crate::token_counter::estimate_total_tokens(&messages, &system_prompt);
+        let turn_start = Instant::now();
+        if let Some(telemetry) = &telemetry {
+            telemetry
+                .log_session_event(SessionMetric::Turn {
+                    session_id: request.session_id.clone(),
+                    turn_number: iteration,
+                    input_tokens,
+                    model_ref: request.model_ref.clone(),
+                })
+                .await;
+        }
+
+        let tokens_before_compaction =
+            crate::token_counter::estimate_total_tokens(&messages, &system_prompt);
         if let Some((summary, boundary)) = compactor
             .compact_if_needed(
                 &mut messages,
@@ -563,6 +603,19 @@ pub(crate) async fn run_loop(
                 },
             )
             .await;
+
+            if let Some(telemetry) = &telemetry {
+                let tokens_after_compaction =
+                    crate::token_counter::estimate_total_tokens(&messages, &system_prompt);
+                telemetry
+                    .log_session_event(SessionMetric::Compaction {
+                        session_id: request.session_id.clone(),
+                        turn_number: iteration,
+                        tokens_before: tokens_before_compaction,
+                        tokens_after: tokens_after_compaction,
+                    })
+                    .await;
+            }
         }
 
         let mut req = ChatRequest::new(&request.model_ref, Vec::new());
@@ -580,6 +633,20 @@ pub(crate) async fn run_loop(
             assistant_msg.tool_calls = Some(pending_tool_calls.clone());
         }
         messages.push(assistant_msg);
+
+        let output_tokens = crate::token_counter::count_tokens(&assistant_text);
+        let turn_duration_ms = turn_start.elapsed().as_millis() as u64;
+        if let Some(telemetry) = &telemetry {
+            telemetry
+                .log_session_event(SessionMetric::TurnCompleted {
+                    session_id: request.session_id.clone(),
+                    turn_number: iteration,
+                    output_tokens,
+                    tool_calls: pending_tool_calls.len(),
+                    duration_ms: turn_duration_ms,
+                })
+                .await;
+        }
 
         if pending_tool_calls.is_empty() {
             // Turn-end gating: if required todo patterns are not satisfied,
@@ -661,6 +728,8 @@ pub(crate) async fn run_loop(
             todo_store.clone(),
             None,
             Some(plan_tracker.clone()),
+            telemetry.clone(),
+            iteration,
             tx,
         )
         .await;
@@ -700,6 +769,7 @@ pub(crate) async fn run_loop(
                 RunEvent::ToolEnd {
                     tool_call: denied.clone(),
                     result: result.clone(),
+                    canonical_meta: None,
                 },
             )
             .await;
@@ -891,7 +961,7 @@ mod tests {
             workspace_only: false,
         })
     }
-    use legion_core::config::Config;
+    use legion_core::config::{Config, TelemetryConfig};
     use legion_provider::provider::Provider;
     use legion_provider::router::ProviderRouter;
     use legion_provider::types::ChatRole;
@@ -1838,7 +1908,7 @@ mod tests {
             matches!(&events[1], RunEvent::ToolStart { tool_call } if tool_call.name == "echo")
         );
         assert!(
-            matches!(&events[2], RunEvent::ToolEnd { tool_call, result } if tool_call.name == "echo" && result.content == "echo: hello")
+            matches!(&events[2], RunEvent::ToolEnd { tool_call, result, .. } if tool_call.name == "echo" && result.content == "echo: hello")
         );
         assert_eq!(
             events[3],
@@ -2118,7 +2188,9 @@ mod tests {
         let events = collect_events(runtime.run(request).unwrap()).await;
 
         let tool_end = events.iter().find_map(|e| match e {
-            RunEvent::ToolEnd { tool_call, result } => Some((tool_call.clone(), result.clone())),
+            RunEvent::ToolEnd {
+                tool_call, result, ..
+            } => Some((tool_call.clone(), result.clone())),
             _ => None,
         });
         assert!(tool_end.is_some());
@@ -3032,6 +3104,55 @@ mod tests {
         assert!(
             contents.len() >= 2,
             "snapshot should include prior system/user context, got {contents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_emits_session_metrics_to_configured_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry_config = TelemetryConfig {
+            unified_log_path: dir
+                .path()
+                .join("unified.jsonl")
+                .to_string_lossy()
+                .to_string(),
+            session_metrics_path: dir
+                .path()
+                .join("metrics.jsonl")
+                .to_string_lossy()
+                .to_string(),
+            ..Default::default()
+        };
+        let client = Arc::new(TelemetryClient::from_config(&telemetry_config).unwrap());
+
+        let runtime = runtime_with_provider(Arc::new(TextProvider {
+            text: "hello".into(),
+        }))
+        .with_telemetry(Some(client.clone()));
+
+        let request = RunRequest::new("telemetry-session", "main", "hi", "text/gpt");
+        let events = collect_events(runtime.run(request).unwrap()).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::Lifecycle {
+                    phase: LifecyclePhase::End,
+                    error: None
+                }
+            )),
+            "run should complete successfully"
+        );
+
+        let metrics_path = client.session_metrics_path().unwrap();
+        let contents = std::fs::read_to_string(metrics_path).unwrap();
+        assert!(
+            contents.contains("\"event\":\"session_started\""),
+            "metrics should contain session_started: {contents}"
+        );
+        assert!(
+            contents.contains("\"event\":\"turn_completed\""),
+            "metrics should contain turn_completed: {contents}"
         );
     }
 }

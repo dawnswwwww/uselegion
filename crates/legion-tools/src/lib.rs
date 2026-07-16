@@ -2,7 +2,9 @@ pub mod ask_user;
 pub mod background_task;
 pub mod browser;
 pub mod grep;
+pub mod image_edit;
 pub mod list_dir;
+pub mod lsp;
 pub mod mcp;
 pub mod plan_mode;
 pub mod policy;
@@ -11,6 +13,7 @@ pub mod sandbox;
 pub mod scheduler;
 pub mod todo;
 pub mod tools;
+pub mod video_generate;
 
 use async_trait::async_trait;
 use legion_plugin_sdk::{

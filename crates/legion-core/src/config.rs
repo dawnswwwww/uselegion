@@ -63,6 +63,8 @@ pub struct Config {
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
     pub subagents: SubagentConfig,
@@ -1417,6 +1419,64 @@ fn default_metrics_path() -> String {
     "/metrics".to_string()
 }
 
+/// Product telemetry settings: unified log, session metrics, and optional
+/// remote sinks. All remote features are disabled by default and compiled-in
+/// only when configured, keeping the local runtime dependency surface small.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_telemetry_mode")]
+    pub mode: String,
+    #[serde(default = "default_true")]
+    pub unified_log: bool,
+    #[serde(default = "default_true")]
+    pub session_metrics: bool,
+    #[serde(default = "default_unified_log_path")]
+    pub unified_log_path: String,
+    #[serde(default = "default_session_metrics_path")]
+    pub session_metrics_path: String,
+    #[serde(default = "default_max_log_bytes")]
+    pub max_log_bytes: u64,
+    #[serde(default)]
+    pub events_url: Option<String>,
+    #[serde(default)]
+    pub mixpanel_token: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            mode: default_telemetry_mode(),
+            unified_log: default_true(),
+            session_metrics: default_true(),
+            unified_log_path: default_unified_log_path(),
+            session_metrics_path: default_session_metrics_path(),
+            max_log_bytes: default_max_log_bytes(),
+            events_url: None,
+            mixpanel_token: None,
+        }
+    }
+}
+
+fn default_telemetry_mode() -> String {
+    "enabled".to_string()
+}
+
+fn default_unified_log_path() -> String {
+    "~/.legion/logs/unified.jsonl".to_string()
+}
+
+fn default_session_metrics_path() -> String {
+    "~/.legion/logs/session-metrics.jsonl".to_string()
+}
+
+fn default_max_log_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NodesConfig {
@@ -2596,5 +2656,57 @@ mod tests {
         assert_eq!(qualified.output_per_1k, 0.015);
         let bare = cfg.models.costs.get("gpt-4o-mini").unwrap();
         assert_eq!(bare.output_per_1k, 0.0006);
+    }
+
+    #[test]
+    fn telemetry_config_uses_defaults() {
+        let json = r#"{ "gateway": { "auth": { "token": "x" } } }"#;
+        let cfg = Config::from_json(json).unwrap();
+        assert!(cfg.telemetry.enabled);
+        assert_eq!(cfg.telemetry.mode, "enabled");
+        assert!(cfg.telemetry.unified_log);
+        assert!(cfg.telemetry.session_metrics);
+        assert_eq!(
+            cfg.telemetry.unified_log_path,
+            "~/.legion/logs/unified.jsonl"
+        );
+        assert_eq!(
+            cfg.telemetry.session_metrics_path,
+            "~/.legion/logs/session-metrics.jsonl"
+        );
+        assert_eq!(cfg.telemetry.max_log_bytes, 5 * 1024 * 1024);
+        assert!(cfg.telemetry.events_url.is_none());
+        assert!(cfg.telemetry.mixpanel_token.is_none());
+    }
+
+    #[test]
+    fn telemetry_config_parses_explicit_values() {
+        let json = r#"{
+            "gateway": { "auth": { "token": "x" } },
+            "telemetry": {
+                "enabled": false,
+                "mode": "session_metrics",
+                "unifiedLog": false,
+                "sessionMetrics": true,
+                "unifiedLogPath": "/tmp/u.jsonl",
+                "sessionMetricsPath": "/tmp/m.jsonl",
+                "maxLogBytes": 1024,
+                "eventsUrl": "https://events.example.com",
+                "mixpanelToken": "mp-token"
+            }
+        }"#;
+        let cfg = Config::from_json(json).unwrap();
+        assert!(!cfg.telemetry.enabled);
+        assert_eq!(cfg.telemetry.mode, "session_metrics");
+        assert!(!cfg.telemetry.unified_log);
+        assert!(cfg.telemetry.session_metrics);
+        assert_eq!(cfg.telemetry.unified_log_path, "/tmp/u.jsonl");
+        assert_eq!(cfg.telemetry.session_metrics_path, "/tmp/m.jsonl");
+        assert_eq!(cfg.telemetry.max_log_bytes, 1024);
+        assert_eq!(
+            cfg.telemetry.events_url,
+            Some("https://events.example.com".to_string())
+        );
+        assert_eq!(cfg.telemetry.mixpanel_token, Some("mp-token".to_string()));
     }
 }

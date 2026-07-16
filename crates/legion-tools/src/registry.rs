@@ -14,7 +14,9 @@ use crate::ask_user::AskUserTool;
 use crate::background_task::{GetTaskOutputTool, KillTaskTool, WaitTasksTool};
 use crate::browser::BrowserTool;
 use crate::grep::GrepTool;
+use crate::image_edit::ImageEditTool;
 use crate::list_dir::ListDirTool;
+use crate::lsp::LspTool;
 use crate::plan_mode::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::policy::{Approval, Policy};
 use crate::sandbox::{
@@ -29,6 +31,7 @@ use crate::tools::{
     MemorySearchTool, ReadTool, RunCoordinatorTool, SpawnSubagentTool, SwarmSendTool,
     SwarmSpawnTool, SwarmStatusTool, WebFetchTool, WebSearchTool, WriteTool,
 };
+use crate::video_generate::VideoGenerateTool;
 use std::path::Path;
 
 fn build_exec_tool(
@@ -112,15 +115,37 @@ pub struct CoreToolRegistry {
 }
 
 impl CoreToolRegistry {
-    /// Construct the registry from the global configuration without MCP tools.
+    /// Construct the registry from the global configuration without MCP tools
+    /// or a provider router.
     pub fn new(config: &Config) -> Self {
-        Self::new_with_mcp(config, None)
+        Self::new_with_mcp_and_router(config, None, None)
     }
 
     /// Construct the registry from the global configuration, optionally merging
     /// in tools surfaced by an MCP manager. Built-in tools take precedence over
     /// MCP tools with the same name.
     pub fn new_with_mcp(config: &Config, mcp_tools: Option<&[McpToolAdapter]>) -> Self {
+        Self::new_with_mcp_and_router(config, mcp_tools, None)
+    }
+
+    /// Construct the registry with optional MCP tools and a provider router.
+    ///
+    /// When a router is supplied, the multimedia tools (`image_edit`,
+    /// `video_generate`) are registered.
+    pub fn new_with_router(
+        config: &Config,
+        router: Option<std::sync::Arc<legion_provider::router::ProviderRouter>>,
+    ) -> Self {
+        Self::new_with_mcp_and_router(config, None, router)
+    }
+
+    /// Construct the registry from the global configuration, optionally merging
+    /// in MCP tools and a provider router.
+    pub fn new_with_mcp_and_router(
+        config: &Config,
+        mcp_tools: Option<&[McpToolAdapter]>,
+        router: Option<std::sync::Arc<legion_provider::router::ProviderRouter>>,
+    ) -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
 
         let read_policy = Policy::from_config(config.tools.get("read"), Approval::Off);
@@ -291,6 +316,42 @@ impl CoreToolRegistry {
             Arc::new(ExitPlanModeTool::new(exit_plan_policy)),
         );
 
+        // LSP tool. Read-only actions default to Off; mutating format defaults
+        // to Prompt so the user can review before the file is rewritten.
+        let lsp_policy = Policy::from_config(config.tools.get("lsp"), Approval::Off);
+        let lsp_tool = LspTool::new(lsp_policy).with_server(
+            config
+                .tools
+                .get("lsp")
+                .and_then(|c| c.extra.get("server"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("rust-analyzer"),
+            config
+                .tools
+                .get("lsp")
+                .and_then(|c| c.extra.get("args"))
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                .unwrap_or_default(),
+        );
+        tools.insert("lsp".to_string(), Arc::new(lsp_tool));
+
+        // Multimedia tools require a provider router.
+        if let Some(router) = router {
+            let image_edit_policy =
+                Policy::from_config(config.tools.get("image_edit"), Approval::Required);
+            tools.insert(
+                "image_edit".to_string(),
+                Arc::new(ImageEditTool::new(router.clone(), image_edit_policy)),
+            );
+
+            let video_gen_policy =
+                Policy::from_config(config.tools.get("video_generate"), Approval::Required);
+            tools.insert(
+                "video_generate".to_string(),
+                Arc::new(VideoGenerateTool::new(router, video_gen_policy)),
+            );
+        }
+
         if let Some(mcp_tools) = mcp_tools {
             for adapter in mcp_tools {
                 let name = adapter.qualified_name().to_string();
@@ -369,6 +430,7 @@ mod tests {
             "scheduler_create",
             "scheduler_delete",
             "scheduler_list",
+            "lsp",
         ] {
             assert!(registry.get(name).is_some(), "missing tool {}", name);
         }
@@ -612,6 +674,60 @@ mod tests {
         let registry = CoreToolRegistry::new_with_mcp(&config, None);
         assert!(registry.get("read").is_some());
         assert!(registry.get("mcp__anything__tool").is_none());
+    }
+
+    #[test]
+    fn registry_includes_multimedia_tools_when_router_given() {
+        use legion_provider::router::ProviderRouter;
+        let config = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#).unwrap();
+        let router = Arc::new(ProviderRouter::new());
+        let registry = CoreToolRegistry::new_with_router(&config, Some(router));
+
+        assert!(registry.get("image_edit").is_some());
+        assert!(registry.get("video_generate").is_some());
+    }
+
+    #[test]
+    fn registry_omits_multimedia_tools_when_no_router() {
+        let config = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#).unwrap();
+        let registry = CoreToolRegistry::new(&config);
+
+        assert!(registry.get("image_edit").is_none());
+        assert!(registry.get("video_generate").is_none());
+    }
+
+    #[test]
+    fn registry_reports_tool_taxonomy() {
+        use legion_runtime::{ToolKind, ToolNamespace};
+        let config = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#).unwrap();
+        let registry = CoreToolRegistry::new(&config);
+
+        let read = registry.get("read").unwrap();
+        assert_eq!(read.kind(), ToolKind::Read);
+        assert_eq!(read.namespace(), ToolNamespace::Legion);
+
+        let grep = registry.get("grep").unwrap();
+        assert_eq!(grep.kind(), ToolKind::Search);
+
+        let lsp = registry.get("lsp").unwrap();
+        assert_eq!(lsp.kind(), ToolKind::Lsp);
+    }
+
+    #[test]
+    fn mcp_tool_reports_server_namespace() {
+        use legion_runtime::{ToolKind, ToolNamespace};
+        let config = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#).unwrap();
+        let adapters = vec![dummy_adapter("filesystem", "read_file")];
+        let registry = CoreToolRegistry::new_with_mcp(&config, Some(&adapters));
+
+        let mcp_tool = registry.get("mcp__filesystem__read_file").unwrap();
+        assert_eq!(mcp_tool.kind(), ToolKind::Other);
+        assert_eq!(
+            mcp_tool.namespace(),
+            ToolNamespace::Mcp {
+                server: "filesystem".to_string()
+            }
+        );
     }
 
     struct DummyTool {

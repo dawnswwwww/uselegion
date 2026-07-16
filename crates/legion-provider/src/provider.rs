@@ -1,6 +1,6 @@
 use crate::types::{
     ChatRequest, ChatStream, EmbedRequest, Embedding, ImageRequest, ImageResponse, ModelInfo,
-    ProviderError, SpeechRequest, SpeechResponse,
+    ProviderError, SpeechRequest, SpeechResponse, VideoRequest, VideoResponse,
 };
 use async_trait::async_trait;
 
@@ -38,5 +38,13 @@ pub trait Provider: Send + Sync {
         _req: SpeechRequest,
     ) -> Result<SpeechResponse, ProviderError> {
         Err(ProviderError::SpeechNotSupported(self.id().to_string()))
+    }
+
+    /// Generate a video from a text prompt (Grok CLI gap Phase 5).
+    ///
+    /// Default implementation reports the capability as unsupported so existing
+    /// providers are unaffected.
+    async fn generate_video(&self, _req: VideoRequest) -> Result<VideoResponse, ProviderError> {
+        Err(ProviderError::VideoNotSupported(self.id().to_string()))
     }
 }

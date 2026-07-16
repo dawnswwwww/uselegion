@@ -1809,6 +1809,7 @@ dependencies = [
  "legion-provider",
  "legion-runtime",
  "legion-skills",
+ "legion-telemetry",
  "legion-tools",
  "serde",
  "serde_json",
@@ -1915,6 +1916,7 @@ dependencies = [
  "legion-plugin-sdk",
  "legion-provider",
  "legion-skills",
+ "legion-telemetry",
  "regex",
  "rstest",
  "serde",
@@ -1935,6 +1937,21 @@ dependencies = [
  "glob",
  "serde",
  "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "legion-telemetry"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "legion-core",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use legion_runtime::{
     BackgroundTaskResult, CoordinatorPlan, SubagentKind, SubagentRequest, SubagentStatus, Tool,
-    ToolContext, ToolError, ToolResult, run_coordinator_plan,
+    ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult, run_coordinator_plan,
 };
 use serde_json::json;
 
@@ -13,6 +13,18 @@ use crate::background_task::{
 };
 use crate::policy::{Approval, Policy};
 use crate::sandbox::{ExecResult, LocalSandboxBackend, SandboxBackend};
+
+/// Helper to stamp `kind()` and `namespace()` on a built-in Legion tool.
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -107,6 +119,8 @@ impl Tool for ReadTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::Read);
 
     async fn execute(
         &self,
@@ -203,6 +217,8 @@ impl Tool for WriteTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::Write);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -282,6 +298,8 @@ impl Tool for EditTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         false
     }
+
+    legion_tool_taxonomy!(ToolKind::Edit);
 
     fn validate_input(&self, input: &serde_json::Value) -> Result<(), ToolError> {
         let old_string = input["old_string"].as_str().unwrap_or("");
@@ -378,6 +396,8 @@ impl Tool for ApplyPatchTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         false
     }
+
+    legion_tool_taxonomy!(ToolKind::Edit);
 
     async fn execute(
         &self,
@@ -572,6 +592,8 @@ impl Tool for ExecTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::Execute);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -709,6 +731,8 @@ impl Tool for WebFetchTool {
         true
     }
 
+    legion_tool_taxonomy!(ToolKind::WebFetch);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -784,6 +808,8 @@ impl Tool for WebSearchTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::WebSearch);
 
     async fn execute(
         &self,
@@ -875,6 +901,8 @@ impl Tool for MemorySearchTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::MemorySearch);
 
     async fn execute(
         &self,
@@ -971,6 +999,8 @@ impl Tool for MemoryGetTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::MemoryGet);
 
     async fn execute(
         &self,
@@ -1070,6 +1100,8 @@ impl Tool for MemoryIndexTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         false
     }
+
+    legion_tool_taxonomy!(ToolKind::Skill);
 
     async fn execute(
         &self,
@@ -1265,6 +1297,8 @@ impl Tool for SpawnSubagentTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         false
     }
+
+    legion_tool_taxonomy!(ToolKind::Task);
 
     async fn execute(
         &self,
@@ -1497,6 +1531,8 @@ impl Tool for AgentToAgentSendTool {
         true
     }
 
+    legion_tool_taxonomy!(ToolKind::Other);
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1623,6 +1659,8 @@ impl Tool for RunCoordinatorTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::Task);
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1724,6 +1762,8 @@ impl Tool for SwarmSpawnTool {
         true
     }
 
+    legion_tool_taxonomy!(ToolKind::Task);
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1823,6 +1863,8 @@ impl Tool for SwarmSendTool {
         true
     }
 
+    legion_tool_taxonomy!(ToolKind::Other);
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1892,6 +1934,8 @@ impl Tool for SwarmStatusTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::Other);
 
     async fn execute(
         &self,
@@ -1978,9 +2022,16 @@ mod tests {
         dir: &TempDir,
         registry: Arc<crate::background_task::BackgroundTaskRegistry>,
     ) -> ToolContext {
+        // Use a unique session id derived from the temp directory name so
+        // concurrent background-task tests do not collide on the same log path.
+        let session_id = dir
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "s1".to_string());
         ToolContext {
             workspace: dir.path().to_path_buf(),
-            session_id: "s1".to_string(),
+            session_id,
             agent_id: "a1".to_string(),
             sender: None,
             memory: None,

@@ -12,10 +12,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use chrono::Utc;
 use legion_automation::cron::{CronJob, CronJobStore, JsonlCronJobStore};
-use legion_runtime::{Tool, ToolContext, ToolError, ToolResult};
+use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use serde_json::json;
 
 use crate::policy::{Approval, Policy};
+
+macro_rules! legion_tool_taxonomy {
+    ($kind:expr) => {
+        fn kind(&self) -> ToolKind {
+            $kind
+        }
+        fn namespace(&self) -> ToolNamespace {
+            ToolNamespace::Legion
+        }
+    };
+}
 
 /// Default path to the shared cron job store.
 fn default_cron_store_path() -> PathBuf {
@@ -139,6 +150,8 @@ impl Tool for SchedulerCreateTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::Other);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -250,6 +263,8 @@ impl Tool for SchedulerDeleteTool {
         false
     }
 
+    legion_tool_taxonomy!(ToolKind::Delete);
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -325,6 +340,8 @@ impl Tool for SchedulerListTool {
     fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
         true
     }
+
+    legion_tool_taxonomy!(ToolKind::ListDir);
 
     async fn execute(
         &self,

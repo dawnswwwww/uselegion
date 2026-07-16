@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use legion_telemetry::SessionMetric;
+
 /// A recorded metric value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetricValue {
@@ -120,6 +122,81 @@ impl MetricsRegistry {
         }
         metrics
     }
+
+    /// Record a runtime session metric as a Prometheus business metric.
+    pub fn record_session_metric(&self, event: &SessionMetric) {
+        match event {
+            SessionMetric::SessionStarted { agent_id, .. } => {
+                self.increment_counter_with_labels(
+                    "legion_sessions_started_total",
+                    "total agent sessions started",
+                    &[("agent_id".to_string(), agent_id.clone())],
+                );
+            }
+            SessionMetric::Turn { model_ref, .. } => {
+                self.increment_counter_with_labels(
+                    "legion_turns_total",
+                    "total agent turns",
+                    &[("model_ref".to_string(), model_ref.clone())],
+                );
+            }
+            SessionMetric::TurnCompleted {
+                output_tokens,
+                duration_ms,
+                ..
+            } => {
+                self.increment_counter("legion_turns_completed_total", "total completed turns");
+                self.add_counter_with_labels(
+                    "legion_output_tokens_total",
+                    "total output tokens",
+                    &[],
+                    *output_tokens as u64,
+                );
+                self.set_gauge(
+                    "legion_last_turn_duration_ms",
+                    "duration of the last completed turn in ms",
+                    *duration_ms as f64,
+                );
+            }
+            SessionMetric::ToolCalled {
+                tool, read_only, ..
+            } => {
+                self.increment_counter_with_labels(
+                    "legion_tool_calls_total",
+                    "total tool calls",
+                    &[
+                        ("tool".to_string(), tool.clone()),
+                        ("read_only".to_string(), read_only.to_string()),
+                    ],
+                );
+            }
+            SessionMetric::Compaction {
+                tokens_before,
+                tokens_after,
+                ..
+            } => {
+                self.increment_counter("legion_compactions_total", "total compaction events");
+                self.set_gauge(
+                    "legion_compaction_tokens_before",
+                    "tokens before compaction",
+                    *tokens_before as f64,
+                );
+                self.set_gauge(
+                    "legion_compaction_tokens_after",
+                    "tokens after compaction",
+                    *tokens_after as f64,
+                );
+            }
+            SessionMetric::DoomLoopRecovery { attempts, .. } => {
+                self.add_counter_with_labels(
+                    "legion_doom_loop_recoveries_total",
+                    "total doom-loop recovery events",
+                    &[],
+                    *attempts as u64,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +237,30 @@ mod tests {
         let snapshot = reg.snapshot();
         let err = snapshot.iter().find(|m| m.name == "errors_total").unwrap();
         assert_eq!(err.help, "total errors");
+    }
+
+    #[test]
+    fn record_session_metric_increments_business_metrics() {
+        let reg = MetricsRegistry::new();
+        reg.record_session_metric(&SessionMetric::ToolCalled {
+            session_id: "s1".to_string(),
+            turn_number: 1,
+            tool: "read".to_string(),
+            read_only: true,
+            duration_ms: 42,
+        });
+        let snapshot = reg.snapshot();
+        let tool = snapshot
+            .iter()
+            .find(|m| m.name == "legion_tool_calls_total")
+            .unwrap();
+        assert_eq!(tool.value, MetricValue::Counter(1));
+        assert!(tool.labels.iter().any(|(k, v)| k == "tool" && v == "read"));
+        assert!(
+            tool.labels
+                .iter()
+                .any(|(k, v)| k == "read_only" && v == "true")
+        );
     }
 
     #[test]

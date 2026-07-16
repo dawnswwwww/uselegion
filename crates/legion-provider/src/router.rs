@@ -8,7 +8,7 @@ use crate::ops::{
 use crate::provider::Provider;
 use crate::types::{
     ChatRequest, ChatStream, EmbedRequest, Embedding, ImageRequest, ImageResponse, ProviderError,
-    ResolvedModelRef, SpeechRequest, SpeechResponse,
+    ResolvedModelRef, SpeechRequest, SpeechResponse, VideoRequest, VideoResponse,
 };
 use legion_core::config::{ModelCost, ProviderConfig};
 use std::collections::HashMap;
@@ -490,6 +490,54 @@ impl ProviderRouter {
                         model = %req.model,
                         error = %err,
                         "speech synthesis failed, trying next fallback"
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(ProviderError::AllProvidersFailed))
+    }
+
+    /// Generate videos through the routed provider.
+    ///
+    /// Like `generate_image`, video generation uses a plain fallback loop
+    /// without retry / rate-limit / cost-tracking wrappers.
+    pub async fn generate_video(
+        &self,
+        model_ref: &str,
+        mut req: VideoRequest,
+    ) -> Result<VideoResponse, ProviderError> {
+        let chain = self.resolve_chain(model_ref)?;
+        if chain.is_empty() {
+            return Err(ProviderError::AllProvidersFailed);
+        }
+
+        let mut last_error: Option<ProviderError> = None;
+        for candidate in chain {
+            let provider = self
+                .providers
+                .get(&candidate.provider_id)
+                .cloned()
+                .ok_or_else(|| ProviderError::ProviderNotFound(candidate.provider_id.clone()))?;
+
+            req.model = candidate.model_name.clone();
+            match provider.generate_video(req.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        provider = %candidate.provider_id,
+                        model = %req.model,
+                        videos = response.videos.len(),
+                        "provider video generation completed"
+                    );
+                    return Ok(response);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %candidate.provider_id,
+                        model = %req.model,
+                        error = %err,
+                        "video generation failed, trying next fallback"
                     );
                     last_error = Some(err);
                 }
