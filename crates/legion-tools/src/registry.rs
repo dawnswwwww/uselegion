@@ -14,6 +14,7 @@ use crate::ask_user::AskUserTool;
 use crate::browser::BrowserTool;
 use crate::grep::GrepTool;
 use crate::list_dir::ListDirTool;
+use crate::plan_mode::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::policy::{Approval, Policy};
 use crate::sandbox::{
     CubeSandboxBackend, ExecResult, LocalSandboxBackend, RestrictedConfig,
@@ -248,6 +249,22 @@ impl CoreToolRegistry {
             );
         }
 
+        // Plan-mode toggle tools. Entering is immediate and approval-free by
+        // default; exiting requires approval so the user can review the plan
+        // first. Both can be overridden via tool config.
+        let enter_plan_policy =
+            Policy::from_config(config.tools.get("enter_plan_mode"), Approval::Off);
+        tools.insert(
+            "enter_plan_mode".to_string(),
+            Arc::new(EnterPlanModeTool::new(enter_plan_policy)),
+        );
+        let exit_plan_policy =
+            Policy::from_config(config.tools.get("exit_plan_mode"), Approval::Prompt);
+        tools.insert(
+            "exit_plan_mode".to_string(),
+            Arc::new(ExitPlanModeTool::new(exit_plan_policy)),
+        );
+
         if let Some(mcp_tools) = mcp_tools {
             for adapter in mcp_tools {
                 let name = adapter.qualified_name().to_string();
@@ -318,6 +335,8 @@ mod tests {
             "memory_search",
             "memory_get",
             "memory_index",
+            "enter_plan_mode",
+            "exit_plan_mode",
         ] {
             assert!(registry.get(name).is_some(), "missing tool {}", name);
         }
@@ -372,6 +391,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            plan_mode_tracker: None,
         }
     }
 

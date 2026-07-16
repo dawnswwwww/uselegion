@@ -1922,6 +1922,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            plan_mode_tracker: None,
         }
     }
 
@@ -2277,6 +2278,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            plan_mode_tracker: None,
         }
     }
 
@@ -2506,6 +2508,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            plan_mode_tracker: None,
         }
     }
 
@@ -2661,6 +2664,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            plan_mode_tracker: None,
         }
     }
 
@@ -2772,6 +2776,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            plan_mode_tracker: None,
         }
     }
 

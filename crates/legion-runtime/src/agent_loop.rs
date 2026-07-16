@@ -308,6 +308,24 @@ pub(crate) async fn run_loop(
         None
     };
 
+    // Plan-mode tracker. Load persisted state for the session when available;
+    // otherwise start fresh in the session directory.
+    let plan_tracker = if let Some(tracker) = request.plan_mode_tracker.clone() {
+        tracker
+    } else {
+        let session_dir =
+            crate::expand_tilde(&format!("~/.legion/sessions/{}", request.session_id));
+        match crate::plan_mode::PlanModeTracker::load(&session_dir).await {
+            Ok(tracker) => Arc::new(tokio::sync::Mutex::new(tracker)),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load plan mode state; starting fresh");
+                Arc::new(tokio::sync::Mutex::new(
+                    crate::plan_mode::PlanModeTracker::new(&session_dir),
+                ))
+            }
+        }
+    };
+
     let skills_config = &config.agents.defaults.skills;
     let skill_registry = if skills_config.enabled {
         let mut skill_dirs = skills_config.dirs.clone();
@@ -612,10 +630,21 @@ pub(crate) async fn run_loop(
             request.depth,
             Some(history_snapshot),
             todo_store.clone(),
+            Some(plan_tracker.clone()),
             tx,
         )
         .await;
         messages.extend(tool_messages);
+
+        // Complete any pending plan-mode exit now that the turn has finished,
+        // and persist the tracker state.
+        {
+            let mut guard = plan_tracker.lock().await;
+            guard.finalize_exit_if_pending();
+            if let Err(err) = guard.save().await {
+                tracing::warn!(error = %err, "failed to save plan mode state");
+            }
+        }
 
         for denied in denied_calls {
             send(

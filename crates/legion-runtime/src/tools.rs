@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::approval::PermissionMode;
 use crate::memory::MemoryBackend;
+use crate::plan_mode::PlanModeTracker;
 use crate::question::QuestionGate;
 use crate::todo::SharedTodoStore;
 
@@ -56,6 +57,10 @@ pub struct ToolContext {
     /// Optional todo store for the `todo_write` tool to update the session
     /// checklist. When `None` the tool reports that todos are unavailable.
     pub todo_store: Option<SharedTodoStore>,
+    /// Optional plan-mode tracker. When present, tools such as
+    /// `enter_plan_mode` and `exit_plan_mode` can mutate session planning
+    /// state, and the runtime enforces plan-mode write restrictions.
+    pub plan_mode_tracker: Option<Arc<tokio::sync::Mutex<PlanModeTracker>>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -78,6 +83,7 @@ impl std::fmt::Debug for ToolContext {
             )
             .field("question_gate", &self.question_gate.is_some())
             .field("todo_store", &self.todo_store.is_some())
+            .field("plan_mode_tracker", &self.plan_mode_tracker.is_some())
             .finish()
     }
 }

@@ -9,6 +9,7 @@ pub mod coordinator;
 pub mod harness;
 pub mod memory;
 pub mod messenger;
+pub mod plan_mode;
 pub mod prompt;
 pub mod question;
 pub mod recall_selector;
@@ -41,6 +42,7 @@ pub use coordinator::{
 pub use harness::{Harness, HarnessRegistry};
 pub use memory::{DecayReport, MemoryBackend, MemoryError, MemoryKind, MemoryNote, RecallContext};
 pub use messenger::{AgentMessenger, MessengerError};
+pub use plan_mode::{PlanModeState, PlanModeTracker};
 pub use prompt::{BuiltPrompt, PromptSection, SectionId, SectionSource, SystemPromptBuilder};
 pub use question::{
     AskUserAnnotation, AskUserInput, AskUserOption, AskUserOutput, AskUserQuestion,
