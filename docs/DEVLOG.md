@@ -68,6 +68,36 @@
 
 ## 开发日志(最新在上)
 
+### 2026-07-16 · Phase 1 完成：list_dir / grep 工具 + PermissionMode 扩展
+- **type**: feature / refactor
+- **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 1）
+- **目标**:完成 Grok CLI 三域差距实施计划 Phase 1：补齐 `list_dir`/`grep` 两个基础文件搜索工具，并将审批模型从 `Approval` 三态扩展为 `PermissionMode` 六态。
+- **改动**:
+  - `crates/legion-tools/src/list_dir.rs`(新建):`ListDirTool` 实现，支持 `path` + `recursive`，输出 `[DIR]`/`[FILE]` 前缀列表；4 个单元测试。
+  - `crates/legion-tools/src/grep.rs`(新建):`GrepTool` 实现，支持 `pattern`/`path`/`glob`/`regex`，输出 `path:line:content`，输出上限 1000 行/40KB；6 个单元测试。
+  - `crates/legion-tools/src/registry.rs`:注册 `list_dir` 与 `grep`，默认 `Approval::Off`；更新核心工具列表测试。
+  - `crates/legion-tools/src/lib.rs`:暴露 `list_dir`/`grep` 模块；更新 plugin 描述。
+  - `crates/legion-tools/Cargo.toml`:新增 `glob = { workspace = true }` 依赖。
+  - `crates/legion-runtime/src/approval.rs`:新增 `PermissionMode` 六态（`Default`/`AcceptEdits`/`Auto`/`DontAsk`/`BypassPermissions`/`Plan`）及解析测试。
+  - `crates/legion-runtime/src/tools.rs`:`Policy` 增加 `permission_mode: Option<PermissionMode>`，`Policy::effective_permission_mode()`，`apply_permission_mode()`；保持 `Approval`  backward-compatible 映射。
+  - `crates/legion-runtime/src/tool_pipeline.rs`:在 `execute_tool_call` 中应用 session-level `PermissionMode`；新增 integration tests。
+  - `crates/legion-core/src/config.rs`:`ToolConfig` 支持 `permissionMode` 字段。
+  - 机械修复：给所有现有 `Policy { ... }` 字面量补 `permission_mode: None`（acp/cli/gateway/host/runtime/tools 等 13 处）。
+- **决策**:
+  - 使用 git worktree 并行开发三个 feature branch（`feat/list-dir`、`feat/grep`、`feat/permission-mode`），然后合并回 `main`；合并时 `lib.rs`/`registry.rs` 出现预期冲突，已手工保留双方改动。
+  - `PermissionMode` 在两处生效：per-tool `build_policy_decider` 决定初始 `Permission::{Allow,Prompt,Deny}`；session-level `ApprovalCtx.permission_mode` 在 `Prompt` 时做最终裁决。这样保留现有自定义 decider 测试不变。
+  - `Plan` 模式当前等价于 `Auto` 对只读工具放行，plan-file 特殊处理放到 Phase 2。
+- **验证**:
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy --workspace --all-targets` 零警告
+  - `cargo test --workspace --all-targets` 全量通过（E2E 需要 `MINIMAX_API_KEY` 的测试正确忽略）
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
+- **遗留**:
+  - Phase 2：Plan mode + Scheduler tools + 后台任务管理工具
+  - Phase 3：双阶段 compaction + TodoGate
+  - Phase 4：`legion-telemetry` crate + unified log + session metrics
+  - Phase 5：Tool taxonomy + LSP + 多媒体工具扩展
+
 ### 2026-07-16 · Grok CLI 三域差距实施计划与 Phase 1 启动
 - **type**: plan / feature
 - **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md`）
