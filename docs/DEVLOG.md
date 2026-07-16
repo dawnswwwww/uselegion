@@ -68,6 +68,29 @@
 
 ## 开发日志(最新在上)
 
+### 2026-07-16 · Phase 2 启动：Plan mode + Scheduler tools + 后台任务工具
+- **type**: plan / feature
+- **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 2）
+- **目标**:实现 Grok CLI 风格的计划模式（Plan mode）、agent 可调用的 Scheduler tools，以及 Bash/Exec 后台任务管理工具。
+- **改动计划**:
+  - Plan mode：`crates/legion-runtime/src/plan_mode.rs` 状态机 + `crates/legion-tools/src/plan_mode.rs` 的 `enter_plan_mode`/`exit_plan_mode` tools。
+  - Scheduler tools：`crates/legion-tools/src/scheduler.rs` 的 `scheduler_create`/`delete`/`list`，写入 `cron.jsonl`。
+  - 后台任务：`crates/legion-tools/src/background_task.rs` 的 `wait_tasks`/`kill_task`/`get_task_output`，扩展 `ExecTool` 支持 `is_background`。
+- **决策**:
+  - 继续使用 git worktree 并行开发三个独立 feature branch。
+  - Plan mode 的 `plan.md` 放在 `~/.legion/sessions/<session_id>/plan.md`。
+  - Scheduler 直接复用 `JsonlCronJobStore` 的格式，避免新建存储。
+  - 后台任务输出写入 `~/.legion/sessions/<session_id>/tasks/<task_id>.log`。
+- **验证**:
+  - `cargo fmt -- --check`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace --all-targets`
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
+- **遗留**:
+  - Phase 3：双阶段 compaction + TodoGate
+  - Phase 4：`legion-telemetry` crate + unified log + session metrics
+  - Phase 5：Tool taxonomy + LSP + 多媒体工具扩展
+
 ### 2026-07-16 · Phase 1 完成：list_dir / grep 工具 + PermissionMode 扩展
 - **type**: feature / refactor
 - **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 1）
