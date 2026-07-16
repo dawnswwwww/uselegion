@@ -68,23 +68,39 @@
 
 ## 开发日志(最新在上)
 
-### 2026-07-16 · Phase 2 启动：Plan mode + Scheduler tools + 后台任务工具
-- **type**: plan / feature
+### 2026-07-16 · Phase 2 完成：Plan mode + Scheduler tools + 后台任务工具
+- **type**: feature
 - **gap**: —（基于 `docs/design/grok-cli-agent-obs-tools-design.md` Phase 2）
-- **目标**:实现 Grok CLI 风格的计划模式（Plan mode）、agent 可调用的 Scheduler tools，以及 Bash/Exec 后台任务管理工具。
-- **改动计划**:
-  - Plan mode：`crates/legion-runtime/src/plan_mode.rs` 状态机 + `crates/legion-tools/src/plan_mode.rs` 的 `enter_plan_mode`/`exit_plan_mode` tools。
-  - Scheduler tools：`crates/legion-tools/src/scheduler.rs` 的 `scheduler_create`/`delete`/`list`，写入 `cron.jsonl`。
-  - 后台任务：`crates/legion-tools/src/background_task.rs` 的 `wait_tasks`/`kill_task`/`get_task_output`，扩展 `ExecTool` 支持 `is_background`。
+- **目标**:实现 Grok CLI 风格的计划模式（Plan mode）、agent 可调用的 Scheduler tools，以及 Bash/Exec 后台任务管理工具，并合并回 `main`。
+- **改动**:
+  - Plan mode：
+    - `crates/legion-runtime/src/plan_mode.rs`(新建)：`PlanModeTracker` 持久化状态机（Inactive/Pending/Active/ExitPending），`plan.md` 放在 `~/.legion/sessions/<session_id>/plan.md`。
+    - `crates/legion-tools/src/plan_mode.rs`(新建)：`enter_plan_mode`/`exit_plan_mode` tools，默认 `Approval::Off`/`Prompt`。
+    - `crates/legion-runtime/src/tool_pipeline.rs`：在 `execute_tool_call` 中强制 plan-mode 写限制（write/edit/apply_patch 只能写 plan 文件，exec 完全被拦）。
+    - `crates/legion-runtime/src/agent_loop.rs`：每轮结束时 `finalize_exit_if_pending()` 并持久化状态。
+    - `crates/legion-runtime/src/types.rs`：`RunRequest` 增加 `plan_mode_tracker`。
+  - Scheduler tools：
+    - `crates/legion-tools/src/scheduler.rs`(新建)：`scheduler_create`/`scheduler_delete`/`scheduler_list`，直接读写 `~/.legion/automation/cron.jsonl`。
+    - `crates/legion-automation/src/cron.rs`：`CronJob` 增加 `name` 字段（兼容旧记录 `serde(default)`）。
+    - `crates/legion-automation/src/commitments.rs` / `cron.rs`：构造 `CronJob` 时补 `name: String::new()`。
+    - `crates/legion-tools/Cargo.toml`：新增 `chrono`、`cron`、`dirs`、`legion-automation` 依赖。
+  - 后台任务：
+    - `crates/legion-tools/src/background_task.rs`(新建)：`BackgroundTaskRegistry` + `wait_tasks`/`kill_task`/`get_task_output`。
+    - `crates/legion-runtime/src/tools.rs`：新增 `BackgroundTaskRegistry` trait 与 `BackgroundTaskResult`/`BackgroundTaskOutput`。
+    - `crates/legion-tools/src/tools.rs`：`ExecTool` 支持 `is_background`，输出写入 `~/.legion/sessions/<session_id>/tasks/<task_id>.log`。
+    - `crates/legion-tools/src/registry.rs`：注册 `wait_tasks`/`kill_task`/`get_task_output`。
+  - 合并与机械修复：
+    - 将 `feat/plan-mode`、`feat/scheduler-tools` 以及 main 上未提交的 background-task 改动合并到 `main`。
+    - 统一 `ToolContext` 同时携带 `background_tasks` 与 `plan_mode_tracker`；修复所有测试中的字段/参数补齐。
 - **决策**:
-  - 继续使用 git worktree 并行开发三个独立 feature branch。
-  - Plan mode 的 `plan.md` 放在 `~/.legion/sessions/<session_id>/plan.md`。
-  - Scheduler 直接复用 `JsonlCronJobStore` 的格式，避免新建存储。
-  - 后台任务输出写入 `~/.legion/sessions/<session_id>/tasks/<task_id>.log`。
+  - 由于 `feat/background-tasks` worktree 实际无改动，直接在 `main` 提交已实现的 background-task 代码，再合并 plan-mode 与 scheduler-tools。
+  - Plan mode 写限制在 `execute_tool_call` 层硬编码，不依赖工具自身的 `is_read_only`，避免模型绕过。
+  - Scheduler 直接复用 `JsonlCronJobStore`，agent 创建的 job 与后台 cron scheduler 共用同一存储。
+  - 后台任务输出采用 stdout/stderr 合并写入单一日志文件，由 `get_task_output` 解析分隔。
 - **验证**:
-  - `cargo fmt -- --check`
-  - `cargo clippy --workspace --all-targets`
-  - `cargo test --workspace --all-targets`
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+  - `cargo test --workspace --all-targets` 全量通过（E2E 需要 `MINIMAX_API_KEY` 的测试正确忽略）
   - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
 - **遗留**:
   - Phase 3：双阶段 compaction + TodoGate
