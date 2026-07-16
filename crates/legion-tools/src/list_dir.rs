@@ -201,6 +201,7 @@ mod tests {
             approval: Approval::Off,
             allow_from: vec![],
             workspace_only: false,
+            permission_mode: None,
         }
     }
 

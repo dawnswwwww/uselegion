@@ -305,6 +305,7 @@ mod tests {
             approval: Approval::Off,
             allow_from: vec![],
             workspace_only: false,
+            permission_mode: None,
         }
     }
 
@@ -313,6 +314,7 @@ mod tests {
             approval: Approval::Off,
             allow_from: vec![],
             workspace_only: true,
+            permission_mode: None,
         }
     }
 
