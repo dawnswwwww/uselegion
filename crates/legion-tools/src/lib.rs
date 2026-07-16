@@ -1,5 +1,6 @@
 pub mod ask_user;
 pub mod browser;
+pub mod grep;
 pub mod list_dir;
 pub mod mcp;
 pub mod policy;
@@ -42,7 +43,7 @@ impl Plugin for ToolsPlugin {
             version: env!("CARGO_PKG_VERSION").to_string(),
             kind: PluginKind::Tool,
             description: Some(
-                "Built-in tools: read, list_dir, write, edit, apply_patch, exec, web_search, web_fetch, ask_user"
+                "Built-in tools: read, list_dir, grep, write, edit, apply_patch, exec, web_search, web_fetch, ask_user"
                     .to_string(),
             ),
         }
