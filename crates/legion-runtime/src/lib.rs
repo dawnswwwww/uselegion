@@ -56,7 +56,10 @@ pub use subagent::{
 pub use surfaced::SurfacedStore;
 pub use swarm::{SwarmError, SwarmManager, SwarmMessage, TeammateInfo, TeammateStatus};
 pub use todo::{JsonTodoStore, SharedTodoStore, TodoItem, TodoList, TodoStatus, TodoStore};
-pub use tools::{Tool, ToolCall, ToolContext, ToolError, ToolRegistry, ToolResult};
+pub use tools::{
+    BackgroundTaskOutput, BackgroundTaskRegistry, BackgroundTaskResult, Tool, ToolCall,
+    ToolContext, ToolError, ToolRegistry, ToolResult,
+};
 pub use types::{LifecyclePhase, RunEvent, RunRequest, RunStream, RuntimeError};
 
 use std::path::PathBuf;

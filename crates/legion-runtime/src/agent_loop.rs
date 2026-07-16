@@ -612,6 +612,7 @@ pub(crate) async fn run_loop(
             request.depth,
             Some(history_snapshot),
             todo_store.clone(),
+            None,
             tx,
         )
         .await;

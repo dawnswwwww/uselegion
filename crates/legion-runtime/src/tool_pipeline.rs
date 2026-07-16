@@ -120,6 +120,7 @@ pub async fn execute_tool_call(
     depth: u8,
     parent_history: Option<Arc<Vec<ChatMessage>>>,
     todo_store: Option<crate::SharedTodoStore>,
+    background_tasks: Option<Arc<dyn crate::tools::BackgroundTaskRegistry>>,
 ) -> ToolResult {
     let tool = match registry.get(&call.name) {
         Some(t) => t,
@@ -194,6 +195,7 @@ pub async fn execute_tool_call(
         parent_history,
         question_gate: question.map(|q| q.gate),
         todo_store,
+        background_tasks,
     };
 
     match tool.execute(input, ctx).await {
@@ -225,6 +227,7 @@ pub async fn run_tool_batches(
     depth: u8,
     parent_history: Option<Arc<Vec<ChatMessage>>>,
     todo_store: Option<crate::SharedTodoStore>,
+    background_tasks: Option<Arc<dyn crate::tools::BackgroundTaskRegistry>>,
     tx: &mut Sender<RunEvent>,
 ) -> Vec<ChatMessage> {
     let mut results = Vec::new();
@@ -252,6 +255,7 @@ pub async fn run_tool_batches(
                 let swarm = swarm.clone();
                 let parent_history = parent_history.clone();
                 let todo_store = todo_store.clone();
+                let background_tasks = background_tasks.clone();
 
                 handles.push(tokio::spawn(async move {
                     execute_tool_call(
@@ -273,6 +277,7 @@ pub async fn run_tool_batches(
                         depth,
                         parent_history,
                         todo_store,
+                        background_tasks,
                     )
                     .await
                 }));
@@ -332,6 +337,7 @@ pub async fn run_tool_batches(
                     depth,
                     parent_history.clone(),
                     todo_store.clone(),
+                    background_tasks.clone(),
                 )
                 .await;
 
@@ -724,6 +730,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_error);
@@ -762,6 +769,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
         )
@@ -822,6 +830,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_error);
@@ -869,6 +878,7 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
                 None,
                 None,
             )
@@ -919,6 +929,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .await;
         assert!(!result.is_error);
@@ -964,6 +975,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
         )
@@ -1016,6 +1028,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .await;
         assert!(!result.is_error);
@@ -1063,6 +1076,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .await;
         // Unattended prompt must fail closed.
@@ -1106,6 +1120,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
         )
@@ -1202,6 +1217,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .await;
         assert!(!result.is_error);
@@ -1233,6 +1249,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
         )
@@ -1269,6 +1286,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             &mut tx,
@@ -1353,6 +1371,7 @@ mod tests {
             None,
             None,
             0,
+            None,
             None,
             None,
             &mut tx,

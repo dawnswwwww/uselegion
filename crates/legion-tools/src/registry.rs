@@ -11,6 +11,7 @@ use legion_runtime::{Tool, ToolRegistry};
 use crate::mcp::McpTool;
 
 use crate::ask_user::AskUserTool;
+use crate::background_task::{GetTaskOutputTool, KillTaskTool, WaitTasksTool};
 use crate::browser::BrowserTool;
 use crate::grep::GrepTool;
 use crate::list_dir::ListDirTool;
@@ -150,6 +151,14 @@ impl CoreToolRegistry {
         let exec_policy = Policy::from_config(config.tools.get("exec"), Approval::Required);
         let exec_tool = build_exec_tool(&config.tools, exec_policy);
         tools.insert("exec".to_string(), Arc::new(exec_tool));
+
+        // Background task management tools.
+        tools.insert("wait_tasks".to_string(), Arc::new(WaitTasksTool::new()));
+        tools.insert("kill_task".to_string(), Arc::new(KillTaskTool::new()));
+        tools.insert(
+            "get_task_output".to_string(),
+            Arc::new(GetTaskOutputTool::new()),
+        );
 
         let web_fetch_policy = Policy::from_config(config.tools.get("web_fetch"), Approval::Off);
         tools.insert(
@@ -313,6 +322,9 @@ mod tests {
             "edit",
             "apply_patch",
             "exec",
+            "wait_tasks",
+            "kill_task",
+            "get_task_output",
             "web_fetch",
             "web_search",
             "memory_search",
@@ -372,6 +384,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            background_tasks: None,
         }
     }
 

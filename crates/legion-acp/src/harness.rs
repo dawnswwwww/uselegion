@@ -323,6 +323,7 @@ async fn execute_tool_call(
         parent_history: None,
         question_gate: None,
         todo_store: None,
+        background_tasks: None,
     };
 
     match tool.execute(params, ctx).await {

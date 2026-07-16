@@ -233,6 +233,7 @@ mod tests {
             parent_history: None,
             question_gate: Some(gate),
             todo_store: None,
+            background_tasks: None,
         }
     }
 
@@ -298,6 +299,7 @@ mod tests {
             parent_history: None,
             question_gate: None,
             todo_store: None,
+            background_tasks: None,
         };
 
         let result = tool.execute(sample_input(), ctx).await;

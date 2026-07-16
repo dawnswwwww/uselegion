@@ -133,6 +133,7 @@ mod tests {
                     parent_history: None,
                     question_gate: None,
                     todo_store: None,
+                    background_tasks: None,
                 },
             )
             .await

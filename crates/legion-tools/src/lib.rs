@@ -1,4 +1,5 @@
 pub mod ask_user;
+pub mod background_task;
 pub mod browser;
 pub mod grep;
 pub mod list_dir;

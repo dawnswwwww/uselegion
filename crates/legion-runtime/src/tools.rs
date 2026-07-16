@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::approval::PermissionMode;
@@ -15,6 +15,57 @@ use crate::question::QuestionGate;
 use crate::todo::SharedTodoStore;
 
 pub use legion_core::config::ToolConfig;
+
+/// Result of a background task once it has completed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundTaskResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Snapshot of a background task's current output and state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundTaskOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub is_running: bool,
+}
+
+/// Registry that tracks background tasks spawned by tools.
+///
+/// Implementations are expected to be thread-safe and shared across tool
+/// invocations in the same session via [`ToolContext::background_tasks`].
+#[async_trait]
+pub trait BackgroundTaskRegistry: Send + Sync + std::fmt::Debug {
+    /// Allocate a new unique task id.
+    fn next_task_id(&self) -> String;
+
+    /// Register a new background task.
+    ///
+    /// `handle` is the tokio task running the command; `log_path` is the file
+    /// the task writes its stdout/stderr to. Returns the resolved task id
+    /// (the registry may normalize or replace the requested id).
+    async fn register(
+        &self,
+        task_id: String,
+        handle: tokio::task::JoinHandle<Result<BackgroundTaskResult, String>>,
+        log_path: PathBuf,
+    ) -> Result<String, ToolError>;
+
+    /// Wait for all given task ids to complete and return their results.
+    async fn wait(
+        &self,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, BackgroundTaskResult>, ToolError>;
+
+    /// Kill a running task.
+    async fn kill(&self, task_id: &str) -> Result<(), ToolError>;
+
+    /// Return the current output of a task without waiting for it to finish.
+    async fn output(&self, task_id: &str) -> Result<BackgroundTaskOutput, ToolError>;
+}
 
 /// Context passed to a tool execution.
 #[derive(Clone)]
@@ -56,6 +107,9 @@ pub struct ToolContext {
     /// Optional todo store for the `todo_write` tool to update the session
     /// checklist. When `None` the tool reports that todos are unavailable.
     pub todo_store: Option<SharedTodoStore>,
+    /// Optional registry for background tasks spawned by the `exec` tool and
+    /// managed by `wait_tasks`, `kill_task`, and `get_task_output`.
+    pub background_tasks: Option<Arc<dyn BackgroundTaskRegistry>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -78,6 +132,7 @@ impl std::fmt::Debug for ToolContext {
             )
             .field("question_gate", &self.question_gate.is_some())
             .field("todo_store", &self.todo_store.is_some())
+            .field("background_tasks", &self.background_tasks.is_some())
             .finish()
     }
 }
