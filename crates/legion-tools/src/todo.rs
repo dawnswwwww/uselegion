@@ -122,6 +122,7 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             approval: crate::policy::Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         }

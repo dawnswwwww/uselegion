@@ -21,6 +21,7 @@ impl McpTool {
         };
         let policy = Policy {
             approval,
+            permission_mode: None,
             allow_from: Vec::new(),
             workspace_only: false,
         };

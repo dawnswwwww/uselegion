@@ -769,6 +769,7 @@ mod tests {
         static POLICY: OnceLock<crate::tools::Policy> = OnceLock::new();
         POLICY.get_or_init(|| crate::tools::Policy {
             approval: crate::tools::Approval::Required,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })
@@ -1046,6 +1047,7 @@ mod tests {
         static POLICY: OnceLock<crate::tools::Policy> = OnceLock::new();
         POLICY.get_or_init(|| crate::tools::Policy {
             approval: crate::tools::Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })

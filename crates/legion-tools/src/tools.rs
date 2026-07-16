@@ -784,6 +784,7 @@ impl MemorySearchTool {
         Self {
             policy: Policy {
                 approval: Approval::Off,
+                permission_mode: None,
                 allow_from: vec![],
                 workspace_only: false,
             },
@@ -878,6 +879,7 @@ impl MemoryGetTool {
         Self {
             policy: Policy {
                 approval: Approval::Off,
+                permission_mode: None,
                 allow_from: vec![],
                 workspace_only: false,
             },
@@ -970,6 +972,7 @@ impl MemoryIndexTool {
         Self {
             policy: Policy {
                 approval: Approval::Off,
+                permission_mode: None,
                 allow_from: vec![],
                 workspace_only: false,
             },
@@ -1140,6 +1143,7 @@ impl SpawnSubagentTool {
         Self {
             policy: Policy {
                 approval: Approval::Off,
+                permission_mode: None,
                 allow_from: vec![],
                 workspace_only: false,
             },
@@ -1496,6 +1500,7 @@ impl RunCoordinatorTool {
         Self {
             policy: Policy {
                 approval: Approval::Off,
+                permission_mode: None,
                 allow_from: vec![],
                 workspace_only: false,
             },
@@ -1923,6 +1928,7 @@ mod tests {
     fn open_policy() -> Policy {
         Policy {
             approval: crate::policy::Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         }
@@ -1931,6 +1937,7 @@ mod tests {
     fn ws_only_policy() -> Policy {
         Policy {
             approval: crate::policy::Approval::Off,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: true,
         }
@@ -2629,6 +2636,7 @@ mod tests {
     fn a2a_tool() -> AgentToAgentSendTool {
         AgentToAgentSendTool::new(Policy {
             approval: Approval::Prompt,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         })
@@ -2742,6 +2750,7 @@ mod tests {
     fn prompt_policy() -> Policy {
         Policy {
             approval: Approval::Prompt,
+            permission_mode: None,
             allow_from: vec![],
             workspace_only: false,
         }

@@ -241,6 +241,7 @@ impl CoreToolRegistry {
                 "todo_write".to_string(),
                 Arc::new(TodoWriteTool::new(Policy {
                     approval: Approval::Off,
+                    permission_mode: None,
                     allow_from: vec![],
                     workspace_only: false,
                 })),
@@ -573,6 +574,7 @@ mod tests {
                 description: "dummy tool",
                 policy: Policy {
                     approval: Approval::Off,
+                    permission_mode: None,
                     allow_from: vec![],
                     workspace_only: false,
                 },

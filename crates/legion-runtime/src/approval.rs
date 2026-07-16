@@ -10,12 +10,54 @@
 //! agent loop and the channel side lands in Part 2.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
+
+/// Rich permission mode that controls how the runtime handles tool approvals.
+///
+/// This is the successor to the three-state [`crate::tools::Approval`] model.
+/// Modes are applied after the per-tool policy decider returns
+/// [`Permission::Prompt`](crate::tools::Permission); hard denials are always
+/// respected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Prompt for approval when the tool is not pre-approved (legacy `prompt`).
+    Default,
+    /// Auto-approve file edit/write tools (`write`, `edit`, `apply_patch`).
+    AcceptEdits,
+    /// Auto-approve read-only / non-dangerous tools.
+    Auto,
+    /// Deny if there is no explicit allow (legacy unattended `required`).
+    DontAsk,
+    /// Auto-approve everything except hard denials (legacy `off`).
+    BypassPermissions,
+    /// Plan mode: allow read-only tools and plan-file writes.
+    ///
+    /// Plan-file special handling is Phase 2; for now this is equivalent to
+    /// [`PermissionMode::Auto`] for read-only tools.
+    Plan,
+}
+
+impl FromStr for PermissionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(PermissionMode::Default),
+            "accept_edits" | "acceptEdits" => Ok(PermissionMode::AcceptEdits),
+            "auto" => Ok(PermissionMode::Auto),
+            "dont_ask" | "dontAsk" => Ok(PermissionMode::DontAsk),
+            "bypass_permissions" | "bypassPermissions" => Ok(PermissionMode::BypassPermissions),
+            "plan" => Ok(PermissionMode::Plan),
+            _ => Err(format!("unknown permission mode: {s}")),
+        }
+    }
+}
 
 /// Describes a tool invocation awaiting approval.
 #[derive(Debug, Clone)]
@@ -35,6 +77,9 @@ pub struct ApprovalRequest {
 pub struct ApprovalCtx {
     pub gate: Arc<ApprovalGate>,
     pub interactive: bool,
+    /// Session-level permission mode. Applied after the `can_use_tool` decider
+    /// returns [`Permission::Prompt`](crate::tools::Permission).
+    pub permission_mode: PermissionMode,
 }
 
 /// Notifies the user (typically via the originating channel) that an approval
@@ -415,5 +460,46 @@ mod tests {
         );
         // The registry consumes the entry, so a replayed reply is a miss.
         assert!(!registry.resolve(&prompt_id, true).await);
+    }
+
+    #[test]
+    fn permission_mode_from_str_accepts_snake_and_camel() {
+        assert_eq!(
+            "default".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            "accept_edits".parse::<PermissionMode>().unwrap(),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            "acceptEdits".parse::<PermissionMode>().unwrap(),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            "auto".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            "dont_ask".parse::<PermissionMode>().unwrap(),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            "dontAsk".parse::<PermissionMode>().unwrap(),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            "bypass_permissions".parse::<PermissionMode>().unwrap(),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            "bypassPermissions".parse::<PermissionMode>().unwrap(),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            "plan".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Plan
+        );
+        assert!("unknown".parse::<PermissionMode>().is_err());
     }
 }
