@@ -16,6 +16,7 @@ pub use state::{AppState, ChatMessage, MessageRole, MessageState};
 
 use crate::driver::{
     CliMode, EMBEDDED_NOTICE, LocalDriver, TurnDriver, WsDriver, build_local_host, probe_gateway,
+    session_cron_store_path,
 };
 use crate::{CliError, GatewayClient, load_config};
 use crossterm::event::{self, Event, KeyEventKind};
@@ -132,18 +133,25 @@ pub async fn run_tui(
 
     let state = Arc::new(Mutex::new(state_inner));
 
+    // Local TUI sessions use a scoped cron store so `/loop` and
+    // `scheduler_create` write to the same session-level JSONL file.
+    let local_cron_store_path = session_cron_store_path(&session_key);
+
     // Select the transport. The WebSocket path behaves exactly as before
     // (Gateway mode still auto-starts the gateway); Auto probes briefly and
     // falls back to an embedded runtime without starting anything.
     let mut version_warning: Option<String> = None;
     let driver: Arc<dyn TurnDriver> = match mode {
-        CliMode::Local => Arc::new(LocalDriver::new(
-            Arc::new(build_local_host(&config).await?),
-            session_key.clone(),
-            event_tx.clone(),
-            yolo,
-            workspace_override.clone(),
-        )),
+        CliMode::Local => Arc::new(
+            LocalDriver::new(
+                Arc::new(build_local_host(&config, local_cron_store_path.clone()).await?),
+                session_key.clone(),
+                event_tx.clone(),
+                yolo,
+                workspace_override.clone(),
+            )
+            .await?,
+        ),
         CliMode::Gateway => {
             // Ensure the gateway is reachable. If not, start it in the background.
             let client = match GatewayClient::connect(&config).await {
@@ -176,13 +184,16 @@ pub async fn run_tui(
             }
             None => {
                 eprintln!("{EMBEDDED_NOTICE}");
-                Arc::new(LocalDriver::new(
-                    Arc::new(build_local_host(&config).await?),
-                    session_key.clone(),
-                    event_tx.clone(),
-                    yolo,
-                    workspace_override.clone(),
-                ))
+                Arc::new(
+                    LocalDriver::new(
+                        Arc::new(build_local_host(&config, local_cron_store_path.clone()).await?),
+                        session_key.clone(),
+                        event_tx.clone(),
+                        yolo,
+                        workspace_override.clone(),
+                    )
+                    .await?,
+                )
             }
         },
     };

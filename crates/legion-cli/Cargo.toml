@@ -19,6 +19,7 @@ legion-runtime = { path = "../legion-runtime" }
 legion-skills = { path = "../legion-skills" }
 legion-tools = { path = "../legion-tools" }
 clap = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
