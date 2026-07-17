@@ -5,7 +5,7 @@
 //! interception happens in `handle_key_event` before the driver).
 //!
 //! Three command kinds:
-//! - **Local** (`/help`, `/clear`, `/status`, `/quit`, `/skills`, `/goal`):
+//! - **Local** (`/help`, `/clear`, `/status`, `/quit`, `/skills`, `/goal`, `/theme`):
 //!   executed entirely in-process; the agent never sees them.
 //! - **Prompt** (`/skills:<name>`): injects `body` as a system message, then
 //!   sends the user's args to the agent as a normal turn.
@@ -14,6 +14,8 @@
 
 use crate::goal;
 use crate::loop_cmd;
+use crate::tui::ScreenMode;
+use crate::tui::theme::Theme;
 use crate::tui::{AppState, MessageRole};
 
 // ---------------------------------------------------------------------------
@@ -123,9 +125,23 @@ pub fn builtins() -> Vec<SlashCommand> {
         SlashCommand {
             name: "loop".into(),
             aliases: vec![],
-            description: "schedule a recurring prompt (requires gateway)".into(),
-            arg_hint: "[interval] <prompt>".into(),
+            description: "ask the agent to schedule a recurring prompt".into(),
+            arg_hint: "<when> <what>".into(),
             kind: CommandKind::Local { run: cmd_loop },
+        },
+        SlashCommand {
+            name: "theme".into(),
+            aliases: vec![],
+            description: "switch the TUI color theme".into(),
+            arg_hint: "<dark|light|default>".into(),
+            kind: CommandKind::Local { run: cmd_theme },
+        },
+        SlashCommand {
+            name: "mode".into(),
+            aliases: vec![],
+            description: "switch between fullscreen and inline viewport".into(),
+            arg_hint: "<fullscreen|inline>".into(),
+            kind: CommandKind::Local { run: cmd_mode },
         },
     ]
 }
@@ -427,30 +443,29 @@ fn cmd_goal(state: &mut AppState, args: &str) -> CommandResult {
 
 fn cmd_loop(state: &mut AppState, args: &str) -> CommandResult {
     match loop_cmd::parse_loop(args) {
-        Ok(req) => {
-            let cron = match loop_cmd::interval_to_cron(&req.interval) {
-                Ok(expr) => expr,
-                Err(err) => {
-                    state.push_message(
-                        MessageRole::System,
-                        format!("Usage: /loop [interval] <prompt>\n{err}"),
-                    );
-                    return CommandResult::Handled;
+        Ok(req) => match loop_cmd::interval_to_cron(&req.interval) {
+            Ok(cron) => {
+                let human = loop_cmd::cron_human_summary(&cron);
+                state.push_message(
+                    MessageRole::System,
+                    format!(
+                        "Scheduling loop: {} ({}).\nPrompt: {}",
+                        cron, human, req.prompt
+                    ),
+                );
+                CommandResult::ScheduleLoop {
+                    interval: cron,
+                    prompt: req.prompt,
                 }
-            };
-            let human = loop_cmd::cron_human_summary(&cron);
-            state.push_message(
-                MessageRole::System,
-                format!(
-                    "Scheduling loop: {} ({})\nPrompt: {}",
-                    cron, human, req.prompt
-                ),
-            );
-            CommandResult::ScheduleLoop {
-                interval: cron,
-                prompt: req.prompt,
             }
-        }
+            Err(err) => {
+                state.push_message(
+                    MessageRole::System,
+                    format!("Usage: /loop [interval] <prompt>\n{err}"),
+                );
+                CommandResult::Handled
+            }
+        },
         Err(err) => {
             state.push_message(
                 MessageRole::System,
@@ -459,6 +474,45 @@ fn cmd_loop(state: &mut AppState, args: &str) -> CommandResult {
             CommandResult::Handled
         }
     }
+}
+
+fn cmd_theme(state: &mut AppState, args: &str) -> CommandResult {
+    let name = args.trim().to_lowercase();
+    let display_name = if name.is_empty() { "default" } else { &name };
+    match name.as_str() {
+        "dark" => state.theme = Theme::default_dark(),
+        "light" => state.theme = Theme::default_light(),
+        "" | "default" => state.theme = Theme::default(),
+        _ => {
+            state.push_message(
+                MessageRole::System,
+                format!("unknown theme '/theme {name}' — try dark, light, or default"),
+            );
+            return CommandResult::Handled;
+        }
+    }
+    state.push_message(MessageRole::System, format!("theme set to {display_name}"));
+    CommandResult::Handled
+}
+
+fn cmd_mode(state: &mut AppState, args: &str) -> CommandResult {
+    let name = args.trim().to_lowercase();
+    match name.as_str() {
+        "fullscreen" => state.screen_mode = ScreenMode::Fullscreen,
+        "inline" => state.screen_mode = ScreenMode::Inline,
+        _ => {
+            state.push_message(
+                MessageRole::System,
+                "usage: /mode <fullscreen|inline>".to_string(),
+            );
+            return CommandResult::Handled;
+        }
+    }
+    state.push_message(
+        MessageRole::System,
+        format!("viewport mode set to {name}; switch takes effect next redraw"),
+    );
+    CommandResult::Handled
 }
 
 // ---------------------------------------------------------------------------
@@ -472,14 +526,14 @@ mod tests {
     #[test]
     fn suggestions_empty_query_returns_builtins_with_help_first() {
         let all = suggestions("", &[]);
-        // 7 builtins, no skills → all fit under the cap.
-        assert_eq!(all.len(), 7);
+        // 9 builtins, no skills, but empty query is capped at MAX_SUGGESTIONS (8).
+        assert_eq!(all.len(), 8);
         assert_eq!(all[0].name, "help");
     }
 
     #[test]
     fn suggestions_empty_query_caps_at_max() {
-        // With 7 builtins + 5 skills = 12 commands, the empty-query menu
+        // With 9 builtins + 5 skills = 14 commands, the empty-query menu
         // must cap at MAX_SUGGESTIONS (8), builtins first.
         let skills = vec![
             test_skill("alpha", "a"),
@@ -490,9 +544,8 @@ mod tests {
         ];
         let all = suggestions("", &skills);
         assert_eq!(all.len(), 8);
-        // First 7 are builtins, 8th is the first skill by name.
-        assert!(all[0..7].iter().all(|c| !c.name.starts_with("skills:")));
-        assert!(all[7].name.starts_with("skills:"));
+        // First 8 are builtins, so no skill appears (mode is the 9th builtin).
+        assert!(all.iter().all(|c| !c.name.starts_with("skills:")));
     }
 
     #[test]
@@ -528,9 +581,44 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_skill_returns_send_to_agent() {
+    fn dispatch_theme_sets_default() {
         let mut state = AppState::default();
-        state.loaded_skills = vec![test_skill("clarify", "clarify requirements")];
+        let result = dispatch(&mut state, "/theme default");
+        assert!(matches!(result, CommandResult::Handled));
+        // Echo + confirmation.
+        assert_eq!(state.messages().len(), 2);
+        assert!(
+            state
+                .messages()
+                .last()
+                .unwrap()
+                .content
+                .contains("theme set")
+        );
+        assert_eq!(state.theme, Theme::default());
+    }
+
+    #[test]
+    fn dispatch_theme_unknown_shows_hint() {
+        let mut state = AppState::default();
+        let result = dispatch(&mut state, "/theme neon");
+        assert!(matches!(result, CommandResult::Handled));
+        assert!(
+            state
+                .messages()
+                .last()
+                .unwrap()
+                .content
+                .contains("unknown theme")
+        );
+    }
+
+    #[test]
+    fn dispatch_skill_returns_send_to_agent() {
+        let mut state = AppState {
+            loaded_skills: vec![test_skill("clarify", "clarify requirements")],
+            ..Default::default()
+        };
         let result = dispatch(&mut state, "/skills:clarify help me with X");
         match result {
             CommandResult::SendToAgent { message } => {
@@ -547,8 +635,10 @@ mod tests {
 
     #[test]
     fn dispatch_skill_no_args_sends_placeholder() {
-        let mut state = AppState::default();
-        state.loaded_skills = vec![test_skill("clarify", "clarify requirements")];
+        let mut state = AppState {
+            loaded_skills: vec![test_skill("clarify", "clarify requirements")],
+            ..Default::default()
+        };
         let result = dispatch(&mut state, "/skills:clarify");
         match result {
             CommandResult::SendToAgent { message } => {
@@ -585,19 +675,23 @@ mod tests {
         // "skills:clarify" contains ':' but not '/', so looks_like_path
         // must not swallow it.  It also must not be treated as a path
         // because of the colon.
-        let mut state = AppState::default();
-        state.loaded_skills = vec![test_skill("clarify", "clarify")];
+        let mut state = AppState {
+            loaded_skills: vec![test_skill("clarify", "clarify")],
+            ..Default::default()
+        };
         let result = dispatch(&mut state, "/skills:clarify");
         assert!(matches!(result, CommandResult::SendToAgent { .. }));
     }
 
     #[test]
     fn cmd_skills_lists_loaded_skills() {
-        let mut state = AppState::default();
-        state.loaded_skills = vec![
-            test_skill("clarify", "clarify requirements"),
-            test_skill("deploy", "deploy to staging"),
-        ];
+        let mut state = AppState {
+            loaded_skills: vec![
+                test_skill("clarify", "clarify requirements"),
+                test_skill("deploy", "deploy to staging"),
+            ],
+            ..Default::default()
+        };
         cmd_skills(&mut state, "");
         let msg = state.messages().last().unwrap();
         assert!(msg.content.contains("/skills:clarify"));
@@ -606,8 +700,10 @@ mod tests {
 
     #[test]
     fn cmd_help_includes_skill_section() {
-        let mut state = AppState::default();
-        state.loaded_skills = vec![test_skill("clarify", "clarify requirements")];
+        let mut state = AppState {
+            loaded_skills: vec![test_skill("clarify", "clarify requirements")],
+            ..Default::default()
+        };
         cmd_help(&mut state, "");
         let msg = state.messages().last().unwrap();
         assert!(msg.content.contains("/skills:clarify"));
@@ -615,8 +711,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_goal_start_creates_goal() {
-        let mut state = AppState::default();
-        state.session_key = "agent:main:dm:cli:default:direct:peer-1".to_string();
+        let mut state = AppState {
+            session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            ..Default::default()
+        };
         let result = dispatch(&mut state, "/goal get CI green");
         assert!(matches!(result, CommandResult::Handled));
         assert!(state.goal.is_some());
@@ -627,9 +725,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_goal_show_shows_summary() {
-        let mut state = AppState::default();
-        state.session_key = "agent:main:dm:cli:default:direct:peer-1".to_string();
-        state.goal = Some(crate::goal::Goal::new("fix bug"));
+        let mut state = AppState {
+            session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            goal: Some(crate::goal::Goal::new("fix bug")),
+            ..Default::default()
+        };
         let result = dispatch(&mut state, "/goal");
         assert!(matches!(result, CommandResult::Handled));
         let msg = state.messages().last().unwrap();
@@ -639,9 +739,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_goal_complete_clears_and_keeps_terminal() {
-        let mut state = AppState::default();
-        state.session_key = "agent:main:dm:cli:default:direct:peer-1".to_string();
-        state.goal = Some(crate::goal::Goal::new("fix bug"));
+        let mut state = AppState {
+            session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            goal: Some(crate::goal::Goal::new("fix bug")),
+            ..Default::default()
+        };
         let result = dispatch(&mut state, "/goal complete");
         assert!(matches!(result, CommandResult::Handled));
         assert_eq!(
