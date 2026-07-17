@@ -1,6 +1,7 @@
 //! TUI state types and structures.
 
 use crate::tui::composer::Composer;
+use crate::tui::history_search::HistorySearch;
 use crate::tui::selection::Selection;
 use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
@@ -135,6 +136,8 @@ pub struct AppState {
     pub(crate) selection: Option<Selection>,
     /// Whether the user is currently dragging to select text.
     pub(crate) selecting: bool,
+    /// History search popup state.
+    pub(crate) history_search: Option<HistorySearch>,
     /// Stored pasted content keyed by placeholder token.
     pub(crate) paste_store: HashMap<String, String>,
     /// Next placeholder id for pasted content.

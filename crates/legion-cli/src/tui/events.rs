@@ -1,6 +1,7 @@
 //! TUI event handling.
 
 use crate::slash_commands::CommandResult;
+use crate::tui::history_search::HistorySearch;
 use crate::tui::input::{complete_slash_command, navigate_input_history};
 use crate::tui::question::format_question_message;
 use crate::tui::selection::{Selection, osc52_copy, position_to_cursor, selected_text};
@@ -58,6 +59,11 @@ pub(crate) fn handle_key_event(
         }
         return;
     }
+    // While the history search popup is open, keys navigate/accept/cancel it.
+    if state.history_search.is_some() {
+        handle_history_search_key(state, key);
+        return;
+    }
     // Computed once per key: the completion menu state for `/` input. It is
     // derived from the input alone, so every handler below sees the same view.
     let sugg = state.slash_suggestions();
@@ -73,6 +79,9 @@ pub(crate) fn handle_key_event(
         }
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.composer.redo();
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.history_search = Some(HistorySearch::new());
         }
         KeyCode::Enter => {
             if let Some(cmd) = sugg.get(state.slash_selected).cloned() {
@@ -337,6 +346,40 @@ pub(crate) fn handle_question_key(
         _ => {}
     }
     refresh_question_message(state);
+}
+
+/// Handle keys while the history-search popup is open.
+pub(crate) fn handle_history_search_key(state: &mut AppState, key: event::KeyEvent) {
+    let Some(ref mut hs) = state.history_search else {
+        return;
+    };
+    let filtered = hs.filtered(&state.input_history);
+    match key.code {
+        KeyCode::Esc => {
+            state.history_search = None;
+        }
+        KeyCode::Up => {
+            hs.move_up(filtered.len());
+        }
+        KeyCode::Down => {
+            hs.move_down(filtered.len());
+        }
+        KeyCode::Enter => {
+            if let Some((_, text)) = filtered.get(hs.selected) {
+                state.composer.set_text(text);
+            }
+            state.history_search = None;
+        }
+        KeyCode::Backspace => {
+            hs.query.pop();
+            hs.selected = 0;
+        }
+        KeyCode::Char(c) => {
+            hs.query.push(c);
+            hs.selected = 0;
+        }
+        _ => {}
+    }
 }
 
 /// Cancel the question prompt and answer with an empty selection so the run

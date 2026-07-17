@@ -348,6 +348,41 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
         }
     }
 
+    // History search popup.
+    if let Some(ref hs) = state.history_search {
+        let filtered = hs.filtered(&state.input_history);
+        let height = (filtered.len() as u16 + 4).min(f.area().height / 2).max(5);
+        let width = (f.area().width * 4 / 5).max(20);
+        let x = f.area().x + (f.area().width - width) / 2;
+        let y = f.area().y + (f.area().height - height) / 2;
+        let area = Rect::new(x, y, width, height);
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, text))| {
+                let display = if text.len() > width as usize - 4 {
+                    format!("{}…", &text[..width as usize - 5])
+                } else {
+                    text.to_string()
+                };
+                let item = ListItem::new(Line::from(display));
+                if idx == hs.selected {
+                    item.style(
+                        Style::default()
+                            .fg(theme.selected_fg)
+                            .bg(theme.input_border),
+                    )
+                } else {
+                    item
+                }
+            })
+            .collect();
+        let list = List::new(items).block(Block::default().title("history").borders(Borders::ALL));
+        f.render_widget(Clear, area);
+        f.render_widget(list, area);
+    }
+
     // Status bar. A pending tool-approval prompt takes precedence over the
     // usual status so the user always sees what is blocking the run.
     let status_lines = status_bar_lines(state, &theme, status_height);

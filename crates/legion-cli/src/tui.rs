@@ -2,6 +2,7 @@
 
 mod composer;
 mod events;
+mod history_search;
 mod input;
 mod markdown;
 mod question;
