@@ -15,6 +15,7 @@ pub mod syntax;
 pub mod theme;
 mod tool_card;
 mod widgets;
+mod writer;
 
 pub use state::{AppState, ChatMessage, MessageRole, MessageState};
 
@@ -35,6 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use writer::{TermWriter, WriterThread};
 
 /// Run the interactive TUI.
 ///
@@ -391,11 +393,17 @@ async fn run_terminal(
         crossterm::event::EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    let backend = CrosstermBackend::new(stdout);
+
+    // Offload stdout writes to a dedicated thread so a slow terminal cannot
+    // block the async event loop.
+    let (term_writer, writer) = WriterThread::spawn(stdout);
+    let backend = CrosstermBackend::new(term_writer);
     let mut terminal = Terminal::new(backend)?;
 
     let result = tui_loop(&mut terminal, state.clone(), send_tx.clone(), event_rx).await;
 
+    // Terminal cleanup commands travel through the writer thread so they are
+    // serialized behind any pending frame bytes.
     disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
@@ -404,11 +412,16 @@ async fn run_terminal(
         DisableBracketedPaste
     )?;
 
+    // Drop the terminal (which flushes its backend) and wait for the writer
+    // thread to drain the last bytes before returning.
+    drop(terminal);
+    writer.join()?;
+
     result
 }
 
 async fn tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<TermWriter>>,
     state: Arc<Mutex<state::AppState>>,
     send_tx: mpsc::UnboundedSender<state::OutboundControl>,
     event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
