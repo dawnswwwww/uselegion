@@ -54,7 +54,15 @@
 | T7 | 超链接 OSC 8 | done | P2 | 2-3d | [T7 超链接](./2026-07-17-legion-tui-hyperlinks.md) |
 | T8 | Writer Thread（非阻塞终端 I/O） | done | P2 | 3-4d | [T8 Writer Thread](./2026-07-17-legion-tui-writer-thread.md) |
 | T9 | PTY 集成测试框架 | done | P3 | 5-7d | [T9 PTY 测试](./2026-07-17-legion-tui-pty-testing.md) |
-| T10 | Inline / Minimal 视口模式 | in-progress | P3 | 7-10d | [T10 Inline 视口](./2026-07-17-legion-tui-inline-viewport.md) |
+| T10 | Inline / Minimal 视口模式 | done | P3 | 7-10d | [T10 Inline 视口](./2026-07-17-legion-tui-inline-viewport.md) |
+
+---
+
+## 4. 完成记录
+
+- 2026-07-17：T1-T10 全部实现并合并到 `feature/tui-overhaul` 分支。
+- 验证状态：`cargo build --workspace --all-targets`、`cargo clippy --workspace --all-targets`、`cargo fmt -- --check`、`cargo test --workspace --lib` 全绿；`legion-cli` 单元测试与 PTY 集成测试全绿。
+- 注意：`legion-gateway` / `legion-automation` / `legion-web` 的部分集成测试依赖外部服务，在本机环境中会挂起，与本次 TUI 改动无关。
 
 ---
 
