@@ -1,11 +1,7 @@
 //! TUI event handling.
 
 use crate::slash_commands::CommandResult;
-use crate::tui::input::{
-    complete_slash_command, delete_back, delete_forward, insert_char, move_cursor_end,
-    move_cursor_home, move_cursor_left, move_cursor_right, move_cursor_vertical,
-    navigate_input_history,
-};
+use crate::tui::input::{complete_slash_command, navigate_input_history};
 use crate::tui::question::format_question_message;
 use crate::tui::state::{
     AppState, ChatMessage, MessageRole, MessageState, OutboundControl, PendingQuestion,
@@ -54,17 +50,17 @@ pub(crate) fn handle_key_event(
     // derived from the input alone, so every handler below sees the same view.
     let sugg = state.slash_suggestions();
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.quit = true;
-        }
         // Shortcuts require Ctrl so plain typing always reaches the input
         // box — the input is permanently focused, there is no mode in which
         // a bare 'q'/'t' can be interpreted as a command.
-        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.quit = true;
-        }
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             toggle_nearest_thinking(state);
+        }
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.composer.undo();
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.composer.redo();
         }
         KeyCode::Enter => {
             if let Some(cmd) = sugg.get(state.slash_selected).cloned() {
@@ -92,8 +88,10 @@ pub(crate) fn handle_key_event(
                     complete_slash_command(state, &cmd);
                 }
             } else {
-                let text =
-                    crate::tui::input::expand_paste_placeholders(&state.input, &state.paste_store);
+                let text = crate::tui::input::expand_paste_placeholders(
+                    &state.composer.join(),
+                    &state.paste_store,
+                );
                 let text = text.trim().to_string();
                 if !text.is_empty() {
                     // Shell escape mode: `!command` runs locally through the
@@ -165,50 +163,15 @@ pub(crate) fn handle_key_event(
                 complete_slash_command(state, &cmd);
             }
         }
-        KeyCode::Char(c) => {
-            insert_char(state, c);
-        }
-        KeyCode::Backspace => {
-            delete_back(state);
-        }
-        KeyCode::Delete => {
-            delete_forward(state);
-        }
-        KeyCode::Left => {
-            move_cursor_left(state, key.modifiers.contains(KeyModifiers::CONTROL));
-        }
-        KeyCode::Right => {
-            move_cursor_right(state, key.modifiers.contains(KeyModifiers::CONTROL));
-        }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
             if sugg.is_empty() {
-                move_cursor_vertical(state, true);
+                state.composer.move_cursor_up();
             }
         }
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
             if sugg.is_empty() {
-                move_cursor_vertical(state, false);
+                state.composer.move_cursor_down();
             }
-        }
-        KeyCode::PageUp => {
-            let delta = state.page_scroll_delta();
-            state.scroll = state.scroll.saturating_sub(delta);
-        }
-        KeyCode::PageDown => {
-            let delta = state.page_scroll_delta();
-            state.scroll = state.scroll.saturating_add(delta);
-        }
-        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.scroll = 0;
-        }
-        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.scroll = state.max_scroll;
-        }
-        KeyCode::Home if key.modifiers.contains(KeyModifiers::ALT) => {
-            move_cursor_home(state, true);
-        }
-        KeyCode::End if key.modifiers.contains(KeyModifiers::ALT) => {
-            move_cursor_end(state, true);
         }
         KeyCode::Up => {
             if sugg.is_empty() {
@@ -229,14 +192,30 @@ pub(crate) fn handle_key_event(
                 state.slash_selected = (state.slash_selected + 1) % sugg.len();
             }
         }
-        KeyCode::Home => {
-            move_cursor_home(state, false);
+        KeyCode::PageUp => {
+            let delta = state.page_scroll_delta();
+            state.scroll = state.scroll.saturating_sub(delta);
         }
-        KeyCode::End => {
-            move_cursor_end(state, false);
+        KeyCode::PageDown => {
+            let delta = state.page_scroll_delta();
+            state.scroll = state.scroll.saturating_add(delta);
         }
-
-        _ => {}
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.scroll = 0;
+        }
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.scroll = state.max_scroll;
+        }
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::ALT) => {
+            state.composer.move_cursor_top();
+        }
+        KeyCode::End if key.modifiers.contains(KeyModifiers::ALT) => {
+            state.composer.move_cursor_bottom();
+        }
+        // All other keys are handled by the rich textarea editor.
+        _ => {
+            state.composer.input(key);
+        }
     }
 }
 

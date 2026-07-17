@@ -1,5 +1,6 @@
 //! TUI state types and structures.
 
+use crate::tui::composer::Composer;
 use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use legion_runtime::{AskUserOutput, AskUserQuestion, TodoItem};
@@ -80,9 +81,8 @@ pub(crate) enum OutboundControl {
 #[derive(Default, Clone)]
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
-    pub(crate) input: String,
-    /// Byte index of the cursor inside `input`.
-    pub(crate) cursor: usize,
+    /// Rich multi-line input editor.
+    pub(crate) composer: Composer,
     /// User inputs sent in this TUI session, recalled with ↑/↓.
     pub(crate) input_history: Vec<String>,
     /// Index into `input_history` when browsing history. `None` means the
@@ -103,9 +103,7 @@ pub struct AppState {
     pub(crate) session_peer: String,
     /// Which `(message_index, think_index)` blocks are expanded.
     pub(crate) expanded_thinks: HashSet<(usize, usize)>,
-    /// Target column for vertical cursor movement across wrapped input lines.
-    pub(crate) target_col: Option<usize>,
-    /// Cached input area width (inner) for cursor movement calculations.
+    /// Cached input area width (inner) for dynamic input height calculations.
     pub(crate) input_area_width: u16,
     /// Cached viewport height for scroll clamping.
     pub(crate) viewport_height: u16,
@@ -344,8 +342,9 @@ impl AppState {
     /// input is not a bare command name. Mirrors Claude Code's rule: a
     /// whitespace after the command name (i.e. arguments) closes the menu.
     pub(crate) fn slash_suggestions(&self) -> Vec<crate::slash_commands::SlashCommand> {
-        if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) {
-            crate::slash_commands::suggestions(&self.input[1..], &self.loaded_skills)
+        let text = self.composer.join();
+        if text.starts_with('/') && !text.contains(char::is_whitespace) {
+            crate::slash_commands::suggestions(&text[1..], &self.loaded_skills)
         } else {
             Vec::new()
         }

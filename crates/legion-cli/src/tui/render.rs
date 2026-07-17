@@ -1,13 +1,13 @@
 //! TUI rendering and layout.
 
-use crate::tui::input::{apply_scroll, char_width, cursor_visual_position, input_visual_lines};
+use crate::tui::input::{apply_scroll, char_width, input_visual_lines};
 use crate::tui::state::{AppState, ChatMessage, RenderKey, RenderedMessage, ThinkHint};
 use crate::tui::widgets::{render_todo_panel, status_bar_lines};
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, Wrap,
+    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
 };
 use std::collections::HashSet;
 
@@ -153,7 +153,9 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     // Dynamic input area: grows with content up to a cap, but always leaves
     // room for the chat (min 5) and the status bar.
     let input_width = f.area().width.saturating_sub(2) as usize;
-    let input_line_count = input_visual_lines(&state.input, input_width).len().max(1);
+    let input_line_count = input_visual_lines(&state.composer.join(), input_width)
+        .len()
+        .max(1);
     let input_height = (input_line_count as u16 + 2).clamp(3, 10);
     // On very short terminals keep a compact single-line status bar; otherwise
     // split it into a status line plus a shortcuts line so it is readable.
@@ -270,39 +272,15 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     // Input box.
-    let inner_input = input_area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let visible_height = inner_input.height as usize;
-    let input_width = state.input_area_width as usize;
-    let input_lines = input_visual_lines(&state.input, input_width);
-    let (cursor_line, cursor_col) = cursor_visual_position(&state.input, state.cursor, input_width);
-    let input_scroll = cursor_line.saturating_sub(visible_height.saturating_sub(1));
-    let displayed_input: Vec<Line> = input_lines
-        .into_iter()
-        .skip(input_scroll)
-        .take(visible_height)
-        .map(Line::from)
-        .collect();
-    let input_title = if state.input.starts_with('!') {
+    // The composer renders its own reversed-style cursor; the terminal cursor
+    // is intentionally hidden by not calling set_cursor_position.
+    let input_title = if state.composer.join().starts_with('!') {
         "shell mode"
     } else {
         "Input"
     };
-    let input = Paragraph::new(Text::from(displayed_input))
-        .block(
-            Block::default()
-                .title(input_title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.input_border)),
-        )
-        .wrap(Wrap { trim: false });
-    f.render_widget(input, input_area);
-
-    let cursor_x = inner_input.x + cursor_col as u16;
-    let cursor_y = inner_input.y + (cursor_line - input_scroll) as u16;
-    f.set_cursor_position(Position::new(cursor_x, cursor_y));
+    state.composer.set_title(input_title);
+    state.composer.render(input_area, f.buffer_mut());
 
     // Slash-command completion menu: a floating list above the input box,
     // open while the input is a bare `/name` (see AppState::slash_suggestions).

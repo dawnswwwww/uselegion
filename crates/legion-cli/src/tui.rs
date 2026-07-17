@@ -1,5 +1,6 @@
 //! Interactive TUI for Legion, similar to Claude Code.
 
+mod composer;
 mod events;
 mod input;
 mod markdown;
@@ -15,7 +16,6 @@ pub use state::{AppState, ChatMessage, MessageRole, MessageState};
 
 use crate::driver::{
     CliMode, EMBEDDED_NOTICE, LocalDriver, TurnDriver, WsDriver, build_local_host, probe_gateway,
-    session_cron_store_path,
 };
 use crate::{CliError, GatewayClient, load_config};
 use crossterm::event::{self, Event, KeyEventKind};
@@ -132,25 +132,18 @@ pub async fn run_tui(
 
     let state = Arc::new(Mutex::new(state_inner));
 
-    // Local TUI sessions use a scoped cron store so `/loop` and
-    // `scheduler_create` write to the same session-level JSONL file.
-    let local_cron_store_path = session_cron_store_path(&session_key);
-
     // Select the transport. The WebSocket path behaves exactly as before
     // (Gateway mode still auto-starts the gateway); Auto probes briefly and
     // falls back to an embedded runtime without starting anything.
     let mut version_warning: Option<String> = None;
     let driver: Arc<dyn TurnDriver> = match mode {
-        CliMode::Local => Arc::new(
-            LocalDriver::new(
-                Arc::new(build_local_host(&config, local_cron_store_path.clone()).await?),
-                session_key.clone(),
-                event_tx.clone(),
-                yolo,
-                workspace_override.clone(),
-            )
-            .await?,
-        ),
+        CliMode::Local => Arc::new(LocalDriver::new(
+            Arc::new(build_local_host(&config).await?),
+            session_key.clone(),
+            event_tx.clone(),
+            yolo,
+            workspace_override.clone(),
+        )),
         CliMode::Gateway => {
             // Ensure the gateway is reachable. If not, start it in the background.
             let client = match GatewayClient::connect(&config).await {
@@ -183,16 +176,13 @@ pub async fn run_tui(
             }
             None => {
                 eprintln!("{EMBEDDED_NOTICE}");
-                Arc::new(
-                    LocalDriver::new(
-                        Arc::new(build_local_host(&config, local_cron_store_path.clone()).await?),
-                        session_key.clone(),
-                        event_tx.clone(),
-                        yolo,
-                        workspace_override.clone(),
-                    )
-                    .await?,
-                )
+                Arc::new(LocalDriver::new(
+                    Arc::new(build_local_host(&config).await?),
+                    session_key.clone(),
+                    event_tx.clone(),
+                    yolo,
+                    workspace_override.clone(),
+                ))
             }
         },
     };
@@ -527,6 +517,12 @@ mod tests {
         static HIGHLIGHTER: std::sync::OnceLock<crate::tui::syntax::Highlighter> =
             std::sync::OnceLock::new();
         HIGHLIGHTER.get_or_init(crate::tui::syntax::Highlighter::new)
+    }
+
+    fn composer_with(text: &str) -> crate::tui::composer::Composer {
+        let mut c = crate::tui::composer::Composer::new();
+        c.set_text(text);
+        c
     }
 
     #[test]
@@ -1074,7 +1070,7 @@ mod tests {
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Char('a')), &tx);
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Enter), &tx);
 
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
         assert!(
             state.pending_approval.is_some(),
             "prompt stays pending until y/n/Esc"
@@ -1085,8 +1081,7 @@ mod tests {
     #[test]
     fn handle_key_event_sends_user_message_and_marks_pending() {
         let mut state = AppState {
-            input: "hi".to_string(),
-            cursor: 2,
+            composer: composer_with("hi"),
             ..AppState::default()
         };
         let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1098,14 +1093,13 @@ mod tests {
         assert_eq!(state.messages[0].content, "hi");
         assert!(state.pending_request);
         assert!(state.force_scroll_bottom);
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
     }
 
     #[test]
     fn handle_key_event_slash_help_runs_locally_without_sending() {
         let mut state = AppState {
-            input: "/help".to_string(),
-            cursor: 5,
+            composer: composer_with("/help"),
             ..AppState::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1117,7 +1111,7 @@ mod tests {
         assert_eq!(state.messages[1].role, MessageRole::System);
         assert!(state.messages[1].content.contains("/clear"));
         assert!(!state.pending_request, "slash commands never start a turn");
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
         assert!(
             rx.try_recv().is_err(),
             "slash commands must not reach the driver"
@@ -1127,8 +1121,7 @@ mod tests {
     #[test]
     fn handle_key_event_slash_quit_sets_quit_flag() {
         let mut state = AppState {
-            input: "/quit".to_string(),
-            cursor: 5,
+            composer: composer_with("/quit"),
             ..AppState::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1140,8 +1133,7 @@ mod tests {
     #[test]
     fn handle_key_event_slash_clear_empties_history() {
         let mut state = AppState {
-            input: "/clear".to_string(),
-            cursor: 6,
+            composer: composer_with("/clear"),
             ..AppState::default()
         };
         state
@@ -1161,8 +1153,7 @@ mod tests {
     #[test]
     fn handle_key_event_slash_path_is_sent_as_message() {
         let mut state = AppState {
-            input: "/tmp/foo".to_string(),
-            cursor: 8,
+            composer: composer_with("/tmp/foo"),
             ..AppState::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1179,14 +1170,13 @@ mod tests {
     #[test]
     fn handle_key_event_tab_completes_selected_slash_command() {
         let mut state = AppState {
-            input: "/he".to_string(),
-            cursor: 3,
+            composer: composer_with("/he"),
             ..AppState::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Tab), &tx);
-        assert_eq!(state.input, "/help ");
-        assert_eq!(state.cursor, 6);
+        assert_eq!(state.composer.join(), "/help ");
+        assert_eq!(state.composer.cursor(), (0, 6));
         assert_eq!(state.slash_selected, 0);
         assert!(rx.try_recv().is_err(), "completion does not send anything");
     }
@@ -1195,8 +1185,7 @@ mod tests {
     fn handle_key_event_arrows_navigate_slash_menu_without_moving_cursor() {
         let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let mut state = AppState {
-            input: "/".to_string(),
-            cursor: 1,
+            composer: composer_with("/"),
             input_area_width: 80,
             ..AppState::default()
         };
@@ -1206,32 +1195,37 @@ mod tests {
         assert_eq!(state.slash_selected, 2);
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Up), &tx);
         assert_eq!(state.slash_selected, 1);
-        assert_eq!(state.cursor, 1, "menu navigation must not move the cursor");
+        assert_eq!(
+            state.composer.cursor(),
+            (0, 1),
+            "menu navigation must not move the cursor"
+        );
 
         // With a single suggestion, a bare Down would otherwise move the
-        // cursor to the end of the input line (via move_cursor_vertical).
+        // cursor to the end of the input line.
         let mut state = AppState {
-            input: "/help".to_string(),
-            cursor: 3,
+            composer: composer_with("/help"),
             input_area_width: 80,
             ..AppState::default()
         };
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Down), &tx);
         assert_eq!(state.slash_selected, 0);
-        assert_eq!(state.cursor, 3);
+        assert_eq!(
+            state.composer.cursor(),
+            (0, 5),
+            "menu navigation must not move the cursor"
+        );
     }
 
     #[test]
     fn commit_and_clear_input_records_history() {
         let mut state = AppState {
-            input: "hello".to_string(),
-            cursor: 5,
+            composer: composer_with("hello"),
             ..AppState::default()
         };
         input::commit_and_clear_input(&mut state, "hello");
         assert_eq!(state.input_history, vec!["hello".to_string()]);
-        assert!(state.input.is_empty());
-        assert_eq!(state.cursor, 0);
+        assert!(state.composer.is_empty());
         assert!(state.draft_input.is_none());
         assert!(state.history_index.is_none());
     }
@@ -1247,19 +1241,19 @@ mod tests {
 
         // ↑ recalls the most recent entry.
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Up), &tx);
-        assert_eq!(state.input, "second");
-        assert_eq!(state.cursor, 6);
+        assert_eq!(state.composer.join(), "second");
+        assert_eq!(state.composer.cursor(), (0, 6));
         assert_eq!(state.history_index, Some(1));
         assert_eq!(state.draft_input, Some(String::new()));
 
         // ↑ again moves to older entry.
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Up), &tx);
-        assert_eq!(state.input, "first");
+        assert_eq!(state.composer.join(), "first");
         assert_eq!(state.history_index, Some(0));
 
         // ↓ moves forward through history.
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Down), &tx);
-        assert_eq!(state.input, "second");
+        assert_eq!(state.composer.join(), "second");
         assert_eq!(state.history_index, Some(1));
     }
 
@@ -1267,34 +1261,34 @@ mod tests {
     fn handle_key_event_down_restores_draft() {
         let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let mut state = AppState {
-            input: "draft".to_string(),
-            cursor: 5,
+            composer: composer_with("draft"),
             input_history: vec!["previous".to_string()],
             input_area_width: 80,
             ..AppState::default()
         };
 
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Up), &tx);
-        assert_eq!(state.input, "previous");
+        assert_eq!(state.composer.join(), "previous");
         assert_eq!(state.draft_input, Some("draft".to_string()));
 
         // ↓ past the newest entry restores the saved draft.
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Down), &tx);
-        assert_eq!(state.input, "draft");
-        assert_eq!(state.cursor, 5);
+        assert_eq!(state.composer.join(), "draft");
+        assert_eq!(state.composer.cursor(), (0, 5));
         assert!(state.history_index.is_none());
         assert!(state.draft_input.is_none());
     }
 
     #[test]
-    fn handle_key_event_shift_up_down_moves_cursor_vertically() {
+    fn handle_key_event_shift_up_down_moves_cursor_between_lines() {
         let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let mut state = AppState {
-            input: "abcd efgh".to_string(),
-            cursor: 0,
-            input_area_width: 5,
+            composer: composer_with("abcd\nefgh"),
+            input_area_width: 80,
             ..AppState::default()
         };
+        state.composer.move_cursor_top();
+        state.composer.input(event::KeyEvent::from(KeyCode::Home));
 
         fn shift_key(code: KeyCode) -> event::KeyEvent {
             event::KeyEvent {
@@ -1307,13 +1301,15 @@ mod tests {
 
         events::handle_key_event(&mut state, shift_key(KeyCode::Down), &tx);
         assert_eq!(
-            state.cursor, 5,
-            "Shift+Down should move to next visual line"
+            state.composer.cursor(),
+            (1, 0),
+            "Shift+Down should move to next line"
         );
         events::handle_key_event(&mut state, shift_key(KeyCode::Up), &tx);
         assert_eq!(
-            state.cursor, 0,
-            "Shift+Up should move to previous visual line"
+            state.composer.cursor(),
+            (0, 0),
+            "Shift+Up should move to previous line"
         );
     }
 
@@ -1321,15 +1317,14 @@ mod tests {
     fn navigate_input_history_no_ops_when_empty() {
         let mut state = AppState::default();
         input::navigate_input_history(&mut state, true);
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
         assert!(state.history_index.is_none());
     }
 
     #[test]
     fn handle_key_event_slash_command_with_args_executes_directly() {
         let mut state = AppState {
-            input: "/help me".to_string(),
-            cursor: 8,
+            composer: composer_with("/help me"),
             ..AppState::default()
         };
         assert!(
@@ -1349,8 +1344,7 @@ mod tests {
     #[test]
     fn handle_key_event_bang_prefix_executes_shell_command() {
         let mut state = AppState {
-            input: "!echo hi".to_string(),
-            cursor: 8,
+            composer: composer_with("!echo hi"),
             ..AppState::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1362,15 +1356,14 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].role, MessageRole::User);
         assert_eq!(state.messages[0].content, "!echo hi");
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
         assert!(!state.pending_request);
     }
 
     #[test]
     fn handle_key_event_bang_only_reports_empty_shell_command() {
         let mut state = AppState {
-            input: "!".to_string(),
-            cursor: 1,
+            composer: composer_with("!"),
             ..AppState::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1379,75 +1372,63 @@ mod tests {
         assert_eq!(state.messages[0].role, MessageRole::System);
         assert!(state.messages[0].content.contains("empty"));
         assert!(rx.try_recv().is_err(), "empty shell command is not sent");
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
     }
 
     #[test]
     fn input_title_reflects_bang_prefix() {
         let state = AppState {
-            input: "!pwd".to_string(),
+            composer: composer_with("!pwd"),
             ..AppState::default()
         };
         // The title is derived from input content, not a separate flag.
-        assert!(state.input.starts_with('!'));
+        assert!(state.composer.join().starts_with('!'));
     }
 
     #[test]
-    fn input_cursor_moves_left_right() {
-        let mut state = AppState {
-            input: "abc".to_string(),
-            cursor: 3,
-            input_area_width: 80,
-            ..AppState::default()
-        };
-        input::move_cursor_left(&mut state, false);
-        assert_eq!(state.cursor, 2);
-        input::move_cursor_right(&mut state, false);
-        assert_eq!(state.cursor, 3);
+    fn composer_cursor_moves_left_right() {
+        let mut composer = composer_with("abc");
+        composer.input(event::KeyEvent::from(KeyCode::End));
+        composer.input(event::KeyEvent::from(KeyCode::Left));
+        assert_eq!(composer.cursor(), (0, 2));
+        composer.input(event::KeyEvent::from(KeyCode::Right));
+        assert_eq!(composer.cursor(), (0, 3));
     }
 
     #[test]
-    fn input_insert_and_delete_at_cursor() {
-        let mut state = AppState {
-            input: "ac".to_string(),
-            cursor: 1,
-            ..AppState::default()
-        };
-        input::insert_char(&mut state, 'b');
-        assert_eq!(state.input, "abc");
-        assert_eq!(state.cursor, 2);
-        input::delete_back(&mut state);
-        assert_eq!(state.input, "ac");
-        assert_eq!(state.cursor, 1);
+    fn composer_insert_and_delete_at_cursor() {
+        let mut composer = composer_with("ac");
+        composer.input(event::KeyEvent::from(KeyCode::Home));
+        composer.input(event::KeyEvent::from(KeyCode::Right));
+        composer.input(event::KeyEvent::from(KeyCode::Char('b')));
+        assert_eq!(composer.join(), "abc");
+        assert_eq!(composer.cursor(), (0, 2));
+        composer.input(event::KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(composer.join(), "ac");
+        assert_eq!(composer.cursor(), (0, 1));
     }
 
     #[test]
-    fn input_home_end() {
-        let mut state = AppState {
-            input: "hello world".to_string(),
-            cursor: 5,
-            input_area_width: 80,
-            ..AppState::default()
-        };
-        input::move_cursor_home(&mut state, false);
-        assert_eq!(state.cursor, 0);
-        input::move_cursor_end(&mut state, true);
-        assert_eq!(state.cursor, state.input.len());
+    fn composer_home_end() {
+        let mut composer = composer_with("hello world");
+        composer.input(event::KeyEvent::from(KeyCode::Home));
+        assert_eq!(composer.cursor(), (0, 0));
+        composer.input(event::KeyEvent::from(KeyCode::End));
+        assert_eq!(composer.cursor(), (0, 11));
     }
 
     #[test]
-    fn input_cursor_wraps_lines() {
-        let mut state = AppState {
-            input: "abcd efgh".to_string(),
-            cursor: 0,
-            input_area_width: 5,
-            ..AppState::default()
-        };
-        // "abcd " is 5 chars wide, "efgh" on next line.
-        input::move_cursor_end(&mut state, false);
-        assert_eq!(state.cursor, 5);
-        input::move_cursor_vertical(&mut state, false);
-        assert_eq!(state.cursor, 9);
+    fn composer_cursor_moves_between_lines() {
+        let mut composer = composer_with("abcd\nefgh");
+        composer.move_cursor_top();
+        composer.input(event::KeyEvent::from(KeyCode::Home));
+        assert_eq!(composer.cursor(), (0, 0));
+        composer.move_cursor_down();
+        assert_eq!(composer.cursor(), (1, 0));
+        composer.move_cursor_end();
+        assert_eq!(composer.cursor(), (1, 4));
+        composer.move_cursor_up();
+        assert_eq!(composer.cursor(), (0, 4));
     }
 
     #[test]
@@ -1582,7 +1563,7 @@ mod tests {
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Char('t')), &tx);
         events::handle_key_event(&mut state, event::KeyEvent::from(KeyCode::Char('q')), &tx);
 
-        assert_eq!(state.input, "tq");
+        assert_eq!(state.composer.join(), "tq");
         assert!(!state.quit);
         assert!(state.expanded_thinks.is_empty());
     }
@@ -1608,7 +1589,7 @@ mod tests {
 
         events::handle_key_event(&mut state, ctrl_key(KeyCode::Char('t')), &tx);
         assert!(state.expanded_thinks.contains(&(0, 0)));
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
 
         events::handle_key_event(&mut state, ctrl_key(KeyCode::Char('t')), &tx);
         assert!(state.expanded_thinks.is_empty());
@@ -1721,8 +1702,7 @@ mod tests {
     #[test]
     fn handle_key_event_enter_forces_scroll_bottom() {
         let mut state = AppState {
-            input: "hi".to_string(),
-            cursor: 2,
+            composer: composer_with("hi"),
             ..AppState::default()
         };
         let (tx, _) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1735,8 +1715,7 @@ mod tests {
     fn handle_paste_inserts_small_text() {
         let mut state = AppState::default();
         input::handle_paste(&mut state, "hello".to_string());
-        assert_eq!(state.input, "hello");
-        assert_eq!(state.cursor, 5);
+        assert_eq!(state.composer.join(), "hello");
         assert!(state.paste_store.is_empty());
     }
 
@@ -1745,7 +1724,7 @@ mod tests {
         let mut state = AppState::default();
         let text = "line1\nline2\nline3".to_string();
         input::handle_paste(&mut state, text.clone());
-        assert_eq!(state.input, text);
+        assert_eq!(state.composer.join(), text);
         assert!(state.paste_store.is_empty());
     }
 
@@ -1754,9 +1733,10 @@ mod tests {
         let mut state = AppState::default();
         let text = "x".repeat(state::PASTE_CHAR_THRESHOLD + 1);
         input::handle_paste(&mut state, text.clone());
-        assert!(!state.input.contains(&text));
-        assert!(state.input.contains("Pasted text"));
-        assert!(state.input.contains(&format!("{} chars", text.len())));
+        let joined = state.composer.join();
+        assert!(!joined.contains(&text));
+        assert!(joined.contains("Pasted text"));
+        assert!(joined.contains(&format!("{} chars", text.len())));
         assert_eq!(state.paste_store.len(), 1);
         assert!(state.paste_store.values().any(|v| v == &text));
     }
@@ -1769,12 +1749,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         input::handle_paste(&mut state, text.clone());
-        assert!(state.input.contains("Pasted text"));
-        assert!(
-            state
-                .input
-                .contains(&format!("{} lines", state::PASTE_LINE_THRESHOLD + 1))
-        );
+        let joined = state.composer.join();
+        assert!(joined.contains("Pasted text"));
+        assert!(joined.contains(&format!("{} lines", state::PASTE_LINE_THRESHOLD + 1)));
         assert_eq!(state.paste_store.len(), 1);
     }
 
@@ -1802,7 +1779,7 @@ mod tests {
 
         let sent = rx.try_recv().expect("expected a message to be sent");
         assert_eq!(sent, state::OutboundControl::Message(content));
-        assert!(state.input.is_empty());
+        assert!(state.composer.is_empty());
         assert!(state.paste_store.is_empty());
     }
 
@@ -1867,8 +1844,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut state = AppState {
-            input: "hello".to_string(),
-            cursor: 5,
+            composer: composer_with("hello"),
             ..AppState::default()
         };
         let (tx, _) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1905,8 +1881,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut state = AppState {
-            input: "hello world".to_string(),
-            cursor: 11,
+            composer: composer_with("hello world"),
             ..AppState::default()
         };
         let (tx, _) = mpsc::unbounded_channel::<state::OutboundControl>();
@@ -1940,8 +1915,7 @@ mod tests {
                 MessageRole::Assistant,
                 "first line\nsecond line".to_string(),
             )],
-            input: "this is a long user message".to_string(),
-            cursor: 27,
+            composer: composer_with("this is a long user message"),
             ..AppState::default()
         };
         let (tx, _) = mpsc::unbounded_channel::<state::OutboundControl>();
