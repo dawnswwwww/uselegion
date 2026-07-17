@@ -1,5 +1,6 @@
 //! Tool-call card rendering.
 
+use crate::tui::ansi::{ansi_to_text, has_ansi};
 use crate::tui::state::{TOOL_ARGS_MAX_CHARS, TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES};
 use crate::tui::theme::Theme;
 use ratatui::style::{Modifier, Style};
@@ -50,6 +51,20 @@ pub(crate) fn push_result_lines(
 ) {
     let total = text.lines().count();
     let limit = TOOL_RESULT_HEAD_LINES + TOOL_RESULT_TAIL_LINES;
+
+    // For ANSI output we render the colored text directly when it fits;
+    // truncating styled lines while preserving colors is not worth the
+    // complexity for the long-output case, which falls back to plain text.
+    if has_ansi(text) && total <= limit + 1 {
+        let ansi_text = ansi_to_text(text);
+        for line in ansi_text.lines {
+            let mut spans = vec![Span::styled(prefix.to_string(), style)];
+            spans.extend(line.spans);
+            out.push(Line::from(spans));
+        }
+        return;
+    }
+
     if total <= limit + 1 {
         for line in text.lines() {
             out.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));

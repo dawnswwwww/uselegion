@@ -73,6 +73,7 @@ syntect = "5.3"
 
 # tui widgets
 tui-textarea = "0.7.0"
+ansi-to-tui = "7.0"
 
 # testing
 rstest = "0.25"
