@@ -60,6 +60,8 @@ predicates = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 libc = { workspace = true }
+portable-pty = { workspace = true }
+anyhow = { workspace = true }
 
 [[bin]]
 name = "legion"
