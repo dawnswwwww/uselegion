@@ -1,6 +1,7 @@
 //! Markdown-to-ratatui rendering.
 
 use crate::tui::input::char_width;
+use crate::tui::links::osc8_link;
 use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag, TagEnd};
@@ -178,16 +179,18 @@ pub(crate) fn markdown_lines(
                     quote_depth = quote_depth.saturating_sub(1);
                 }
                 TagEnd::Link => {
-                    push_pending_to_spans(
-                        &mut current_spans,
-                        &mut pending,
-                        effective_style(style, in_heading),
-                    );
                     if let Some(url) = link_url.take() {
-                        current_spans.push(Span::styled(
-                            format!(" ↗({})", url),
-                            Style::default().fg(theme.link_fg),
-                        ));
+                        let display = std::mem::take(&mut pending);
+                        let display_style = effective_style(style, in_heading)
+                            .add_modifier(Modifier::UNDERLINED)
+                            .fg(theme.link_fg);
+                        current_spans.push(Span::styled(osc8_link(&url, &display), display_style));
+                    } else {
+                        push_pending_to_spans(
+                            &mut current_spans,
+                            &mut pending,
+                            effective_style(style, in_heading),
+                        );
                     }
                     if let Some(prev) = link_style.take() {
                         style = prev;

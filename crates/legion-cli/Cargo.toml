@@ -49,6 +49,7 @@ crossterm = "0.28"
 unicode-width = "0.2"
 syntect = { workspace = true }
 ansi-to-tui = { workspace = true }
+linkify = { workspace = true }
 rand = "0.9"
 libc = { workspace = true }
 pulldown-cmark = { workspace = true }

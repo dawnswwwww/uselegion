@@ -1,9 +1,11 @@
 //! Interactive TUI for Legion, similar to Claude Code.
 
+mod ansi;
 mod composer;
 mod events;
 mod history_search;
 mod input;
+mod links;
 mod markdown;
 mod question;
 mod render;

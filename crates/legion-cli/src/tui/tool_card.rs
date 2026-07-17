@@ -1,6 +1,7 @@
 //! Tool-call card rendering.
 
 use crate::tui::ansi::{ansi_to_text, has_ansi};
+use crate::tui::links::linkify_text;
 use crate::tui::state::{TOOL_ARGS_MAX_CHARS, TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES};
 use crate::tui::theme::Theme;
 use ratatui::style::{Modifier, Style};
@@ -67,7 +68,9 @@ pub(crate) fn push_result_lines(
 
     if total <= limit + 1 {
         for line in text.lines() {
-            out.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
+            let mut spans = vec![Span::styled(prefix.to_string(), style)];
+            spans.extend(linkify_text(line, style));
+            out.push(Line::from(spans));
         }
         return;
     }
