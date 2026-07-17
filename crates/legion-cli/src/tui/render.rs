@@ -1,6 +1,7 @@
 //! TUI rendering and layout.
 
 use crate::tui::input::{apply_scroll, char_width, input_visual_lines};
+use crate::tui::selection::{highlight_line_selection, line_selection_range};
 use crate::tui::state::{AppState, ChatMessage, RenderKey, RenderedMessage, ThinkHint};
 use crate::tui::widgets::{render_todo_panel, status_bar_lines};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
@@ -188,6 +189,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     let chat_area = chunks[0];
     let todo_area = chunks[1];
     let input_area = chunks[2];
+    state.chat_area = chat_area;
     state.input_area_width = input_area.width.saturating_sub(2);
 
     // The Paragraph widget renders inside the chat block's borders, so the
@@ -222,7 +224,20 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
         if msg_end > state.scroll && offset < window_end {
             let local_start = state.scroll.saturating_sub(offset);
             let local_end = msg_lines.min(window_end - offset);
-            visible_lines.extend(entry.lines[local_start..local_end].iter().cloned());
+            for line_idx in local_start..local_end {
+                let mut line = entry.lines[line_idx].clone();
+                if let Some(ref sel) = state.selection {
+                    if let Some((start, end)) = line_selection_range(sel, msg_idx, line_idx) {
+                        let end = if end == usize::MAX {
+                            line.spans.iter().map(|s| s.content.chars().count()).sum()
+                        } else {
+                            end
+                        };
+                        line = highlight_line_selection(line, start, end);
+                    }
+                }
+                visible_lines.push(line);
+            }
             let sep_pos = offset + msg_lines;
             if has_sep && sep_pos >= state.scroll && sep_pos < window_end {
                 visible_lines.push(Line::from(""));

@@ -3,6 +3,7 @@
 use crate::slash_commands::CommandResult;
 use crate::tui::input::{complete_slash_command, navigate_input_history};
 use crate::tui::question::format_question_message;
+use crate::tui::selection::{Selection, osc52_copy, position_to_cursor, selected_text};
 use crate::tui::state::{
     AppState, ChatMessage, MessageRole, MessageState, OutboundControl, PendingQuestion,
 };
@@ -19,10 +20,21 @@ pub(crate) fn handle_key_event(
     key: event::KeyEvent,
     send_tx: &mpsc::UnboundedSender<OutboundControl>,
 ) {
-    // Quit shortcuts are always honored first.
-    if (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('q'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-    {
+    // Ctrl+C copies the current scrollback selection if one exists; otherwise
+    // it acts as a quit shortcut (alongside Ctrl+Q).
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let Some(ref sel) = state.selection {
+            if !sel.is_empty() {
+                let text = selected_text(sel, &state.messages, &state.render_cache);
+                print!("{}", osc52_copy(&text));
+                state.selection = None;
+                return;
+            }
+        }
+        state.quit = true;
+        return;
+    }
+    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
         state.quit = true;
         return;
     }
@@ -411,6 +423,9 @@ pub(crate) fn handle_mouse_event(state: &mut AppState, mouse: MouseEvent) {
         }
         MouseEventKind::Down(_) => {
             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+            // Check think-block hitboxes first; clicks on thinking hints toggle
+            // expansion and do not start a selection.
+            let mut hit_think = false;
             for (rect, msg_idx, think_idx) in &state.think_hitboxes {
                 if rect.contains(pos) {
                     let key = (*msg_idx, *think_idx);
@@ -419,9 +434,42 @@ pub(crate) fn handle_mouse_event(state: &mut AppState, mouse: MouseEvent) {
                     } else {
                         state.expanded_thinks.insert(key);
                     }
+                    hit_think = true;
                     break;
                 }
             }
+            if !hit_think {
+                state.selection = None;
+                if let Some(cursor) = position_to_cursor(
+                    pos,
+                    state.chat_area,
+                    &state.messages,
+                    state.scroll,
+                    &state.render_cache,
+                ) {
+                    state.selection = Some(Selection::new(cursor, cursor));
+                    state.selecting = true;
+                }
+            }
+        }
+        MouseEventKind::Drag(_) => {
+            if state.selecting {
+                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+                if let Some(cursor) = position_to_cursor(
+                    pos,
+                    state.chat_area,
+                    &state.messages,
+                    state.scroll,
+                    &state.render_cache,
+                ) {
+                    if let Some(ref mut sel) = state.selection {
+                        sel.head = cursor;
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(_) => {
+            state.selecting = false;
         }
         _ => {}
     }

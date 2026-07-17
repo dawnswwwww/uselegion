@@ -1,9 +1,11 @@
 //! TUI state types and structures.
 
 use crate::tui::composer::Composer;
+use crate::tui::selection::Selection;
 use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use legion_runtime::{AskUserOutput, AskUserQuestion, TodoItem};
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::text::Line;
 use std::collections::{HashMap, HashSet};
@@ -111,6 +113,8 @@ pub struct AppState {
     pub(crate) visible_chat_lines: u16,
     /// Cached maximum scroll position (updated each draw).
     pub(crate) max_scroll: usize,
+    /// Cached chat area rectangle, used to map mouse events to scrollback positions.
+    pub(crate) chat_area: Rect,
     /// If true, the next draw should snap the message list to the bottom.
     pub(crate) force_scroll_bottom: bool,
     /// True while a user request has been sent but the run has not finished.
@@ -127,6 +131,10 @@ pub struct AppState {
     pub(crate) pending_question: Option<PendingQuestion>,
     /// Screen rectangles of thinking hint lines for mouse clicks.
     pub(crate) think_hitboxes: Vec<(ratatui::layout::Rect, usize, usize)>,
+    /// Current scrollback text selection, if any.
+    pub(crate) selection: Option<Selection>,
+    /// Whether the user is currently dragging to select text.
+    pub(crate) selecting: bool,
     /// Stored pasted content keyed by placeholder token.
     pub(crate) paste_store: HashMap<String, String>,
     /// Next placeholder id for pasted content.

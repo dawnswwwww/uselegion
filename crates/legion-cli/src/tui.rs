@@ -6,6 +6,7 @@ mod input;
 mod markdown;
 mod question;
 mod render;
+mod selection;
 mod state;
 pub mod syntax;
 pub mod theme;
