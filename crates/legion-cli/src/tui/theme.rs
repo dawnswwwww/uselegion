@@ -37,7 +37,7 @@ impl Default for Theme {
             input_border: Color::Blue,
             selected_fg: Color::Black,
             code_bg: Color::Rgb(30, 30, 30),
-            code_inline_bg: Color::Rgb(50, 50, 50),
+            code_inline_bg: Color::Rgb(40, 40, 40),
             link_fg: Color::LightBlue,
             error_fg: Color::Red,
             spinner_fg: Color::Green,

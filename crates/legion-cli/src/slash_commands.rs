@@ -5,18 +5,15 @@
 //! interception happens in `handle_key_event` before the driver).
 //!
 //! Three command kinds:
-//! - **Local** (`/help`, `/clear`, `/status`, `/quit`, `/skills`, `/goal`, `/loop`):
-//!   executed entirely in-process; the agent never sees them directly.
+//! - **Local** (`/help`, `/clear`, `/status`, `/quit`, `/skills`, `/goal`, `/theme`):
+//!   executed entirely in-process; the agent never sees them.
 //! - **Prompt** (`/skills:<name>`): injects `body` as a system message, then
 //!   sends the user's args to the agent as a normal turn.
-//!
-//! `/loop` is a Local command that forwards the user's natural-language request
-//! to the agent with a system-style instruction. The agent itself decides how
-//! to parse the interval, calls `scheduler_create`, and can execute the task
-//! immediately. This keeps scheduling logic in one place (the scheduler tools)
-//! and lets the agent handle complex stop conditions ("5 times", "until 17:35").
+//! - **ScheduleLoop** (`/loop`): parsed locally, then scheduled as a recurring
+//!   cron job through the gateway (requires gateway mode).
 
 use crate::goal;
+use crate::loop_cmd;
 use crate::tui::theme::Theme;
 use crate::tui::{AppState, MessageRole};
 
@@ -65,6 +62,9 @@ pub enum CommandResult {
     /// a system message, and `message` should be sent to the agent as a user
     /// turn.
     SendToAgent { message: String },
+    /// `/loop` parsed successfully: schedule the prompt as a recurring cron
+    /// job and also run it now.
+    ScheduleLoop { interval: String, prompt: String },
     /// The input is not a command (e.g. `/tmp/foo`) and should be sent as a
     /// normal message.
     NotACommand,
@@ -433,31 +433,38 @@ fn cmd_goal(state: &mut AppState, args: &str) -> CommandResult {
     CommandResult::Handled
 }
 
-/// System instruction prepended to `/loop` requests so the agent knows how to
-/// turn natural language into a scheduled cron job.
-const LOOP_SCHEDULING_INSTRUCTION: &str = r#"The user wants to schedule a recurring task with `/loop`. Please:
-
-1. Parse the user's request to decide the cron interval (e.g. "每3分钟" -> */3 * * * *, "每小时" -> 0 */1 * * *). If you cannot determine a reasonable interval, default to */10 * * * *. Cron expressions are interpreted in LOCAL time.
-2. Call `scheduler_create` with:
-   - `name`: a short descriptive name for the loop (include the topic and timestamp).
-   - `cron`: the cron expression you chose (local time).
-   - `prompt`: the concrete task the agent should run on each fire.
-3. Execute the task once right now and report the result to the user.
-4. If the user specified a stop condition (e.g. "5 times", "写5篇", "17:35结束", "持续20分钟"), schedule an additional ONE-SHOT job by calling `scheduler_create` with the `at` parameter (local time "YYYY-MM-DD HH:MM:SS") instead of `cron`. Its prompt should instruct the agent to call `scheduler_delete` on the loop job (use `scheduler_list` to find its id) and then delete the one-shot job itself. One-shot jobs fire once and are removed automatically.
-
-Use the available `scheduler_create`, `scheduler_list`, and `scheduler_delete` tools. Be concise but confirm the created job id and next fire time."#;
-
-fn cmd_loop(_state: &mut AppState, args: &str) -> CommandResult {
-    if args.trim().is_empty() {
-        return CommandResult::SendToAgent {
-            message: "Please explain how to use /loop.".to_string(),
-        };
-    }
-    CommandResult::SendToAgent {
-        message: format!(
-            "{LOOP_SCHEDULING_INSTRUCTION}\n\nUser's /loop request: {}",
-            args.trim()
-        ),
+fn cmd_loop(state: &mut AppState, args: &str) -> CommandResult {
+    match loop_cmd::parse_loop(args) {
+        Ok(req) => match loop_cmd::interval_to_cron(&req.interval) {
+            Ok(cron) => {
+                let human = loop_cmd::cron_human_summary(&cron);
+                state.push_message(
+                    MessageRole::System,
+                    format!(
+                        "Scheduling loop: {} ({}).\nPrompt: {}",
+                        cron, human, req.prompt
+                    ),
+                );
+                CommandResult::ScheduleLoop {
+                    interval: cron,
+                    prompt: req.prompt,
+                }
+            }
+            Err(err) => {
+                state.push_message(
+                    MessageRole::System,
+                    format!("Usage: /loop [interval] <prompt>\n{err}"),
+                );
+                CommandResult::Handled
+            }
+        },
+        Err(err) => {
+            state.push_message(
+                MessageRole::System,
+                format!("Usage: /loop [interval] <prompt>\n{err}"),
+            );
+            CommandResult::Handled
+        }
     }
 }
 
@@ -718,29 +725,26 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_loop_forwards_request_to_agent() {
+    fn dispatch_loop_returns_schedule_loop() {
         let mut state = AppState::default();
-        let result = dispatch(&mut state, "/loop 每3分钟帮我写一篇作文");
+        let result = dispatch(&mut state, "/loop 5m check the deploy");
         match result {
-            CommandResult::SendToAgent { message } => {
-                assert!(message.contains("scheduler_create"));
-                assert!(message.contains("User's /loop request:"));
-                assert!(message.contains("每3分钟帮我写一篇作文"));
+            CommandResult::ScheduleLoop { interval, prompt } => {
+                assert_eq!(interval, "*/5 * * * *");
+                assert_eq!(prompt, "check the deploy");
             }
-            other => panic!("expected SendToAgent, got {other:?}"),
+            other => panic!("expected ScheduleLoop, got {other:?}"),
         }
     }
 
     #[test]
-    fn dispatch_loop_empty_args_asks_for_help() {
+    fn dispatch_loop_unclean_interval_shows_usage() {
         let mut state = AppState::default();
-        let result = dispatch(&mut state, "/loop");
-        match result {
-            CommandResult::SendToAgent { message } => {
-                assert!(message.contains("explain how to use /loop"));
-            }
-            other => panic!("expected SendToAgent, got {other:?}"),
-        }
+        // 90m does not map cleanly to a cron expression, so interval_to_cron fails.
+        let result = dispatch(&mut state, "/loop 90m check");
+        assert!(matches!(result, CommandResult::Handled));
+        let msg = state.messages().last().unwrap();
+        assert!(msg.content.contains("Usage: /loop"));
     }
 
     fn test_skill(name: &str, desc: &str) -> legion_skills::Skill {

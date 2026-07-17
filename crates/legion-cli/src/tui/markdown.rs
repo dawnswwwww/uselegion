@@ -199,7 +199,7 @@ pub(crate) fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 );
                 current_spans.push(Span::styled(
                     content.to_string(),
-                    Style::default().bg(theme.code_inline_bg),
+                    Style::default().fg(Color::White).bg(theme.code_inline_bg),
                 ));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {

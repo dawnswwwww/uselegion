@@ -4,7 +4,7 @@ use crate::tui::input::{apply_scroll, char_width, cursor_visual_position, input_
 use crate::tui::state::{AppState, ChatMessage, RenderKey, RenderedMessage, ThinkHint};
 use crate::tui::widgets::{render_todo_panel, status_bar_lines};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, Wrap,
@@ -338,7 +338,11 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
                         cmd.name, aliases, cmd.description
                     )));
                     if idx == state.slash_selected {
-                        item.style(Style::default().add_modifier(Modifier::REVERSED))
+                        item.style(
+                            Style::default()
+                                .fg(theme.selected_fg)
+                                .bg(theme.input_border),
+                        )
                     } else {
                         item
                     }
