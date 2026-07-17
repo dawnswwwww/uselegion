@@ -6,6 +6,7 @@ use crate::tui::state::{
     AppState, ChatMessage, MessageRole, MessageState, PendingQuestion, RenderedMessage,
     SUBMIT_LABEL, ThinkHint,
 };
+use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use crate::tui::tool_card::render_tool_card;
 use ratatui::style::{Color, Modifier, Style};
@@ -158,6 +159,7 @@ pub(crate) fn message_lines(
     expanded: &HashSet<(usize, usize)>,
     _viewport_width: u16,
     theme: &Theme,
+    highlighter: &Highlighter,
 ) -> RenderedMessage {
     if msg.role == MessageRole::Tool {
         let mut lines = render_tool_card(&msg.content, theme);
@@ -200,7 +202,7 @@ pub(crate) fn message_lines(
                     if msg.state == MessageState::Streaming || msg.state == MessageState::Loading {
                         plain_lines(text)
                     } else {
-                        markdown_lines(text, theme)
+                        markdown_lines(text, theme, highlighter)
                     };
                 if first {
                     prepend_prefix(&mut md, prefix.clone());

@@ -1,5 +1,6 @@
 //! TUI state types and structures.
 
+use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use legion_runtime::{AskUserOutput, AskUserQuestion, TodoItem};
 use ratatui::style::Color;
@@ -92,6 +93,7 @@ pub struct AppState {
     pub(crate) draft_input: Option<String>,
     pub(crate) status: String,
     pub theme: Theme,
+    pub highlighter: Highlighter,
     pub(crate) scroll: usize,
     pub(crate) quit: bool,
     /// Selected index in the slash-command completion menu.
@@ -275,6 +277,7 @@ impl AppState {
                 &self.expanded_thinks,
                 content_width,
                 &self.theme,
+                &self.highlighter,
             );
             let (mut lines, think_hints) = wrap_and_remap(rendered, content_width);
             if role != MessageRole::Tool {

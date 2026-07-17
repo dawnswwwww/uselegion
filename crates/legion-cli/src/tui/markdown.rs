@@ -1,6 +1,7 @@
 //! Markdown-to-ratatui rendering.
 
 use crate::tui::input::char_width;
+use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
@@ -18,7 +19,11 @@ pub(crate) fn plain_lines(text: &str) -> Vec<Line<'static>> {
 ///
 /// Supports inline **bold**, *italic*, `code`, ~~strikethrough~~, links, fenced
 /// code blocks, headings, unordered/ordered lists, blockquotes and thematic rules.
-pub(crate) fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+pub(crate) fn markdown_lines(
+    text: &str,
+    theme: &Theme,
+    highlighter: &Highlighter,
+) -> Vec<Line<'static>> {
     let parser = Parser::new(text);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
@@ -117,7 +122,13 @@ pub(crate) fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 TagEnd::Emphasis => style = style.remove_modifier(Modifier::ITALIC),
                 TagEnd::Strikethrough => style = style.remove_modifier(Modifier::CROSSED_OUT),
                 TagEnd::CodeBlock => {
-                    emit_code_block(&mut lines, &mut code_buffer, &mut code_lang, theme);
+                    emit_code_block(
+                        &mut lines,
+                        &mut code_buffer,
+                        &mut code_lang,
+                        theme,
+                        highlighter,
+                    );
                     in_code_block = false;
                 }
                 TagEnd::Heading(..) => {
@@ -238,7 +249,13 @@ pub(crate) fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     }
 
     if in_code_block {
-        emit_code_block(&mut lines, &mut code_buffer, &mut code_lang, theme);
+        emit_code_block(
+            &mut lines,
+            &mut code_buffer,
+            &mut code_lang,
+            theme,
+            highlighter,
+        );
     } else {
         flush_pending(
             &mut lines,
@@ -335,6 +352,7 @@ pub(crate) fn emit_code_block(
     buffer: &mut String,
     lang: &mut String,
     theme: &Theme,
+    highlighter: &Highlighter,
 ) {
     if buffer.is_empty() {
         return;
@@ -365,6 +383,8 @@ pub(crate) fn emit_code_block(
         code_style,
     )));
 
+    let highlighted = highlighter.highlight_lines(lang, buffer, theme);
+
     for (idx, line) in code_lines.iter().enumerate() {
         let num = idx + 1;
         let mut spans = vec![Span::styled(
@@ -372,7 +392,17 @@ pub(crate) fn emit_code_block(
             gutter_style,
         )];
         if !line.is_empty() {
-            spans.push(Span::styled(line.to_string(), code_style));
+            match highlighted {
+                Some(ref hl) if idx < hl.len() => {
+                    for span in &hl[idx].spans {
+                        let merged = span.style.patch(Style::default().bg(theme.code_bg));
+                        spans.push(Span::styled(span.content.clone(), merged));
+                    }
+                }
+                _ => {
+                    spans.push(Span::styled(line.to_string(), code_style));
+                }
+            }
         }
         lines.push(Line::from(spans));
     }

@@ -6,6 +6,7 @@ mod markdown;
 mod question;
 mod render;
 mod state;
+pub mod syntax;
 pub mod theme;
 mod tool_card;
 mod widgets;
@@ -522,11 +523,17 @@ mod tests {
         crate::tui::theme::Theme::default()
     }
 
+    fn highlighter() -> &'static crate::tui::syntax::Highlighter {
+        static HIGHLIGHTER: std::sync::OnceLock<crate::tui::syntax::Highlighter> =
+            std::sync::OnceLock::new();
+        HIGHLIGHTER.get_or_init(crate::tui::syntax::Highlighter::new)
+    }
+
     #[test]
     fn message_lines_include_prefix() {
         let theme = theme();
         let msg = ChatMessage::new(MessageRole::User, "hello");
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme);
+        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
         let text = rendered.lines[0].to_string();
         assert!(text.contains("You:"));
         assert!(text.contains("hello"));
@@ -537,7 +544,7 @@ mod tests {
         let theme = theme();
         let mut msg = ChatMessage::new(MessageRole::Assistant, "hello");
         msg.state = MessageState::Loading;
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme);
+        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
         let text = rendered.lines[0].to_string();
         assert!(text.contains("Legion:"));
         assert!(text.contains("◐"));
@@ -550,7 +557,7 @@ mod tests {
             MessageRole::Assistant,
             "<think>secret</think>answer".to_string(),
         );
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme);
+        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
         let all_text: String = rendered
             .lines
             .iter()
@@ -576,7 +583,7 @@ mod tests {
         );
         let mut expanded = HashSet::new();
         expanded.insert((0, 0));
-        let rendered = widgets::message_lines(&msg, 0, &expanded, 80, &theme);
+        let rendered = widgets::message_lines(&msg, 0, &expanded, 80, &theme, highlighter());
         let all_text: String = rendered
             .lines
             .iter()
@@ -590,7 +597,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_bold_and_italic() {
         let theme = theme();
-        let lines = markdown::markdown_lines("**bold** and *italic*", &theme);
+        let lines = markdown::markdown_lines("**bold** and *italic*", &theme, highlighter());
         let text = lines[0].to_string();
         assert!(text.contains("bold"));
         assert!(text.contains("italic"));
@@ -599,7 +606,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_inline_code() {
         let theme = theme();
-        let lines = markdown::markdown_lines("use `cargo build`", &theme);
+        let lines = markdown::markdown_lines("use `cargo build`", &theme, highlighter());
         let text = lines[0].to_string();
         assert!(text.contains("cargo build"));
     }
@@ -607,7 +614,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_code_block() {
         let theme = theme();
-        let lines = markdown::markdown_lines("```rust\nlet x = 1;\n```", &theme);
+        let lines = markdown::markdown_lines("```rust\nlet x = 1;\n```", &theme, highlighter());
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -621,7 +628,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_header() {
         let theme = theme();
-        let lines = markdown::markdown_lines("# Title\n## Subtitle", &theme);
+        let lines = markdown::markdown_lines("# Title\n## Subtitle", &theme, highlighter());
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -634,7 +641,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_list() {
         let theme = theme();
-        let lines = markdown::markdown_lines("- a\n- b", &theme);
+        let lines = markdown::markdown_lines("- a\n- b", &theme, highlighter());
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -647,7 +654,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_blockquote() {
         let theme = theme();
-        let lines = markdown::markdown_lines("> quoted", &theme);
+        let lines = markdown::markdown_lines("> quoted", &theme, highlighter());
         let text = lines[0].to_string();
         assert!(text.contains("quoted"));
         assert!(text.contains("│"));
@@ -656,7 +663,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_horizontal_rule() {
         let theme = theme();
-        let lines = markdown::markdown_lines("---", &theme);
+        let lines = markdown::markdown_lines("---", &theme, highlighter());
         let text = lines[0].to_string();
         assert!(text.contains("──"));
     }
@@ -718,7 +725,7 @@ mod tests {
             content: "**bold**".to_string(),
             state: MessageState::Streaming,
         };
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme);
+        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
         let text: String = rendered
             .lines
             .iter()
@@ -732,7 +739,7 @@ mod tests {
             state: MessageState::Done,
             ..msg
         };
-        let rendered = widgets::message_lines(&done, 0, &HashSet::new(), 80, &theme);
+        let rendered = widgets::message_lines(&done, 0, &HashSet::new(), 80, &theme, highlighter());
         let text: String = rendered
             .lines
             .iter()
