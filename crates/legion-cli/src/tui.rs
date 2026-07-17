@@ -4,6 +4,7 @@ mod ansi;
 mod composer;
 mod events;
 mod history_search;
+mod inline;
 mod input;
 mod links;
 mod markdown;
@@ -17,7 +18,7 @@ mod tool_card;
 mod widgets;
 mod writer;
 
-pub use state::{AppState, ChatMessage, MessageRole, MessageState};
+pub use state::{AppState, ChatMessage, MessageRole, MessageState, ScreenMode};
 
 use crate::driver::{
     CliMode, EMBEDDED_NOTICE, LocalDriver, TurnDriver, WsDriver, build_local_host, probe_gateway,
@@ -27,8 +28,11 @@ use crate::{CliError, GatewayClient, load_config};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use inline::{INLINE_HEIGHT, reset_emitted_index};
 use legion_skills::SkillRegistry;
 use ratatui::Terminal;
+use ratatui::TerminalOptions;
+use ratatui::Viewport;
 use ratatui::backend::CrosstermBackend;
 use serde_json::json;
 use std::io;
@@ -375,49 +379,92 @@ pub async fn run_tui(
     result
 }
 
+/// Result of one `tui_loop` invocation.
+enum LoopOutcome {
+    /// The user asked to quit.
+    Quit,
+    /// The viewport mode changed; the terminal should be recreated.
+    ModeSwitch,
+}
+
 async fn run_terminal(
     state: Arc<Mutex<state::AppState>>,
     send_tx: mpsc::UnboundedSender<state::OutboundControl>,
     event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
 ) -> Result<(), CliError> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    // Enable mouse capture so the scroll wheel works. Terminal emulators
-    // follow a universal convention: holding Shift bypasses the app's mouse
-    // capture and falls back to native text selection (click-drag to select,
-    // copy). This is how tmux, htop, less, and all ratatui/crossterm apps
-    // reconcile "scroll wheel works" with "user can still select text".
-    crossterm::execute!(
-        stdout,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    let mut current_mode = state.lock().unwrap().screen_mode;
 
-    // Offload stdout writes to a dedicated thread so a slow terminal cannot
-    // block the async event loop.
-    let (term_writer, writer) = WriterThread::spawn(stdout);
-    let backend = CrosstermBackend::new(term_writer);
-    let mut terminal = Terminal::new(backend)?;
+    loop {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
 
-    let result = tui_loop(&mut terminal, state.clone(), send_tx.clone(), event_rx).await;
+        if current_mode == ScreenMode::Fullscreen {
+            // Enable mouse capture so the scroll wheel works. Terminal
+            // emulators follow a universal convention: holding Shift
+            // bypasses the app's mouse capture and falls back to native
+            // text selection. This is how tmux, htop, less, and all
+            // ratatui/crossterm apps reconcile "scroll wheel works" with
+            // "user can still select text".
+            crossterm::execute!(
+                &mut stdout,
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture,
+                EnableBracketedPaste
+            )?;
+        }
 
-    // Terminal cleanup commands travel through the writer thread so they are
-    // serialized behind any pending frame bytes.
-    disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
+        let (term_writer, scrollback_tx, writer) = WriterThread::spawn(stdout);
+        let backend = CrosstermBackend::new(term_writer);
+        let mut terminal = match current_mode {
+            ScreenMode::Fullscreen => Terminal::new(backend)?,
+            ScreenMode::Inline => {
+                // In inline mode the live viewport lives at the bottom of the
+                // normal scrollback. Reset the scrollback emission cursor so
+                // we do not dump pre-existing history onto the current line.
+                reset_emitted_index(&mut state.lock().unwrap());
+                Terminal::with_options(
+                    backend,
+                    TerminalOptions {
+                        viewport: Viewport::Inline(INLINE_HEIGHT),
+                    },
+                )?
+            }
+        };
 
-    // Drop the terminal (which flushes its backend) and wait for the writer
-    // thread to drain the last bytes before returning.
-    drop(terminal);
-    writer.join()?;
+        let outcome = tui_loop(
+            &mut terminal,
+            state.clone(),
+            send_tx.clone(),
+            event_rx,
+            scrollback_tx,
+        )
+        .await;
 
-    result
+        // Reverse fullscreen terminal setup before dropping the terminal.
+        if current_mode == ScreenMode::Fullscreen {
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+                DisableBracketedPaste
+            )?;
+        }
+
+        // Drop the terminal (which flushes its backend) and wait for the
+        // writer thread to drain the last bytes before returning.
+        drop(terminal);
+        writer.join()?;
+        disable_raw_mode()?;
+
+        match outcome {
+            Ok(LoopOutcome::ModeSwitch) => {
+                current_mode = state.lock().unwrap().screen_mode;
+                continue;
+            }
+            Ok(LoopOutcome::Quit) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 async fn tui_loop(
@@ -425,12 +472,14 @@ async fn tui_loop(
     state: Arc<Mutex<state::AppState>>,
     send_tx: mpsc::UnboundedSender<state::OutboundControl>,
     event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
-) -> Result<(), CliError> {
+    scrollback_tx: std::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<LoopOutcome, CliError> {
     let mut last_tick = tokio::time::Instant::now();
     let tick_rate = Duration::from_millis(100);
     // Nothing on screen animates, so the UI only redraws when an event may
     // have changed state. Idle iterations block in `poll` and cost no CPU.
     let mut dirty = true;
+    let initial_mode = state.lock().unwrap().screen_mode;
 
     loop {
         // Drain incoming websocket events.
@@ -438,6 +487,16 @@ async fn tui_loop(
         while let Ok(msg) = event_rx.try_recv() {
             events::handle_ws_event(&mut state.lock().unwrap(), msg);
             had_events = true;
+        }
+
+        // In inline mode, flush finalized messages to the native scrollback.
+        {
+            let mut s = state.lock().unwrap();
+            inline::emit_finalized_messages(&mut s, |bytes| {
+                scrollback_tx
+                    .send(bytes)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread gone"))
+            })?;
         }
 
         // Poll terminal events with a timeout.
@@ -473,7 +532,15 @@ async fn tui_loop(
             drop(s);
         }
 
-        let should_quit = state.lock().unwrap().quit;
+        let (should_quit, current_mode) = {
+            let s = state.lock().unwrap();
+            (s.quit, s.screen_mode)
+        };
+
+        if current_mode != initial_mode {
+            return Ok(LoopOutcome::ModeSwitch);
+        }
+
         if dirty {
             terminal.draw(|f| render::draw_ui(f, &mut state.lock().unwrap()))?;
             dirty = false;
@@ -484,7 +551,7 @@ async fn tui_loop(
         }
     }
 
-    Ok(())
+    Ok(LoopOutcome::Quit)
 }
 
 /// Generate a random RFC 4122 version-4 UUID (e.g.

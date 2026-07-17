@@ -14,6 +14,7 @@
 
 use crate::goal;
 use crate::loop_cmd;
+use crate::tui::ScreenMode;
 use crate::tui::theme::Theme;
 use crate::tui::{AppState, MessageRole};
 
@@ -134,6 +135,13 @@ pub fn builtins() -> Vec<SlashCommand> {
             description: "switch the TUI color theme".into(),
             arg_hint: "<dark|light|default>".into(),
             kind: CommandKind::Local { run: cmd_theme },
+        },
+        SlashCommand {
+            name: "mode".into(),
+            aliases: vec![],
+            description: "switch between fullscreen and inline viewport".into(),
+            arg_hint: "<fullscreen|inline>".into(),
+            kind: CommandKind::Local { run: cmd_mode },
         },
     ]
 }
@@ -487,6 +495,26 @@ fn cmd_theme(state: &mut AppState, args: &str) -> CommandResult {
     CommandResult::Handled
 }
 
+fn cmd_mode(state: &mut AppState, args: &str) -> CommandResult {
+    let name = args.trim().to_lowercase();
+    match name.as_str() {
+        "fullscreen" => state.screen_mode = ScreenMode::Fullscreen,
+        "inline" => state.screen_mode = ScreenMode::Inline,
+        _ => {
+            state.push_message(
+                MessageRole::System,
+                "usage: /mode <fullscreen|inline>".to_string(),
+            );
+            return CommandResult::Handled;
+        }
+    }
+    state.push_message(
+        MessageRole::System,
+        format!("viewport mode set to {name}; switch takes effect next redraw"),
+    );
+    CommandResult::Handled
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -498,14 +526,14 @@ mod tests {
     #[test]
     fn suggestions_empty_query_returns_builtins_with_help_first() {
         let all = suggestions("", &[]);
-        // 8 builtins, no skills → all fit under the cap.
+        // 9 builtins, no skills, but empty query is capped at MAX_SUGGESTIONS (8).
         assert_eq!(all.len(), 8);
         assert_eq!(all[0].name, "help");
     }
 
     #[test]
     fn suggestions_empty_query_caps_at_max() {
-        // With 8 builtins + 5 skills = 13 commands, the empty-query menu
+        // With 9 builtins + 5 skills = 14 commands, the empty-query menu
         // must cap at MAX_SUGGESTIONS (8), builtins first.
         let skills = vec![
             test_skill("alpha", "a"),
@@ -516,7 +544,7 @@ mod tests {
         ];
         let all = suggestions("", &skills);
         assert_eq!(all.len(), 8);
-        // First 8 are builtins, so no skill appears.
+        // First 8 are builtins, so no skill appears (mode is the 9th builtin).
         assert!(all.iter().all(|c| !c.name.starts_with("skills:")));
     }
 

@@ -21,7 +21,6 @@ impl HistorySearch {
             .enumerate()
             .rev()
             .filter(|(_, text)| q.is_empty() || text.to_lowercase().contains(&q))
-            .map(|(idx, text)| (idx, text))
             .collect()
     }
 

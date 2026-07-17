@@ -40,6 +40,16 @@ pub enum MessageRole {
     Question,
 }
 
+/// Display mode for the TUI.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum ScreenMode {
+    /// Traditional full-screen alternate-buffer mode (default).
+    #[default]
+    Fullscreen,
+    /// Inline live viewport drawn at the bottom of the normal scrollback.
+    Inline,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MessageState {
     /// Message has been sent but the first token has not arrived yet.
@@ -162,6 +172,12 @@ pub struct AppState {
     pub goal_store: crate::goal::GoalStore,
     /// Full session key for the current TUI session.
     pub session_key: String,
+    /// Full-screen or inline viewport mode.
+    pub screen_mode: ScreenMode,
+    /// In inline mode, index of the last message already emitted to the native
+    /// scrollback. Messages finalized after this index are flushed on the next
+    /// frame.
+    pub last_emitted_scrollback_index: usize,
 }
 
 /// UI state for an in-flight `ask_user` prompt.

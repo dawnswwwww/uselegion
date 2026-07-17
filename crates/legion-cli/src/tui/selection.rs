@@ -160,7 +160,7 @@ fn x_to_char_index(text: &str, x: u16, area_x: u16) -> usize {
     let target = x.saturating_sub(area_x) as usize;
     let mut width = 0usize;
     for (idx, c) in text.chars().enumerate() {
-        let cw = crate::tui::input::char_width(c) as usize;
+        let cw = crate::tui::input::char_width(c);
         if width + cw > target {
             return idx;
         }
