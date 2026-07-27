@@ -2785,4 +2785,30 @@ mod tests {
         assert!(last.content.contains("theme: light"));
         assert!(last.content.contains("viewport: fullscreen"));
     }
+
+    #[test]
+    fn visible_width_ignores_osc8_sequences() {
+        use crate::tui::input::visible_width;
+        let link = crate::tui::links::osc8_link("https://example.com/some/long/url", "example");
+        assert_eq!(visible_width(&link), 7);
+    }
+
+    #[test]
+    fn wrap_does_not_split_or_miscount_osc8_links() {
+        use crate::tui::input::visible_width;
+        let link = crate::tui::links::osc8_link("https://example.com", "a]very[long~display~text");
+        let line = Line::from(ratatui::text::Span::raw(link.clone()));
+        let wrapped = render::wrap_line_to_width(line, 10);
+        assert!(wrapped.len() > 1, "long display text must wrap");
+        for piece in &wrapped {
+            assert!(visible_width(&piece.to_string()) <= 10);
+        }
+        // No escape sequence is torn apart: the concatenation of all pieces
+        // reproduces the original string exactly.
+        let reassembled: String = wrapped
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(reassembled, link);
+    }
 }

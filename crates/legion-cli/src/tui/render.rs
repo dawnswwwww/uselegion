@@ -20,7 +20,7 @@ pub(crate) fn wrap_line_to_width(line: Line<'static>, width: u16) -> Vec<Line<'s
         return vec![line];
     }
 
-    let str_width = |s: &str| s.chars().map(char_width).sum::<usize>();
+    let str_width = |s: &str| crate::tui::input::visible_width(s);
     let spans_width =
         |spans: &[Span<'static>]| spans.iter().map(|s| str_width(&s.content)).sum::<usize>();
     if spans_width(&line.spans) <= width {
@@ -54,12 +54,21 @@ pub(crate) fn wrap_line_to_width(line: Line<'static>, width: u16) -> Vec<Line<'s
             current_spans.push(span);
             current_width = span_width;
         } else {
-            // Span is wider than the viewport: split it character-by-character.
+            // Span is wider than the viewport: split it into display units.
+            // Escape sequences (OSC 8 links) move as atomic zero-width units
+            // so a sequence is never torn across lines.
             let span_style = span.style;
             let mut piece = String::new();
             let mut piece_width = 0usize;
-            for c in span.content.chars() {
-                let cw = char_width(c);
+            let mut rest = span.content.as_ref();
+            while !rest.is_empty() {
+                let (unit, tail) = crate::tui::input::next_display_unit(rest);
+                rest = tail;
+                let cw = if unit.starts_with('\x1b') {
+                    0
+                } else {
+                    unit.chars().map(char_width).sum::<usize>()
+                };
                 if piece_width + cw > width && !piece.is_empty() {
                     result.push(
                         Line::from(vec![Span::styled(std::mem::take(&mut piece), span_style)])
@@ -67,7 +76,7 @@ pub(crate) fn wrap_line_to_width(line: Line<'static>, width: u16) -> Vec<Line<'s
                     );
                     piece_width = 0;
                 }
-                piece.push(c);
+                piece.push_str(unit);
                 piece_width += cw;
             }
             if !piece.is_empty() {

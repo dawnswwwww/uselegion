@@ -23,6 +23,69 @@ pub(crate) fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(1)
 }
 
+/// Display width of `s`, ignoring ANSI escape sequences: CSI (`ESC [ … final`)
+/// and OSC (`ESC ] … BEL` or `ESC ] … ESC \`), which take no terminal cells.
+/// This matters for OSC 8 hyperlinks, whose bytes live inside span content.
+pub(crate) fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let (unit, tail) = next_display_unit(rest);
+        if !unit.starts_with('\x1b') {
+            width += unit.chars().map(char_width).sum::<usize>();
+        }
+        rest = tail;
+    }
+    width
+}
+
+/// Split `s` into its first display unit and the remainder. A unit is either
+/// a full escape sequence (CSI or OSC) or a single char, so wrapping never
+/// tears a sequence apart.
+pub(crate) fn next_display_unit(s: &str) -> (&str, &str) {
+    if s.starts_with('\x1b') {
+        let end = escape_sequence_len(s);
+        s.split_at(end)
+    } else {
+        let c = s.chars().next().expect("non-empty input");
+        s.split_at(c.len_utf8())
+    }
+}
+
+/// Byte length of the escape sequence at the start of `s` (which begins with
+/// ESC). Unterminated sequences consume the rest of the string.
+fn escape_sequence_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    match bytes.get(1) {
+        Some(b'[') => {
+            // CSI: parameters/intermediates, then a final byte in 0x40..=0x7E.
+            let mut i = 2;
+            while i < bytes.len() {
+                if (0x40..=0x7e).contains(&bytes[i]) {
+                    return i + 1;
+                }
+                i += 1;
+            }
+            bytes.len()
+        }
+        Some(b']') => {
+            // OSC: ends at BEL or ST (ESC \).
+            let mut i = 2;
+            while i < bytes.len() {
+                if bytes[i] == 0x07 {
+                    return i + 1;
+                }
+                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return i + 2;
+                }
+                i += 1;
+            }
+            bytes.len()
+        }
+        _ => 1,
+    }
+}
+
 pub(crate) fn input_visual_lines(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
