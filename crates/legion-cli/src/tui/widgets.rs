@@ -161,7 +161,7 @@ pub(crate) fn message_lines(
     msg: &ChatMessage,
     msg_index: usize,
     expanded: &HashSet<(usize, usize)>,
-    _viewport_width: u16,
+    viewport_width: u16,
     theme: &Theme,
     highlighter: &Highlighter,
 ) -> RenderedMessage {
@@ -206,7 +206,7 @@ pub(crate) fn message_lines(
                     if msg.state == MessageState::Streaming || msg.state == MessageState::Loading {
                         plain_lines(text)
                     } else {
-                        markdown_lines(text, theme, highlighter, _viewport_width)
+                        markdown_lines(text, theme, highlighter, viewport_width)
                     };
                 if first {
                     prepend_prefix(&mut md, prefix.clone());

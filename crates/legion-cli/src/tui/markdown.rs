@@ -25,7 +25,7 @@ pub(crate) fn markdown_lines(
     text: &str,
     theme: &Theme,
     highlighter: &Highlighter,
-    _viewport_width: u16,
+    viewport_width: u16,
 ) -> Vec<Line<'static>> {
     let parser = Parser::new_ext(text, pulldown_cmark::Options::ENABLE_TABLES);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -160,6 +160,7 @@ pub(crate) fn markdown_lines(
                         &mut code_lang,
                         theme,
                         highlighter,
+                        viewport_width,
                     );
                     in_code_block = false;
                 }
@@ -325,6 +326,7 @@ pub(crate) fn markdown_lines(
             &mut code_lang,
             theme,
             highlighter,
+            viewport_width,
         );
     } else {
         flush_pending(
@@ -426,6 +428,7 @@ pub(crate) fn emit_code_block(
     lang: &mut String,
     theme: &Theme,
     highlighter: &Highlighter,
+    viewport_width: u16,
 ) {
     if buffer.is_empty() {
         return;
@@ -439,7 +442,11 @@ pub(crate) fn emit_code_block(
         .map(|l| l.chars().map(char_width).sum::<usize>())
         .max()
         .unwrap_or(0);
-    let header_width = (max_content_width + line_num_width + 3).max(24);
+    // Fill the viewport (capped below at 24 columns) so the block background
+    // is uniform; over-wide content still wraps via `wrap_line_to_width`.
+    let block_width = (max_content_width + line_num_width + 3)
+        .max(24)
+        .min((viewport_width as usize).max(24));
 
     // Top border with language label.
     let label = if lang.is_empty() {
@@ -448,7 +455,7 @@ pub(crate) fn emit_code_block(
         lang.as_str()
     };
     let label_width = label.chars().count();
-    let border_fill = header_width.saturating_sub(label_width + 4);
+    let border_fill = block_width.saturating_sub(label_width + 4);
     lines.push(Line::from(Span::styled(
         format!("─ {} {}─", label, "─".repeat(border_fill)),
         code_style,
@@ -458,10 +465,8 @@ pub(crate) fn emit_code_block(
 
     for (idx, line) in code_lines.iter().enumerate() {
         let num = idx + 1;
-        let mut spans = vec![Span::styled(
-            format!("{:>width$} │ ", num, width = line_num_width),
-            gutter_style,
-        )];
+        let gutter = format!("{:>width$} │ ", num, width = line_num_width);
+        let mut spans = vec![Span::styled(gutter.clone(), gutter_style)];
         if !line.is_empty() {
             match highlighted {
                 Some(ref hl) if idx < hl.len() => {
@@ -474,6 +479,13 @@ pub(crate) fn emit_code_block(
                     spans.push(Span::styled(line.to_string(), code_style));
                 }
             }
+        }
+        // Pad to the block width so every row's background reaches the same
+        // right edge.
+        let content_width: usize = line.chars().map(char_width).sum();
+        let used = gutter.chars().count() + content_width;
+        if used < block_width {
+            spans.push(Span::styled(" ".repeat(block_width - used), code_style));
         }
         lines.push(Line::from(spans));
     }

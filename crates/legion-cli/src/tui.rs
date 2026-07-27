@@ -896,6 +896,33 @@ mod tests {
     }
 
     #[test]
+    fn code_block_lines_have_uniform_width_and_background() {
+        use crate::tui::input::visible_width;
+        let theme = theme();
+        let lines = markdown::markdown_lines(
+            "```rust\nlet x = 1;\nlet much_longer_variable = compute();\n```",
+            &theme,
+            highlighter(),
+            80,
+        );
+        assert!(lines.len() >= 3, "border + 2 code lines expected");
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|l| visible_width(&l.to_string()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "all code block lines must share one width, got {widths:?}"
+        );
+        // Every line carries the code background on a padding span, so the block
+        // has no ragged right edge.
+        for line in &lines {
+            let last = line.spans.last().expect("line has spans");
+            assert_eq!(last.style.bg, Some(theme.code_bg));
+        }
+    }
+
+    #[test]
     fn render_tool_card_uses_state_color() {
         let theme = theme();
         let done_lines = tool_card::render_tool_card("[tool:done] read_file", &theme);
