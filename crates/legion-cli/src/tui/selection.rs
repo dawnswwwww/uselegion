@@ -71,33 +71,33 @@ impl Selection {
     }
 }
 
-/// Convert a terminal mouse position inside the chat area to a cursor in the
-/// rendered scrollback. Returns `None` when the click is outside rendered text.
+/// Convert a terminal mouse position to a cursor in the rendered scrollback.
+///
+/// `message_rects` are `(msg_idx, rect, first_line)` triples for each *visible*
+/// message body, cached during the last draw. Hit-testing is pure
+/// `Rect::contains` — no scroll-offset or line-accumulation math — so the
+/// rendered geometry is the single source of truth (mirrors `think_hitboxes`;
+/// same idea as grok-build's `HitArea`). Returns `None` when the click misses
+/// every body (border, separator gap, or empty space).
 pub(crate) fn position_to_cursor(
     pos: Position,
-    chat_area: Rect,
-    messages: &[ChatMessage],
-    scroll_offset: usize,
+    message_rects: &[(usize, Rect, usize)],
     render_cache: &[Option<CachedRender>],
 ) -> Option<Cursor> {
-    let row = pos.y.saturating_sub(chat_area.y) as usize;
-    let target_line = scroll_offset + row;
-
-    let mut current_line = 0usize;
-    for (msg_index, _msg) in messages.iter().enumerate() {
-        let rendered = render_cache.get(msg_index).and_then(|r| r.as_ref())?;
-        let msg_total_lines = rendered.lines.len();
-        if msg_total_lines == 0 {
-            continue;
+    for &(msg_idx, rect, first_line) in message_rects {
+        if rect.contains(pos) {
+            let rendered = render_cache.get(msg_idx).and_then(|r| r.as_ref())?;
+            // first_line accounts for a message whose top is scrolled out of
+            // view; (pos.y - rect.y) is the row offset within that visible
+            // window. `contains` guarantees pos.y >= rect.y, so the subtraction
+            // cannot underflow.
+            let line_index = first_line + (pos.y - rect.y) as usize;
+            let text = line_to_text(rendered.lines.get(line_index)?);
+            // rect.x already sits one column past the left border (built from
+            // inner_chat), so pass it directly — not chat_area.x + 1.
+            let char_index = x_to_char_index(&text, pos.x, rect.x);
+            return Some(Cursor::new(msg_idx, line_index, char_index));
         }
-        if current_line + msg_total_lines > target_line {
-            let line_index = target_line - current_line;
-            let line = rendered.lines.get(line_index)?;
-            let text = line_to_text(line);
-            let char_index = x_to_char_index(&text, pos.x, chat_area.x);
-            return Some(Cursor::new(msg_index, line_index, char_index));
-        }
-        current_line += msg_total_lines;
     }
     None
 }
@@ -328,5 +328,80 @@ mod tests {
         let text = selected_text(&sel, &messages, &cache);
         assert!(text.contains("hello"));
         assert!(text.contains("world"));
+    }
+
+    fn one_line_render(text: &'static str) -> Option<CachedRender> {
+        Some(CachedRender {
+            key: crate::tui::state::RenderKey {
+                content_hash: 0,
+                state: crate::tui::state::MessageState::Done,
+                expanded_hash: 0,
+                width: 80,
+            },
+            lines: vec![Line::from(vec![Span::raw(text)])],
+            think_hints: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn click_inside_cached_rect_maps_to_cursor() {
+        // Single one-line message; its body rect occupies screen row 1.
+        let cache = vec![one_line_render("You: hello")];
+        let rects = vec![(0usize, Rect::new(1, 1, 78, 1), 0)];
+        let cursor = position_to_cursor(Position::new(3, 1), &rects, &cache);
+        assert!(cursor.is_some(), "click inside the body rect must hit");
+        let cursor = cursor.unwrap();
+        assert_eq!(cursor.message_index, 0);
+        assert_eq!(cursor.line_index, 0);
+    }
+
+    #[test]
+    fn click_on_second_message_ignores_separator_gap() {
+        // Two one-line messages with a blank separator between them. On screen:
+        //   row 1 → message 0 body
+        //   row 2 → separator gap (no body rect)
+        //   row 3 → message 1 body
+        // This is the exact shape that broke the old line-accumulation code:
+        // it forgot the separator row, so clicks on message 1 landed off by
+        // one (or returned `None`). With rect hit-testing message 1 must
+        // resolve correctly, and the gap row must miss.
+        let cache = vec![one_line_render("You: aaa"), one_line_render("You: bbb")];
+        let rects = vec![
+            (0usize, Rect::new(1, 1, 78, 1), 0),
+            (1usize, Rect::new(1, 3, 78, 1), 0),
+        ];
+        // Click message 1's only line.
+        let cursor = position_to_cursor(Position::new(3, 3), &rects, &cache);
+        assert_eq!(cursor.map(|c| c.message_index), Some(1));
+        assert_eq!(cursor.map(|c| c.line_index), Some(0));
+        // Click the separator gap → nothing.
+        assert!(position_to_cursor(Position::new(3, 2), &rects, &cache).is_none());
+    }
+
+    #[test]
+    fn click_on_scrolled_message_offsets_by_first_line() {
+        // A 4-line message whose top 2 lines are scrolled out of view: the
+        // visible rect starts at the message's line 2 (`first_line = 2`). A
+        // click on the rect's first screen row must map to line_index 2, not
+        // 0 — this is what `first_line` exists to encode. Ignoring it (using
+        // only `pos.y - rect.y`) would silently mis-resolve under scroll.
+        let cache = vec![Some(CachedRender {
+            key: crate::tui::state::RenderKey {
+                content_hash: 0,
+                state: crate::tui::state::MessageState::Done,
+                expanded_hash: 0,
+                width: 80,
+            },
+            lines: vec![
+                Line::from(vec![Span::raw("L0")]),
+                Line::from(vec![Span::raw("L1")]),
+                Line::from(vec![Span::raw("L2")]),
+                Line::from(vec![Span::raw("L3")]),
+            ],
+            think_hints: Vec::new(),
+        })];
+        let rects = vec![(0usize, Rect::new(1, 1, 78, 2), 2)];
+        let cursor = position_to_cursor(Position::new(3, 1), &rects, &cache);
+        assert_eq!(cursor.map(|c| c.line_index), Some(2));
     }
 }

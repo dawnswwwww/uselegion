@@ -483,13 +483,9 @@ pub(crate) fn handle_mouse_event(state: &mut AppState, mouse: MouseEvent) {
             }
             if !hit_think {
                 state.selection = None;
-                if let Some(cursor) = position_to_cursor(
-                    pos,
-                    state.chat_area,
-                    &state.messages,
-                    state.scroll,
-                    &state.render_cache,
-                ) {
+                if let Some(cursor) =
+                    position_to_cursor(pos, &state.message_rects, &state.render_cache)
+                {
                     state.selection = Some(Selection::new(cursor, cursor));
                     state.selecting = true;
                 }
@@ -498,13 +494,9 @@ pub(crate) fn handle_mouse_event(state: &mut AppState, mouse: MouseEvent) {
         MouseEventKind::Drag(_) => {
             if state.selecting {
                 let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-                if let Some(cursor) = position_to_cursor(
-                    pos,
-                    state.chat_area,
-                    &state.messages,
-                    state.scroll,
-                    &state.render_cache,
-                ) {
+                if let Some(cursor) =
+                    position_to_cursor(pos, &state.message_rects, &state.render_cache)
+                {
                     if let Some(ref mut sel) = state.selection {
                         sel.head = cursor;
                     }

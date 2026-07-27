@@ -417,13 +417,16 @@ fn cmd_quit(state: &mut AppState, _args: &str) -> CommandResult {
 
 fn cmd_goal(state: &mut AppState, args: &str) -> CommandResult {
     let action = goal::parse_goal(args);
-    let (new_goal, reply) = goal::apply_action(state.goal.clone(), action);
+    let prev = state.goal.clone();
+    let is_start = matches!(action, goal::GoalAction::Start(_));
+    let wants_kickoff = is_start || matches!(action, goal::GoalAction::Resume(_));
+    let (new_goal, reply) = goal::apply_action(prev.clone(), action);
     state.goal = new_goal.clone();
 
     // Persist asynchronously so the TUI input thread never blocks on I/O.
     let store = state.goal_store.clone();
     let session_key = state.session_key.clone();
-    if let Some(goal) = new_goal {
+    if let Some(goal) = new_goal.clone() {
         tokio::spawn(async move {
             if let Err(err) = store.save(&session_key, &goal).await {
                 tracing::warn!(error = %err, "failed to persist goal");
@@ -438,7 +441,31 @@ fn cmd_goal(state: &mut AppState, args: &str) -> CommandResult {
     }
 
     state.push_message(MessageRole::System, reply);
+
+    // Goal mode: a start/resume that actually (re)activated the goal kicks
+    // off pursuit immediately — the runtime injects the goal context and
+    // keeps the run going while the goal is active. Error replies ("goal
+    // already exists", "already active") do not transition state, so they
+    // never kick off a parallel run.
+    if wants_kickoff && goal_activated(&prev, &new_goal) {
+        let message = if is_start {
+            "Begin pursuing the active session goal now.".to_string()
+        } else {
+            "Resume working on the active session goal now.".to_string()
+        };
+        return CommandResult::SendToAgent { message };
+    }
     CommandResult::Handled
+}
+
+/// True when a `/goal start|resume` transitioned the goal from
+/// none/terminal/resumable to active.
+fn goal_activated(prev: &Option<goal::Goal>, new: &Option<goal::Goal>) -> bool {
+    let became_active = new.as_ref().is_some_and(|g| g.status.is_active());
+    let was_inactive = prev
+        .as_ref()
+        .is_none_or(|g| g.status.is_terminal() || g.status.can_resume());
+    became_active && was_inactive
 }
 
 fn cmd_loop(state: &mut AppState, args: &str) -> CommandResult {
@@ -476,42 +503,75 @@ fn cmd_loop(state: &mut AppState, args: &str) -> CommandResult {
     }
 }
 
-fn cmd_theme(state: &mut AppState, args: &str) -> CommandResult {
-    let name = args.trim().to_lowercase();
-    let display_name = if name.is_empty() { "default" } else { &name };
-    match name.as_str() {
-        "dark" => state.theme = Theme::default_dark(),
-        "light" => state.theme = Theme::default_light(),
-        "" | "default" => state.theme = Theme::default(),
-        _ => {
-            state.push_message(
-                MessageRole::System,
-                format!("unknown theme '/theme {name}' — try dark, light, or default"),
-            );
-            return CommandResult::Handled;
+/// Persist a `tui.*` config value. Returns false when there is no config
+/// path (tests) or the write fails; failures are logged, not fatal.
+fn persist_tui_config(state: &AppState, key: &str, value: &str) -> bool {
+    let Some(path) = state.config_path.clone() else {
+        return false;
+    };
+    let key = key.to_string();
+    let raw = format!("\"{value}\"");
+    match crate::config_set(&path, &key, &raw) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(error = %err, key = %key, "failed to persist TUI config");
+            false
         }
     }
-    state.push_message(MessageRole::System, format!("theme set to {display_name}"));
+}
+
+fn cmd_theme(state: &mut AppState, args: &str) -> CommandResult {
+    let name = {
+        let trimmed = args.trim().to_lowercase();
+        if trimmed.is_empty() {
+            "default".to_string()
+        } else {
+            trimmed
+        }
+    };
+    match Theme::by_name(&name) {
+        Some(theme) => {
+            state.theme = theme;
+            state.theme_name = name.clone();
+            let saved = persist_tui_config(state, "tui.theme", &name);
+            let suffix = if saved { " · saved" } else { "" };
+            state.push_message(MessageRole::System, format!("theme set to {name}{suffix}"));
+        }
+        None => {
+            state.push_message(
+                MessageRole::System,
+                format!(
+                    "unknown theme '/theme {name}' — try one of: {}",
+                    Theme::NAMES.join(", ")
+                ),
+            );
+        }
+    }
     CommandResult::Handled
 }
 
 fn cmd_mode(state: &mut AppState, args: &str) -> CommandResult {
     let name = args.trim().to_lowercase();
-    match name.as_str() {
-        "fullscreen" => state.screen_mode = ScreenMode::Fullscreen,
-        "inline" => state.screen_mode = ScreenMode::Inline,
-        _ => {
+    match ScreenMode::from_name(&name) {
+        Some(mode) => {
+            state.screen_mode = mode;
+            let saved = persist_tui_config(state, "tui.screenMode", mode.name());
+            let suffix = if saved { " · saved" } else { "" };
+            state.push_message(
+                MessageRole::System,
+                format!(
+                    "viewport mode set to {}; takes effect next redraw{suffix}",
+                    mode.name()
+                ),
+            );
+        }
+        None => {
             state.push_message(
                 MessageRole::System,
                 "usage: /mode <fullscreen|inline>".to_string(),
             );
-            return CommandResult::Handled;
         }
     }
-    state.push_message(
-        MessageRole::System,
-        format!("viewport mode set to {name}; switch takes effect next redraw"),
-    );
     CommandResult::Handled
 }
 
@@ -710,13 +770,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_goal_start_creates_goal() {
+    async fn dispatch_goal_start_creates_goal_and_kicks_off() {
+        let dir = tempfile::tempdir().unwrap();
         let mut state = AppState {
             session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            goal_store: crate::goal::GoalStore::new(dir.path()),
             ..Default::default()
         };
         let result = dispatch(&mut state, "/goal get CI green");
-        assert!(matches!(result, CommandResult::Handled));
+        match result {
+            CommandResult::SendToAgent { message } => {
+                assert!(message.contains("Begin pursuing"));
+            }
+            other => panic!("expected SendToAgent, got {other:?}"),
+        }
         assert!(state.goal.is_some());
         assert_eq!(state.goal.as_ref().unwrap().objective, "get CI green");
         let msg = state.messages().last().unwrap();
@@ -724,10 +791,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_goal_show_shows_summary() {
+    async fn dispatch_goal_start_with_existing_goal_does_not_kick_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState {
+            session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            goal: Some(crate::goal::Goal::new("existing")),
+            goal_store: crate::goal::GoalStore::new(dir.path()),
+            ..Default::default()
+        };
+        let result = dispatch(&mut state, "/goal new objective");
+        assert!(matches!(result, CommandResult::Handled));
+        let msg = state.messages().last().unwrap();
+        assert!(msg.content.contains("already exists"));
+        assert_eq!(state.goal.as_ref().unwrap().objective, "existing");
+    }
+
+    #[tokio::test]
+    async fn dispatch_goal_resume_kicks_off_when_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut goal = crate::goal::Goal::new("fix bug");
+        goal.set_status(crate::goal::GoalStatus::Paused, None);
+        let mut state = AppState {
+            session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            goal: Some(goal),
+            goal_store: crate::goal::GoalStore::new(dir.path()),
+            ..Default::default()
+        };
+        let result = dispatch(&mut state, "/goal resume");
+        match result {
+            CommandResult::SendToAgent { message } => {
+                assert!(message.contains("Resume"));
+            }
+            other => panic!("expected SendToAgent, got {other:?}"),
+        }
+        assert_eq!(
+            state.goal.as_ref().unwrap().status,
+            crate::goal::GoalStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_goal_resume_when_already_active_does_not_kick_off() {
+        let dir = tempfile::tempdir().unwrap();
         let mut state = AppState {
             session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
             goal: Some(crate::goal::Goal::new("fix bug")),
+            goal_store: crate::goal::GoalStore::new(dir.path()),
+            ..Default::default()
+        };
+        let result = dispatch(&mut state, "/goal resume");
+        assert!(matches!(result, CommandResult::Handled));
+        let msg = state.messages().last().unwrap();
+        assert!(msg.content.contains("already active"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_goal_show_shows_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState {
+            session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
+            goal: Some(crate::goal::Goal::new("fix bug")),
+            goal_store: crate::goal::GoalStore::new(dir.path()),
             ..Default::default()
         };
         let result = dispatch(&mut state, "/goal");
@@ -739,9 +863,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_goal_complete_clears_and_keeps_terminal() {
+        let dir = tempfile::tempdir().unwrap();
         let mut state = AppState {
             session_key: "agent:main:dm:cli:default:direct:peer-1".to_string(),
             goal: Some(crate::goal::Goal::new("fix bug")),
+            goal_store: crate::goal::GoalStore::new(dir.path()),
             ..Default::default()
         };
         let result = dispatch(&mut state, "/goal complete");

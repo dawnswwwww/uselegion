@@ -63,13 +63,16 @@ fn format_output(output: &std::process::Output) -> String {
 
     let mut text = parts.join("\n").trim_end().to_string();
     if text.len() > MAX_OUTPUT_LEN {
-        let truncated = &text[..MAX_OUTPUT_LEN];
-        let newline = truncated.rfind('\n').unwrap_or(MAX_OUTPUT_LEN);
-        text = format!(
-            "{}\n[output truncated; {} bytes total]",
-            &truncated[..newline],
-            text.len()
-        );
+        // Use char-based truncation so we do not split a multi-byte UTF-8
+        // code point and panic.
+        let truncated: String = text.chars().take(MAX_OUTPUT_LEN).collect();
+        let body = if let Some(newline) = truncated.rfind('\n') {
+            // '\n' is ASCII, so the byte index is always a char boundary.
+            &truncated[..newline]
+        } else {
+            truncated.as_str()
+        };
+        text = format!("{}\n[output truncated; {} bytes total]", body, text.len());
     }
     text
 }
@@ -106,5 +109,22 @@ mod tests {
         let text = format_output(&output);
         assert!(text.contains("[output truncated"));
         assert!(text.len() <= MAX_OUTPUT_LEN + 100);
+    }
+
+    #[test]
+    fn format_output_truncates_multibyte_utf8_without_panic() {
+        // Each 中 character is 3 bytes; we need enough bytes to trigger
+        // truncation while landing inside a multi-byte code point in the
+        // original byte-oriented logic.
+        let repeated = "中".repeat(MAX_OUTPUT_LEN / 2);
+        let output = std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: repeated.into_bytes(),
+            stderr: vec![],
+        };
+        let text = format_output(&output);
+        assert!(text.contains("[output truncated"));
+        // The truncated display text must be valid UTF-8.
+        assert!(text.chars().count() > 0);
     }
 }

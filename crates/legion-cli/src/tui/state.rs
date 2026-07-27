@@ -50,6 +50,23 @@ pub enum ScreenMode {
     Inline,
 }
 
+impl ScreenMode {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "fullscreen" => Some(Self::Fullscreen),
+            "inline" => Some(Self::Inline),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Fullscreen => "fullscreen",
+            Self::Inline => "inline",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MessageState {
     /// Message has been sent but the first token has not arrived yet.
@@ -142,6 +159,14 @@ pub struct AppState {
     pub(crate) pending_question: Option<PendingQuestion>,
     /// Screen rectangles of thinking hint lines for mouse clicks.
     pub(crate) think_hitboxes: Vec<(ratatui::layout::Rect, usize, usize)>,
+    /// Screen rectangles of each visible message body, refreshed each draw, as
+    /// `(msg_idx, rect, first_line)`. `first_line` is the index into the
+    /// message's rendered lines of the row at `rect.y` (nonzero when the
+    /// message's top is scrolled out of view). Drives click→cursor mapping via
+    /// `Rect::contains` — the rendered geometry is the single source of truth,
+    /// with no parallel line-number arithmetic (mirrors `think_hitboxes`; same
+    /// idea as grok-build's `HitArea`).
+    pub(crate) message_rects: Vec<(usize, ratatui::layout::Rect, usize)>,
     /// Current scrollback text selection, if any.
     pub(crate) selection: Option<Selection>,
     /// Whether the user is currently dragging to select text.
@@ -174,6 +199,11 @@ pub struct AppState {
     pub session_key: String,
     /// Full-screen or inline viewport mode.
     pub screen_mode: ScreenMode,
+    /// Name of the active theme (for `/status` and persistence).
+    pub(crate) theme_name: String,
+    /// Config file path used to persist `/theme` and `/mode`. `None` in
+    /// tests, where persistence must not touch the real config file.
+    pub(crate) config_path: Option<std::path::PathBuf>,
     /// In inline mode, index of the last message already emitted to the native
     /// scrollback. Messages finalized after this index are flushed on the next
     /// frame.
@@ -387,6 +417,7 @@ impl AppState {
     pub(crate) fn clear_messages(&mut self) {
         self.messages.clear();
         self.render_cache.clear();
+        self.message_rects.clear();
     }
 
     /// Ask the TUI loop to exit (used by `/quit`).

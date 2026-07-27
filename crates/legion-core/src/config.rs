@@ -75,6 +75,13 @@ pub struct Config {
     /// Session todo list (model-driven task checklist displayed in the TUI).
     #[serde(default)]
     pub todos: TodosConfig,
+    /// TUI display preferences (theme, viewport mode), persisted by the
+    /// `/theme` and `/mode` slash commands.
+    #[serde(default)]
+    pub tui: TuiConfig,
+    /// Session goals (durable objectives with turn-end auto-continuation).
+    #[serde(default)]
+    pub goals: GoalsConfig,
     /// Inferred commitments (automation-advanced Phase B): natural-language
     /// follow-ups mentioned in conversation are turned into one-shot cron jobs.
     #[serde(default)]
@@ -733,12 +740,16 @@ pub struct SubagentConfig {
     /// Maximum concurrent sub-agent runs per gateway (default 4).
     #[serde(default = "default_subagent_max_concurrent")]
     pub max_concurrent: usize,
-    /// Default per-sub-agent timeout in milliseconds (default 120000).
+    /// Default per-sub-agent timeout in milliseconds (default 600000). This
+    /// wall clock is the budget guard for runs with no iteration cap.
     #[serde(default = "default_subagent_timeout_ms")]
     pub default_timeout_ms: u64,
-    /// Default max tool-loop iterations for a sub-agent (default 5).
+    /// Default max tool-loop iterations for a sub-agent. `None` (the default)
+    /// means no cap: the run is bounded by the wall-clock timeout instead,
+    /// matching the main agent's `agents.defaults.maxIterations`. Set a
+    /// number as a runaway guard.
     #[serde(default = "default_subagent_max_iterations")]
-    pub default_max_iterations: usize,
+    pub default_max_iterations: Option<usize>,
     /// Maximum nesting depth of sub-agents (default 2). A spawn attempted at
     /// `depth >= max_depth` is rejected.
     #[serde(default = "default_subagent_max_depth")]
@@ -761,11 +772,11 @@ fn default_subagent_max_concurrent() -> usize {
 }
 
 fn default_subagent_timeout_ms() -> u64 {
-    120_000
+    600_000
 }
 
-fn default_subagent_max_iterations() -> usize {
-    5
+fn default_subagent_max_iterations() -> Option<usize> {
+    None
 }
 
 fn default_subagent_max_depth() -> u8 {
@@ -883,6 +894,55 @@ fn default_todos_max_display() -> usize {
 
 fn default_todos_auto_hide_seconds() -> u64 {
     5
+}
+
+/// TUI display preferences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TuiConfig {
+    /// Color theme name; see `Theme::by_name` in legion-cli ("default", "dark", "light").
+    #[serde(default = "default_tui_theme")]
+    pub theme: String,
+    /// Viewport mode: "fullscreen" or "inline".
+    #[serde(default = "default_tui_screen_mode")]
+    pub screen_mode: String,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_tui_theme(),
+            screen_mode: default_tui_screen_mode(),
+        }
+    }
+}
+
+fn default_tui_theme() -> String {
+    "default".to_string()
+}
+
+fn default_tui_screen_mode() -> String {
+    "fullscreen".to_string()
+}
+
+/// Controls session goals: durable objectives with model-facing tools and
+/// turn-end auto-continuation ("goal turns").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalsConfig {
+    /// Master switch. When `false`, the goal tools are not registered, the
+    /// turn-end goal gate is disabled, and no goal context is injected.
+    /// The `/goal` slash command still manages local state.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for GoalsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
 }
 
 fn default_lite_read_buffer_bytes() -> usize {
@@ -1136,11 +1196,7 @@ pub struct PluginsConfig {
 }
 
 fn default_plugin_dirs() -> Vec<std::path::PathBuf> {
-    vec![
-        dirs::home_dir()
-            .map(|h| h.join(".legion").join("plugins"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".legion/plugins")),
-    ]
+    vec![crate::fs::legion_home().join("plugins")]
 }
 
 impl Default for PluginsConfig {
@@ -1160,8 +1216,7 @@ fn default_skill_dirs() -> Vec<std::path::PathBuf> {
         home.as_ref()
             .map(|h| h.join(".agents").join("skills"))
             .unwrap_or_else(|| std::path::PathBuf::from(".agents/skills")),
-        home.map(|h| h.join(".legion").join("skills"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".legion/skills")),
+        crate::fs::legion_home().join("skills"),
     ]
 }
 
@@ -1607,6 +1662,24 @@ mod tests {
         assert_eq!(cfg.gateway.port, 18789);
         assert_eq!(cfg.gateway.auth.mode, "token");
         assert_eq!(cfg.gateway.auth.token, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn tui_config_defaults_when_absent() {
+        let config = Config::from_json(r#"{"gateway": {"auth": {"token": "x"}}}"#)
+            .expect("config must parse");
+        assert_eq!(config.tui.theme, "default");
+        assert_eq!(config.tui.screen_mode, "fullscreen");
+    }
+
+    #[test]
+    fn tui_config_parses_camel_case() {
+        let config = Config::from_json(
+            r#"{"gateway": {"auth": {"token": "x"}}, "tui": {"theme": "light", "screenMode": "inline"}}"#,
+        )
+        .expect("config must parse");
+        assert_eq!(config.tui.theme, "light");
+        assert_eq!(config.tui.screen_mode, "inline");
     }
 
     #[test]
@@ -2237,8 +2310,9 @@ mod tests {
         let json = r#"{ "gateway": { "auth": { "token": "x" } } }"#;
         let cfg = Config::from_json(json).unwrap();
         assert_eq!(cfg.subagents.max_concurrent, 4);
-        assert_eq!(cfg.subagents.default_timeout_ms, 120_000);
-        assert_eq!(cfg.subagents.default_max_iterations, 5);
+        assert_eq!(cfg.subagents.default_timeout_ms, 600_000);
+        // No iteration cap by default: the wall-clock timeout is the budget.
+        assert_eq!(cfg.subagents.default_max_iterations, None);
         assert_eq!(cfg.subagents.max_depth, 2);
     }
 
@@ -2256,7 +2330,7 @@ mod tests {
         let cfg = Config::from_json(json).unwrap();
         assert_eq!(cfg.subagents.max_concurrent, 8);
         assert_eq!(cfg.subagents.default_timeout_ms, 60_000);
-        assert_eq!(cfg.subagents.default_max_iterations, 3);
+        assert_eq!(cfg.subagents.default_max_iterations, Some(3));
         assert_eq!(cfg.subagents.max_depth, 1);
     }
 

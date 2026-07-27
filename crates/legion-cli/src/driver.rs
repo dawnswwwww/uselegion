@@ -11,7 +11,12 @@
 use crate::tui::AppState;
 use crate::{CliError, GatewayClient};
 use async_trait::async_trait;
+use legion_automation::cron::{
+    AddJobRequest, CronScheduler, JsonlCronJobStore, SharedCronJobStore, cron_loop,
+};
+use legion_automation::tasks::{JsonlTaskStore, SharedTaskStore};
 use legion_core::config::Config;
+use legion_core::util::lock_recover;
 use legion_host::AgentHost;
 use legion_host::SessionStore;
 use legion_protocol::WsFrame;
@@ -29,7 +34,8 @@ use tokio::sync::mpsc;
 
 /// Stderr notice printed whenever the CLI runs embedded instead of through
 /// the gateway.
-pub const EMBEDDED_NOTICE: &str = "gateway unreachable, running embedded (channels/cron inactive)";
+pub const EMBEDDED_NOTICE: &str =
+    "gateway unreachable, running embedded (channels inactive; session loops available)";
 
 /// Deadline for the Auto-mode gateway probe. Loopback connects succeed in
 /// single-digit milliseconds; anything slower is treated as unreachable.
@@ -233,7 +239,7 @@ impl TurnDriver for WsDriver {
             while let Some(msg) = client.recv_json().await.ok().flatten() {
                 let _ = event_tx.send(msg);
             }
-            state.lock().unwrap().status = "disconnected".to_string();
+            lock_recover(&state).status = "disconnected".to_string();
             // Wake the UI loop so the status change gets drawn even though no
             // further websocket events will arrive (the loop only redraws on
             // events).
@@ -306,17 +312,32 @@ pub struct LocalDriver {
     /// The question gate of the in-flight turn, if any. Same lifetime as
     /// `current_gate`: a new turn replaces it and stale resolves are misses.
     current_question_gate: Mutex<Option<Arc<QuestionGate>>>,
+    /// Session-scope cron scheduler. Only present when the session key can be
+    /// resolved to a valid on-disk path; it manages `/loop` jobs that live as
+    /// long as this TUI process.
+    pub(crate) cron_scheduler: Option<Arc<CronScheduler>>,
+    /// Handle to the background `cron_loop` task. Aborted when the driver is
+    /// dropped so the scheduler/runtime Arcs are released and cron fires stop.
+    cron_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LocalDriver {
-    pub fn new(
+    pub async fn new(
         host: Arc<AgentHost>,
         session_key: String,
         event_tx: mpsc::UnboundedSender<Value>,
         yolo: bool,
         workspace_override: Option<PathBuf>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CliError> {
+        let cron_scheduler =
+            build_session_cron_scheduler(&host, &session_key, event_tx.clone(), yolo).await?;
+        let cron_handle = cron_scheduler
+            .as_ref()
+            .map(|s| tokio::spawn(cron_loop(s.clone())));
+        if cron_scheduler.is_some() {
+            tracing::info!(session_key = %session_key, "session cron scheduler started");
+        }
+        Ok(Self {
             host,
             session_key,
             event_tx,
@@ -324,7 +345,9 @@ impl LocalDriver {
             workspace_override,
             current_gate: Mutex::new(None),
             current_question_gate: Mutex::new(None),
-        }
+            cron_scheduler,
+            cron_handle,
+        })
     }
 }
 
@@ -342,7 +365,7 @@ impl TurnDriver for LocalDriver {
             )
             .with_auto_approve(self.yolo),
         );
-        *self.current_gate.lock().unwrap() = Some(gate.clone());
+        *lock_recover(&self.current_gate) = Some(gate.clone());
         // Build this turn's question gate so `ask_user` prompts reach the TUI.
         let question_gate = Arc::new(QuestionGate::new(
             Arc::new(TuiQuestionNotifier {
@@ -350,7 +373,7 @@ impl TurnDriver for LocalDriver {
             }),
             Duration::from_secs(300),
         ));
-        *self.current_question_gate.lock().unwrap() = Some(question_gate.clone());
+        *lock_recover(&self.current_question_gate) = Some(question_gate.clone());
         // Prepare the run before spawning so resolution/start failures
         // surface to the caller like a failed WS send would.
         let (stream, session_key, run_id, session_store) = prepare_local_run(
@@ -368,7 +391,7 @@ impl TurnDriver for LocalDriver {
         // Drive the run in the background so the TUI stays responsive;
         // events arrive on the same channel the WS reader would use.
         tokio::spawn(async move {
-            legion_host::drive_run_stream(
+            if let Err(err) = legion_host::drive_run_stream(
                 stream,
                 session_store,
                 session_key,
@@ -380,21 +403,25 @@ impl TurnDriver for LocalDriver {
                     }
                 },
             )
-            .await;
+            .await
+            {
+                tracing::error!(error = %err, "failed to persist session transcript");
+            }
         });
         Ok(())
     }
 
     async fn history(&self, session_key: &str) -> Result<Value, CliError> {
-        let resolved = legion_host::routing::resolve_session_key(session_key, &self.host.router)
-            .ok_or_else(|| CliError::Other(format!("invalid session key: {session_key}")))?;
-        let mut messages = self.host.session_store.load_for_resume(&resolved).await;
-        // Apply the same orphan repair as the WS handler so the TUI renders
+        // Shared with the gateway's `sessions.history` RPC so the TUI renders
         // exactly what the model will see.
-        let _ = legion_host::recover_orphaned_tool_results(
-            &mut messages,
+        let (resolved, messages) = legion_host::turn::load_session_history(
+            &self.host.router,
+            &self.host.session_store,
             self.host.config.sessions.orphan_policy,
-        );
+            session_key,
+        )
+        .await
+        .map_err(CliError::Other)?;
         Ok(json!({
             "ok": true,
             "payload": {
@@ -405,23 +432,40 @@ impl TurnDriver for LocalDriver {
     }
 
     async fn resolve_approval(&self, prompt_id: &str, allow: bool) {
-        let gate = self.current_gate.lock().unwrap().clone();
+        let gate = lock_recover(&self.current_gate).clone();
         if let Some(gate) = gate {
             gate.resolve(prompt_id, allow).await;
         }
     }
 
     async fn resolve_question(&self, prompt_id: &str, output: AskUserOutput) {
-        let gate = self.current_question_gate.lock().unwrap().clone();
+        let gate = lock_recover(&self.current_question_gate).clone();
         if let Some(gate) = gate {
             gate.resolve(prompt_id, output).await;
         }
     }
 
-    async fn schedule_loop(&self, _cron: &str, _prompt: &str) -> Result<String, CliError> {
-        Err(CliError::Other(
-            "/loop requires the gateway (embedded mode has no cron scheduler). Start the gateway with `legion gateway start`.".to_string(),
-        ))
+    async fn schedule_loop(&self, cron: &str, prompt: &str) -> Result<String, CliError> {
+        let scheduler = self.cron_scheduler.as_ref().ok_or_else(|| {
+            CliError::Other(
+                "session cron scheduler is unavailable for this session key".to_string(),
+            )
+        })?;
+        let agent_id = crate::session_agent_id(&self.session_key).unwrap_or("main");
+        let job = scheduler
+            .add(AddJobRequest {
+                schedule: cron.to_string(),
+                agent_id: agent_id.to_string(),
+                message: prompt.to_string(),
+                at: None,
+                name: String::new(),
+                enabled: true,
+                webhook_secret: None,
+                id_prefix: Some("session-cron".to_string()),
+            })
+            .await
+            .map_err(|err| CliError::Other(format!("failed to schedule session loop: {err}")))?;
+        Ok(job.id)
     }
 
     fn mode_name(&self) -> &'static str {
@@ -429,11 +473,115 @@ impl TurnDriver for LocalDriver {
     }
 }
 
+impl Drop for LocalDriver {
+    fn drop(&mut self) {
+        if let Some(handle) = self.cron_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Build an embedded host from the loaded config, wrapping assembly errors.
-pub async fn build_local_host(config: &Config) -> Result<AgentHost, CliError> {
-    AgentHost::new(config.clone())
-        .await
-        .map_err(|err| CliError::Other(format!("embedded runtime error: {err}")))
+///
+/// `cron_store_path` overrides the scheduler tools' cron store; pass `None`
+/// to use the default `~/.legion/automation/cron.jsonl`.
+pub async fn build_local_host(
+    config: &Config,
+    cron_store_path: Option<PathBuf>,
+) -> Result<AgentHost, CliError> {
+    let host = if let Some(path) = cron_store_path {
+        AgentHost::new_with_cron_store_path(config.clone(), Some(path)).await
+    } else {
+        AgentHost::new(config.clone()).await
+    };
+    host.map_err(|err| CliError::Other(format!("embedded runtime error: {err}")))
+}
+
+/// Compute the session-scoped cron store path for a local TUI session.
+///
+/// Returns `None` when the session key cannot be resolved to a safe on-disk
+/// path.
+pub fn session_cron_store_path(session_key: &str) -> Option<PathBuf> {
+    let store = SessionStore::default();
+    store
+        .session_path(session_key)
+        .map(|p| p.with_extension("cron.jsonl"))
+}
+
+/// Build a session-scope cron scheduler backed by the session's own JSONL
+/// stores. The scheduler is tied to the lifetime of the calling process: when
+/// the TUI exits, the background `cron_loop` task is dropped and scheduled
+/// fires stop. The JSONL files remain on disk for crash recovery but are not
+/// picked up by a fresh TUI session (each session gets a new peer id).
+async fn build_session_cron_scheduler(
+    host: &AgentHost,
+    session_key: &str,
+    event_tx: mpsc::UnboundedSender<Value>,
+    yolo: bool,
+) -> Result<Option<Arc<CronScheduler>>, CliError> {
+    let session_file = match host.session_store.session_path(session_key) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(session_key = %session_key, "invalid session key; session cron scheduler disabled");
+            return Ok(None);
+        }
+    };
+    let session_dir = session_file.parent().ok_or_else(|| {
+        CliError::Other("session transcript path has no parent directory".to_string())
+    })?;
+    let peer_stem = session_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| CliError::Other("invalid session transcript file name".to_string()))?;
+
+    let cron_path = session_dir.join(format!("{}.cron.jsonl", peer_stem));
+    let task_path = session_dir.join(format!("{}.tasks.jsonl", peer_stem));
+
+    let job_store: SharedCronJobStore = Arc::new(
+        JsonlCronJobStore::open(&cron_path)
+            .await
+            .map_err(|err| CliError::Other(format!("session cron store: {err}")))?,
+    );
+    let task_store: SharedTaskStore = Arc::new(
+        JsonlTaskStore::open(&task_path)
+            .await
+            .map_err(|err| CliError::Other(format!("session task store: {err}")))?,
+    );
+
+    // Forward scheduled-run events into the TUI channel as the same
+    // `{"type":"event","event":"agent","payload":...}` frames a gateway
+    // WebSocket would emit, so the current window sees cron output live.
+    let event_sink = Arc::new(move |run_id: &str, event: legion_runtime::RunEvent| {
+        let payload = legion_host::run_event_to_payload(run_id, &event);
+        let frame = WsFrame::event("agent", payload);
+        if let Ok(value) = serde_json::to_value(&frame) {
+            let _ = event_tx.send(value);
+        }
+    });
+
+    // Propagate TUI yolo mode into session loops. Without this, unattended
+    // cron runs would create a no-op approval gate and Prompt/Required tools
+    // (like `exec`) would wait for a human who is not there.
+    let approval_gate = if yolo {
+        Some(Arc::new(
+            ApprovalGate::new(Arc::new(NoOpApprovalNotifier), Duration::from_secs(300))
+                .with_auto_approve(true),
+        ))
+    } else {
+        None
+    };
+
+    let mut scheduler = CronScheduler::new(
+        job_store,
+        task_store,
+        host.runtime.clone(),
+        host.config.clone(),
+    )
+    .with_event_sink(event_sink);
+    if let Some(gate) = approval_gate {
+        scheduler = scheduler.with_approval_gate(gate);
+    }
+    Ok(Some(Arc::new(scheduler)))
 }
 
 /// Resolve the session key, load + repair history, and start an embedded
@@ -463,6 +611,7 @@ pub async fn prepare_local_run(
         dump_prompts,
         yolo,
         workspace: workspace_override,
+        sender: None,
     };
     let (stream, accepted, resolved_key) = host
         .prepare_run(params, approval_gate, question_gate)
@@ -509,7 +658,7 @@ pub async fn run_local_turn(
         workspace_override,
     )
     .await?;
-    legion_host::drive_run_stream(stream, session_store, resolved_key, text, run_id, emit).await;
+    legion_host::drive_run_stream(stream, session_store, resolved_key, text, run_id, emit).await?;
     Ok(())
 }
 
@@ -653,6 +802,41 @@ mod tests {
         frame["payload"]["stream"] == "lifecycle" && frame["payload"]["phase"] == phase
     }
 
+    /// Build an [`AgentHost`] rooted in `tmp` with a fake runtime and a
+    /// session store that writes to the temp dir. Every LocalDriver test uses
+    /// the same config shape; this helper removes the duplication.
+    async fn build_test_host<F>(tmp: &TempDir, provider_id: &str, build_runtime: F) -> AgentHost
+    where
+        F: FnOnce(Config) -> Arc<AgentRuntime>,
+    {
+        let workspace = tmp.path().join("workspace");
+        let collection_path = tmp.path().join("memory");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let config = Config::from_json(&format!(
+            r#"{{
+                "gateway": {{ "auth": {{ "token": "x" }} }},
+                "agents": {{ "defaults": {{ "workspace": "{}", "model": "{}/gpt-4o" }} }},
+                "memory": {{
+                    "builtin": {{
+                        "collectionPath": "{}",
+                        "embeddingDimension": 64
+                    }}
+                }}
+            }}"#,
+            workspace.display().to_string().replace('\\', "/"),
+            provider_id,
+            collection_path.display().to_string().replace('\\', "/"),
+        ))
+        .unwrap();
+
+        let runtime = build_runtime(config.clone());
+        let mut host = AgentHost::new(config).await.unwrap();
+        host.runtime = runtime;
+        host.session_store = Arc::new(SessionStore::new(tmp.path()));
+        host
+    }
+
     /// Drain event frames until the run's terminal lifecycle end arrives.
     async fn collect_until_end(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
         let mut frames = Vec::new();
@@ -673,33 +857,13 @@ mod tests {
     #[tokio::test]
     async fn local_driver_streams_ws_shaped_frames_and_preserves_history() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let collection_path = tmp.path().join("memory");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let config = Config::from_json(&format!(
-            r#"{{
-                "gateway": {{ "auth": {{ "token": "x" }} }},
-                "agents": {{ "defaults": {{ "workspace": "{}", "model": "history-echo/gpt-4o" }} }},
-                "memory": {{
-                    "builtin": {{
-                        "collectionPath": "{}",
-                        "embeddingDimension": 64
-                    }}
-                }}
-            }}"#,
-            workspace.display().to_string().replace('\\', "/"),
-            collection_path.display().to_string().replace('\\', "/"),
-        ))
-        .unwrap();
-
         let requests: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut host = AgentHost::new(config.clone()).await.unwrap();
-        // Override the assembled pieces with test doubles: a fake-provider
-        // runtime and a transcript store rooted in the temp dir.
-        host.runtime = history_runtime(config, requests.clone());
-        host.session_store = Arc::new(SessionStore::new(tmp.path()));
+        let requests_clone = requests.clone();
+        let host = build_test_host(&tmp, "history-echo", move |config| {
+            history_runtime(config, requests_clone)
+        })
+        .await;
 
         let session_key = "agent:main:dm:tui:default:direct:local-driver-test";
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Value>();
@@ -709,7 +873,9 @@ mod tests {
             event_tx,
             false,
             None,
-        );
+        )
+        .await
+        .unwrap();
         assert_eq!(driver.mode_name(), "local");
 
         // ---- Round 1: frames arrive shaped exactly like the WS protocol.
@@ -794,6 +960,75 @@ mod tests {
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[2]["content"], "again");
         assert_eq!(messages[3]["content"], "hello,again");
+    }
+
+    #[tokio::test]
+    async fn local_driver_schedules_session_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = build_test_host(&tmp, "history-echo", |config| {
+            history_runtime(config, Arc::new(std::sync::Mutex::new(Vec::new())))
+        })
+        .await;
+
+        let session_key = "agent:main:dm:tui:default:direct:session-loop-test";
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<Value>();
+        let driver = LocalDriver::new(
+            Arc::new(host),
+            session_key.to_string(),
+            event_tx,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let job_id = driver.schedule_loop("*/1 * * * *", "ping").await.unwrap();
+        assert!(
+            job_id.starts_with("session-cron-"),
+            "expected session-cron prefix, got {}",
+            job_id
+        );
+
+        // Verify the session-scoped cron store was created alongside the transcript.
+        let cron_path = tmp
+            .path()
+            .join("agents/main/sessions/session-loop-test.cron.jsonl");
+        assert!(
+            cron_path.exists(),
+            "session cron store should exist at {cron_path:?}"
+        );
+        let contents = std::fs::read_to_string(&cron_path).unwrap();
+        assert!(
+            contents.contains(&job_id),
+            "cron store should contain the scheduled job"
+        );
+        assert!(
+            contents.contains("ping"),
+            "cron store should contain the prompt"
+        );
+
+        // Trigger the job manually and verify it writes a completed task record
+        // to the session-scoped task store.
+        driver
+            .cron_scheduler
+            .as_ref()
+            .unwrap()
+            .run(&job_id)
+            .await
+            .expect("manual job run should succeed");
+
+        let task_path = tmp
+            .path()
+            .join("agents/main/sessions/session-loop-test.tasks.jsonl");
+        assert!(
+            task_path.exists(),
+            "session task store should exist at {task_path:?}"
+        );
+        let task_contents = std::fs::read_to_string(&task_path).unwrap();
+        assert!(
+            task_contents.contains("completed"),
+            "task store should contain a completed cron task"
+        );
     }
 
     // ---- LocalDriver approval loop ----
@@ -915,36 +1150,17 @@ mod tests {
     #[tokio::test]
     async fn local_driver_surfaces_approval_and_resolves_in_process() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let collection_path = tmp.path().join("memory");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let config = Config::from_json(&format!(
-            r#"{{
-                "gateway": {{ "auth": {{ "token": "x" }} }},
-                "agents": {{ "defaults": {{ "workspace": "{}", "model": "tool-call/gpt-4o" }} }},
-                "memory": {{
-                    "builtin": {{
-                        "collectionPath": "{}",
-                        "embeddingDimension": 64
-                    }}
-                }}
-            }}"#,
-            workspace.display().to_string().replace('\\', "/"),
-            collection_path.display().to_string().replace('\\', "/"),
-        ))
-        .unwrap();
-
-        let mut host = AgentHost::new(config.clone()).await.unwrap();
-        let mut router = ProviderRouter::new();
-        router.register_provider(Arc::new(ToolCallProvider));
-        host.runtime = Arc::new(AgentRuntime::new(
-            Arc::new(router),
-            Arc::new(ExecToolRegistry),
-            Arc::new(FakeMemoryBackend),
-            config,
-        ));
-        host.session_store = Arc::new(SessionStore::new(tmp.path()));
+        let host = build_test_host(&tmp, "tool-call", |config| {
+            let mut router = ProviderRouter::new();
+            router.register_provider(Arc::new(ToolCallProvider));
+            Arc::new(AgentRuntime::new(
+                Arc::new(router),
+                Arc::new(ExecToolRegistry),
+                Arc::new(FakeMemoryBackend),
+                config,
+            ))
+        })
+        .await;
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Value>();
         let driver = LocalDriver::new(
@@ -953,7 +1169,9 @@ mod tests {
             event_tx,
             false,
             None,
-        );
+        )
+        .await
+        .unwrap();
 
         driver.run_turn("run ls".to_string()).await.unwrap();
 
@@ -1074,36 +1292,17 @@ mod tests {
     #[tokio::test]
     async fn local_driver_surfaces_question_and_resolves_in_process() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let collection_path = tmp.path().join("memory");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let config = Config::from_json(&format!(
-            r#"{{
-                "gateway": {{ "auth": {{ "token": "x" }} }},
-                "agents": {{ "defaults": {{ "workspace": "{}", "model": "ask-user-tool-call/gpt-4o" }} }},
-                "memory": {{
-                    "builtin": {{
-                        "collectionPath": "{}",
-                        "embeddingDimension": 64
-                    }}
-                }}
-            }}"#,
-            workspace.display().to_string().replace('\\', "/"),
-            collection_path.display().to_string().replace('\\', "/"),
-        ))
-        .unwrap();
-
-        let mut host = AgentHost::new(config.clone()).await.unwrap();
-        let mut router = ProviderRouter::new();
-        router.register_provider(Arc::new(AskUserToolCallProvider));
-        host.runtime = Arc::new(AgentRuntime::new(
-            Arc::new(router),
-            Arc::new(AskUserToolRegistry),
-            Arc::new(FakeMemoryBackend),
-            config,
-        ));
-        host.session_store = Arc::new(SessionStore::new(tmp.path()));
+        let host = build_test_host(&tmp, "ask-user-tool-call", |config| {
+            let mut router = ProviderRouter::new();
+            router.register_provider(Arc::new(AskUserToolCallProvider));
+            Arc::new(AgentRuntime::new(
+                Arc::new(router),
+                Arc::new(AskUserToolRegistry),
+                Arc::new(FakeMemoryBackend),
+                config,
+            ))
+        })
+        .await;
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Value>();
         let driver = LocalDriver::new(
@@ -1112,7 +1311,9 @@ mod tests {
             event_tx,
             false,
             None,
-        );
+        )
+        .await
+        .unwrap();
 
         driver.run_turn("ask me".to_string()).await.unwrap();
 
@@ -1176,36 +1377,17 @@ mod tests {
     #[tokio::test]
     async fn local_driver_yolo_skips_approval_prompt() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let collection_path = tmp.path().join("memory");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let config = Config::from_json(&format!(
-            r#"{{
-                "gateway": {{ "auth": {{ "token": "x" }} }},
-                "agents": {{ "defaults": {{ "workspace": "{}", "model": "tool-call/gpt-4o" }} }},
-                "memory": {{
-                    "builtin": {{
-                        "collectionPath": "{}",
-                        "embeddingDimension": 64
-                    }}
-                }}
-            }}"#,
-            workspace.display().to_string().replace('\\', "/"),
-            collection_path.display().to_string().replace('\\', "/"),
-        ))
-        .unwrap();
-
-        let mut host = AgentHost::new(config.clone()).await.unwrap();
-        let mut router = ProviderRouter::new();
-        router.register_provider(Arc::new(ToolCallProvider));
-        host.runtime = Arc::new(AgentRuntime::new(
-            Arc::new(router),
-            Arc::new(ExecToolRegistry),
-            Arc::new(FakeMemoryBackend),
-            config,
-        ));
-        host.session_store = Arc::new(SessionStore::new(tmp.path()));
+        let host = build_test_host(&tmp, "tool-call", |config| {
+            let mut router = ProviderRouter::new();
+            router.register_provider(Arc::new(ToolCallProvider));
+            Arc::new(AgentRuntime::new(
+                Arc::new(router),
+                Arc::new(ExecToolRegistry),
+                Arc::new(FakeMemoryBackend),
+                config,
+            ))
+        })
+        .await;
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Value>();
         let driver = LocalDriver::new(
@@ -1214,7 +1396,9 @@ mod tests {
             event_tx,
             true,
             None,
-        );
+        )
+        .await
+        .unwrap();
 
         driver.run_turn("run ls".to_string()).await.unwrap();
 
@@ -1244,36 +1428,17 @@ mod tests {
     #[tokio::test]
     async fn run_local_turn_yolo_auto_approves_required_tool() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let collection_path = tmp.path().join("memory");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let config = Config::from_json(&format!(
-            r#"{{
-                "gateway": {{ "auth": {{ "token": "x" }} }},
-                "agents": {{ "defaults": {{ "workspace": "{}", "model": "tool-call/gpt-4o" }} }},
-                "memory": {{
-                    "builtin": {{
-                        "collectionPath": "{}",
-                        "embeddingDimension": 64
-                    }}
-                }}
-            }}"#,
-            workspace.display().to_string().replace('\\', "/"),
-            collection_path.display().to_string().replace('\\', "/"),
-        ))
-        .unwrap();
-
-        let mut host = AgentHost::new(config.clone()).await.unwrap();
-        let mut router = ProviderRouter::new();
-        router.register_provider(Arc::new(ToolCallProvider));
-        host.runtime = Arc::new(AgentRuntime::new(
-            Arc::new(router),
-            Arc::new(ExecToolRegistry),
-            Arc::new(FakeMemoryBackend),
-            config,
-        ));
-        host.session_store = Arc::new(SessionStore::new(tmp.path()));
+        let host = build_test_host(&tmp, "tool-call", |config| {
+            let mut router = ProviderRouter::new();
+            router.register_provider(Arc::new(ToolCallProvider));
+            Arc::new(AgentRuntime::new(
+                Arc::new(router),
+                Arc::new(ExecToolRegistry),
+                Arc::new(FakeMemoryBackend),
+                config,
+            ))
+        })
+        .await;
 
         let frames: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = frames.clone();

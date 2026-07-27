@@ -502,7 +502,8 @@ async fn run_embedded_agent_turn(
     yolo: bool,
     workspace_override: Option<PathBuf>,
 ) -> Result<(), CliError> {
-    let host = legion_cli::driver::build_local_host(config).await?;
+    let cron_store_path = legion_cli::driver::session_cron_store_path(session_key);
+    let host = legion_cli::driver::build_local_host(config, cron_store_path).await?;
     legion_cli::driver::run_local_turn(
         &host,
         session_key,
@@ -519,17 +520,6 @@ async fn run_embedded_agent_turn(
     .await
 }
 
-/// Expand a leading `~` in a path string using `HOME`. Mirrors
-/// `legion_runtime::expand_tilde` (which is `pub(crate)`).
-fn expand_tilde_cli(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Resolve the `--workspace` flag into a per-run override.
 ///
 /// - `None` (flag not passed) → current directory (the default, matching
@@ -541,7 +531,27 @@ pub(crate) fn resolve_workspace_override(cli_ws: &Option<String>) -> Option<Path
     match cli_ws {
         None => Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         Some(value) if value == "none" => None,
-        Some(path) => Some(expand_tilde_cli(path)),
+        Some(path) => Some(legion_core::fs::expand_tilde(path)),
+    }
+}
+
+/// Detect 5-field (minute hour dom month dow) or 6-field (with seconds)
+/// cron expressions so that `legion loop` does not silently treat them as
+/// a prompt and fall back to the default interval.
+fn looks_like_cron_expression(schedule: &str) -> bool {
+    let trimmed = schedule.trim();
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    matches!(fields.len(), 5 | 6) && fields.iter().all(|f| !f.is_empty())
+}
+
+/// Resolve a `legion loop <schedule>` argument to a cron expression.
+/// Accepts full cron expressions or shorthand intervals (e.g. "5m", "2h").
+fn resolve_loop_schedule(schedule: &str) -> Result<String, CliError> {
+    if looks_like_cron_expression(schedule) {
+        Ok(schedule.to_string())
+    } else {
+        legion_cli::loop_cmd::interval_to_cron(schedule)
+            .map_err(|e| CliError::Other(format!("invalid schedule '{schedule}': {e}")))
     }
 }
 
@@ -910,12 +920,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = load_config()?;
             let client = GatewayClient::connect(&config).await?;
             // Support both shorthand intervals ("5m") and full cron expressions.
-            let input = format!("{schedule} {text}");
-            let cron = match legion_cli::loop_cmd::parse_loop(&input) {
-                Ok(req) => legion_cli::loop_cmd::interval_to_cron(&req.interval)
-                    .map_err(|e| CliError::Other(e.to_string()))?,
-                Err(_) => schedule.clone(),
-            };
+            let cron = resolve_loop_schedule(&schedule)?;
             let resp = client
                 .request(
                     "cron.add",
@@ -1174,5 +1179,28 @@ mod tests {
             resolve_workspace_override(&Some("~/projects".to_string())),
             Some(PathBuf::from(&home).join("projects"))
         );
+    }
+
+    #[test]
+    fn looks_like_cron_recognizes_five_and_six_field_expressions() {
+        assert!(looks_like_cron_expression("0 9 * * *"));
+        assert!(looks_like_cron_expression("0 0 9 * * *"));
+        assert!(!looks_like_cron_expression("5m"));
+        assert!(!looks_like_cron_expression("every 5 minutes"));
+        assert!(!looks_like_cron_expression("check the deploy"));
+    }
+
+    #[test]
+    fn resolve_loop_schedule_accepts_cron_and_intervals() {
+        assert_eq!(resolve_loop_schedule("0 9 * * *").unwrap(), "0 9 * * *");
+        assert_eq!(resolve_loop_schedule("5m").unwrap(), "*/5 * * * *");
+        assert_eq!(resolve_loop_schedule("2h").unwrap(), "0 */2 * * *");
+    }
+
+    #[test]
+    fn resolve_loop_schedule_rejects_invalid_schedule() {
+        assert!(resolve_loop_schedule("foo").is_err());
+        assert!(resolve_loop_schedule("0m").is_err());
+        assert!(resolve_loop_schedule("5x").is_err());
     }
 }

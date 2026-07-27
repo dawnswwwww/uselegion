@@ -97,6 +97,24 @@ pub async fn run_tui(
         ..state::AppState::default()
     };
 
+    // Apply persisted TUI preferences.
+    match crate::tui::theme::Theme::by_name(&config.tui.theme) {
+        Some(theme) => {
+            state_inner.theme = theme;
+            state_inner.theme_name = config.tui.theme.clone();
+        }
+        None => {
+            tracing::warn!(theme = %config.tui.theme, "unknown TUI theme in config; using default");
+            state_inner.theme_name = "default".to_string();
+        }
+    }
+    if let Some(mode) = state::ScreenMode::from_name(&config.tui.screen_mode) {
+        state_inner.screen_mode = mode;
+    } else {
+        tracing::warn!(mode = %config.tui.screen_mode, "unknown TUI screen mode in config; using fullscreen");
+    }
+    state_inner.config_path = crate::default_config_path();
+
     // Load the persisted goal for this session, if any.
     match goal_store.load(&session_key).await {
         Ok(goal) => state_inner.goal = goal,
@@ -2408,5 +2426,32 @@ mod tests {
         // CJK characters are roughly 2 display columns each.
         assert_eq!(widgets::truncate_to_width("中文", 3), "中…");
         assert_eq!(widgets::truncate_to_width("中文", 4), "中文");
+    }
+
+    #[test]
+    fn screen_mode_name_roundtrip() {
+        assert_eq!(
+            ScreenMode::from_name("fullscreen"),
+            Some(ScreenMode::Fullscreen)
+        );
+        assert_eq!(ScreenMode::from_name("inline"), Some(ScreenMode::Inline));
+        assert_eq!(ScreenMode::from_name("bogus"), None);
+        assert_eq!(ScreenMode::Fullscreen.name(), "fullscreen");
+        assert_eq!(ScreenMode::Inline.name(), "inline");
+    }
+
+    #[test]
+    fn theme_command_does_not_persist_without_config_path() {
+        let mut state = AppState::default(); // config_path is None in tests
+        let result = crate::slash_commands::dispatch(&mut state, "/theme light");
+        assert!(matches!(
+            result,
+            crate::slash_commands::CommandResult::Handled
+        ));
+        assert_eq!(state.theme, crate::tui::theme::Theme::default_light());
+        assert_eq!(state.theme_name, "light");
+        let last = state.messages().last().expect("feedback message");
+        assert!(last.content.contains("theme set to light"));
+        assert!(!last.content.contains("saved"));
     }
 }

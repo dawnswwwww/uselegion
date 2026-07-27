@@ -221,36 +221,47 @@ impl GatewayClient {
         let id = client.next_id();
 
         let cli_protocol = gateway_manager::GatewayManager::cli_compatibility();
-        let connect_frame = json!({
-            "type": "connect",
-            "id": id,
-            "params": {
-                "auth": { "token": config.gateway.auth.token.clone().unwrap_or_default() },
-                "deviceId": "legion-cli",
-                "platform": std::env::consts::OS,
-                "deviceFamily": "client",
-                "role": "client",
-                "protocol": cli_protocol
-            }
-        });
+        let connect_frame = legion_protocol::WsFrame::Connect {
+            id,
+            params: legion_protocol::ConnectParams {
+                auth: legion_protocol::AuthCreds {
+                    token: Some(config.gateway.auth.token.clone().unwrap_or_default()),
+                    password: None,
+                },
+                device_id: "legion-cli".to_string(),
+                platform: std::env::consts::OS.to_string(),
+                device_family: "client".to_string(),
+                role: "client".to_string(),
+                protocol: Some(cli_protocol.clone()),
+                ..legion_protocol::ConnectParams::default()
+            },
+        };
 
-        client.send_json(&connect_frame).await?;
+        client
+            .send_json(&serde_json::to_value(&connect_frame)?)
+            .await?;
         let response = client.recv_json().await?.ok_or(CliError::NotConnected)?;
 
-        if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = response
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("connect handshake failed");
-            return Err(CliError::Gateway(error.to_string()));
+        let (ok, payload, error) =
+            match serde_json::from_value::<legion_protocol::WsFrame>(response) {
+                Ok(legion_protocol::WsFrame::Res {
+                    ok, payload, error, ..
+                }) => (ok, payload, error),
+                // Any other frame shape is a failed handshake.
+                _ => (false, None, None),
+            };
+
+        if !ok {
+            return Err(CliError::Gateway(
+                error.unwrap_or_else(|| "connect handshake failed".to_string()),
+            ));
         }
 
         // Version handshake: a stale background gateway may predate the CLI.
         // Prefer the machine-readable protocol block; fall back to crate version.
-        let payload = response.get("payload");
-        let gateway_protocol = payload.and_then(|p| p.get("protocol")).and_then(|v| {
-            serde_json::from_value::<legion_protocol::ProtocolCompatibility>(v.clone()).ok()
-        });
+        let hello =
+            payload.and_then(|p| serde_json::from_value::<legion_protocol::HelloPayload>(p).ok());
+        let gateway_protocol = hello.as_ref().and_then(|h| h.protocol.clone());
 
         if let Some(ref gw_protocol) = gateway_protocol {
             client.gateway_info = Some(gw_protocol.clone());
@@ -258,9 +269,7 @@ impl GatewayClient {
                 client.version_warning = Some(err);
             }
         } else {
-            let gateway_version = payload
-                .and_then(|p| p.get("version"))
-                .and_then(|v| v.as_str());
+            let gateway_version = hello.as_ref().map(|h| h.version.as_str());
             if gateway_version != Some(env!("CARGO_PKG_VERSION")) {
                 client.version_warning = Some(match gateway_version {
                     Some(v) => format!(
@@ -441,16 +450,15 @@ pub const DEFAULT_CLI_SESSION_KEY: &str = "agent:main:dm:cli:default:direct:cli"
 /// stored per agent + peer id, so a peer id is enough to resume a session
 /// regardless of which channel originally created it.
 ///
-/// Validation mirrors the gateway (`agent_rpc::parse_session_key` +
-/// `session_tools::is_safe_peer_id`) so typos fail fast with a clear error
-/// instead of silently starting a fresh, unpersisted session.
+/// Validation mirrors the gateway (`legion_plugin_sdk::session_key` +
+/// `is_safe_segment`) so typos fail fast with a clear error instead of
+/// silently starting a fresh, unpersisted session.
 pub fn resolve_session_key_arg(session: &str, channel: &str) -> Result<String, CliError> {
+    use legion_plugin_sdk::session_key::{is_safe_segment, parse_session_key};
     if let Some(rest) = session.strip_prefix("agent:") {
-        let parts: Vec<&str> = session.split(':').collect();
-        let valid_shape = parts.len() == 7
-            && matches!(parts[5], "direct" | "group" | "thread")
-            && is_safe_session_segment(parts[1])
-            && is_safe_session_segment(parts[6]);
+        let valid_shape = parse_session_key(session).is_some_and(|parts| {
+            is_safe_segment(&parts.agent_id) && is_safe_segment(&parts.peer_id)
+        });
         if valid_shape {
             return Ok(session.to_string());
         }
@@ -460,21 +468,16 @@ pub fn resolve_session_key_arg(session: &str, channel: &str) -> Result<String, C
              with agent/peer limited to ASCII alphanumerics plus '.', '_', '-'"
         )));
     }
-    if !is_safe_session_segment(session) {
+    if !is_safe_segment(session) {
         return Err(CliError::Other(format!(
             "invalid session id '{session}': use the transcript file name from \
              ~/.legion/agents/<agent>/sessions/ (ASCII alphanumerics plus '.', '_', '-'), \
              or a full 'agent:...' session key"
         )));
     }
-    Ok(format!("agent:main:dm:{channel}:default:direct:{session}"))
-}
-
-/// Whitelist check matching the gateway's `is_safe_peer_id` rules.
-fn is_safe_session_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    Ok(legion_plugin_sdk::session_key::direct_session_key(
+        "main", "dm", channel, "default", session,
+    ))
 }
 
 /// Extract the peer id (last segment) from a full session key.
@@ -484,12 +487,8 @@ pub fn session_peer_id(session_key: &str) -> &str {
 
 /// Extract the agent id (second segment) from a full session key.
 pub fn session_agent_id(session_key: &str) -> Option<&str> {
-    let parts: Vec<&str> = session_key.split(':').collect();
-    if parts.len() == 7 && parts[0] == "agent" {
-        Some(parts[1])
-    } else {
-        None
-    }
+    legion_plugin_sdk::session_key::parse_session_key(session_key)?;
+    session_key.split(':').nth(1)
 }
 
 pub fn print_agent_event(payload: &serde_json::Value) -> Result<(), CliError> {
