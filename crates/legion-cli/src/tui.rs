@@ -96,6 +96,9 @@ pub async fn run_tui(
         goal_store: goal_store.clone(),
         ..state::AppState::default()
     };
+    state_inner
+        .composer
+        .placeholder("type a message · / commands · ! shell");
 
     // Apply persisted TUI preferences.
     match crate::tui::theme::Theme::by_name(&config.tui.theme) {
@@ -581,6 +584,15 @@ async fn tui_loop(
             // still cost nothing: no active run means no redraw.
             if s.is_active() {
                 s.spinner_frame = s.spinner_frame.wrapping_add(1);
+                dirty = true;
+            }
+            // Expire a stale transient notice (copy feedback, ...) so the
+            // status bar falls back to the connection status.
+            if s.notice
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= widgets::NOTICE_TTL)
+            {
+                s.notice = None;
                 dirty = true;
             }
             drop(s);
@@ -2695,5 +2707,34 @@ mod tests {
             content.contains("1 queued"),
             "queue indicator missing: {content}"
         );
+    }
+
+    #[test]
+    fn copy_sets_notice_shown_in_status_bar() {
+        let theme = theme();
+        let state = AppState {
+            notice: Some(("copied 42 chars".to_string(), std::time::Instant::now())),
+            ..Default::default()
+        };
+        let lines = widgets::status_bar_lines(&state, &theme, 2);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("copied 42 chars"));
+    }
+
+    #[test]
+    fn expired_notice_falls_back_to_status() {
+        let theme = theme();
+        let state = AppState {
+            status: "local".to_string(),
+            notice: Some((
+                "copied 42 chars".to_string(),
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            )),
+            ..Default::default()
+        };
+        let lines = widgets::status_bar_lines(&state, &theme, 2);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("copied"));
+        assert!(text.contains("local"));
     }
 }

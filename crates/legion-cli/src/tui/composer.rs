@@ -115,15 +115,19 @@ impl Composer {
     }
 
     /// Set the placeholder text shown when the input is empty.
-    #[allow(dead_code)]
     pub fn placeholder(&mut self, text: &str) {
         self.textarea.set_placeholder_text(text);
     }
 
-    /// Update the border title (e.g. "shell mode" when the input starts with `!`).
-    pub fn set_title(&mut self, title: &'static str) {
-        self.textarea
-            .set_block(Block::default().borders(Borders::ALL).title(title));
+    /// Update the border title and color (e.g. "shell mode" when the input
+    /// starts with `!`).
+    pub fn set_chrome(&mut self, title: &'static str, border: ratatui::style::Color) {
+        self.textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(ratatui::style::Style::default().fg(border)),
+        );
     }
 
     /// Render the textarea into the given buffer area.

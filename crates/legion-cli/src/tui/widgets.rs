@@ -16,6 +16,9 @@ use std::collections::HashSet;
 /// Braille spinner frames, indexed by `AppState::spinner_frame`.
 pub(crate) const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// How long a transient notice (copy feedback, ...) replaces the status text.
+pub(crate) const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub(crate) fn role_color(role: MessageRole, theme: &Theme) -> Color {
     match role {
         MessageRole::User => theme.user_bar,
@@ -379,6 +382,11 @@ pub(crate) fn status_bar_lines(
     theme: &Theme,
     status_height: u16,
 ) -> Vec<Line<'static>> {
+    let fresh_notice = state
+        .notice
+        .as_ref()
+        .filter(|(_, at)| at.elapsed() < NOTICE_TTL)
+        .map(|(text, _)| text.clone());
     let (status_text, status_color) = if let Some(pq) = &state.pending_question {
         let hint = question_hint(pq);
         let header = pq
@@ -388,6 +396,8 @@ pub(crate) fn status_bar_lines(
         (format!("{} ({})", header, hint), theme.system_bar)
     } else if let Some((_, tool)) = &state.pending_approval {
         (format!("approve tool '{tool}'? y/n"), theme.system_bar)
+    } else if let Some(notice) = fresh_notice {
+        (notice, theme.assistant_bar)
     } else if state.is_active() {
         let frame = SPINNER[state.spinner_frame % SPINNER.len()];
         (

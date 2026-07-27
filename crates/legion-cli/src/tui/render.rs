@@ -327,12 +327,12 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     // Input box.
     // The composer renders its own reversed-style cursor; the terminal cursor
     // is intentionally hidden by not calling set_cursor_position.
-    let input_title = if state.composer.join().starts_with('!') {
-        "shell mode"
+    let (input_title, border_color) = if state.composer.join().starts_with('!') {
+        ("shell mode", theme.system_bar)
     } else {
-        "Input"
+        ("Input", theme.input_border)
     };
-    state.composer.set_title(input_title);
+    state.composer.set_chrome(input_title, border_color);
     state.composer.render(input_area, f.buffer_mut());
 
     // Slash-command completion menu: a floating list above the input box,

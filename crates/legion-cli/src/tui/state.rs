@@ -124,6 +124,9 @@ pub struct AppState {
     /// newest history entry.
     pub(crate) draft_input: Option<String>,
     pub(crate) status: String,
+    /// Transient status-bar notice (e.g. "copied N chars"), shown for
+    /// `widgets::NOTICE_TTL` instead of the connection status.
+    pub(crate) notice: Option<(String, std::time::Instant)>,
     pub theme: Theme,
     pub highlighter: Highlighter,
     pub(crate) scroll: usize,

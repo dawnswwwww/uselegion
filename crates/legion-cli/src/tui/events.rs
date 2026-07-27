@@ -76,6 +76,10 @@ pub(crate) fn handle_key_event(
             if !sel.is_empty() {
                 let text = selected_text(sel, &state.messages, &state.render_cache);
                 print!("{}", osc52_copy(&text));
+                state.notice = Some((
+                    format!("copied {} chars", text.chars().count()),
+                    std::time::Instant::now(),
+                ));
                 state.selection = None;
                 return;
             }
