@@ -13,6 +13,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 
+/// Braille spinner frames, indexed by `AppState::spinner_frame`.
+pub(crate) const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 pub(crate) fn role_color(role: MessageRole, theme: &Theme) -> Color {
     match role {
         MessageRole::User => theme.user_bar,
@@ -386,7 +389,11 @@ pub(crate) fn status_bar_lines(
     } else if let Some((_, tool)) = &state.pending_approval {
         (format!("approve tool '{tool}'? y/n"), theme.system_bar)
     } else if state.is_active() {
-        ("typing...".to_string(), theme.system_bar)
+        let frame = SPINNER[state.spinner_frame % SPINNER.len()];
+        (
+            format!("{frame} typing... (esc to cancel)"),
+            theme.system_bar,
+        )
     } else {
         (
             state.status.clone(),

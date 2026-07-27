@@ -152,6 +152,9 @@ pub struct AppState {
     /// arrives, without adding an empty assistant placeholder that would push
     /// the user's own message out of the viewport.
     pub(crate) pending_request: bool,
+    /// Frame counter for the status-bar spinner, advanced by the UI tick
+    /// while a run is active.
+    pub(crate) spinner_frame: usize,
     /// User messages typed while a run is active, sent (in order) when the
     /// run finishes. The bool marks whether the text should appear in the
     /// chat as a user message when it is finally sent (false for

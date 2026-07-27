@@ -577,6 +577,12 @@ async fn tui_loop(
                 s.todo_hide_at = None;
                 dirty = true;
             }
+            // Drive the status-bar spinner while a run is active. Idle ticks
+            // still cost nothing: no active run means no redraw.
+            if s.is_active() {
+                s.spinner_frame = s.spinner_frame.wrapping_add(1);
+                dirty = true;
+            }
             drop(s);
         }
 
@@ -2647,5 +2653,19 @@ mod tests {
         );
         let hs = state.history_search.as_ref().expect("search still open");
         assert_eq!(hs.query, "");
+    }
+
+    #[test]
+    fn status_bar_shows_spinner_and_cancel_hint_while_active() {
+        let theme = theme();
+        let mut state = AppState {
+            pending_request: true,
+            ..Default::default()
+        };
+        state.spinner_frame = 0;
+        let lines = widgets::status_bar_lines(&state, &theme, 2);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains(widgets::SPINNER[0]));
+        assert!(text.contains("esc to cancel"));
     }
 }
