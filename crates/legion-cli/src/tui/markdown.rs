@@ -5,7 +5,7 @@ use crate::tui::links::osc8_link;
 use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// Render text without markdown parsing. Used while a message is streaming,
@@ -53,6 +53,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     in_code_block = true;
                     code_lang = match kind {
@@ -68,6 +69,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     in_heading = Some(level as u8);
                 }
@@ -79,6 +81,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     list_stack.push(ListState {
                         ordered: start.is_some(),
@@ -93,6 +96,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                 }
                 Tag::BlockQuote(_) => {
@@ -103,6 +107,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     quote_depth += 1;
                 }
@@ -110,7 +115,7 @@ pub(crate) fn markdown_lines(
                     push_pending_to_spans(
                         &mut current_spans,
                         &mut pending,
-                        effective_style(style, in_heading),
+                        effective_style(style, in_heading, theme),
                     );
                     link_url = Some(dest_url.to_string());
                     link_style = Some(style);
@@ -140,6 +145,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     in_heading = None;
                 }
@@ -151,6 +157,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     list_stack.pop();
                 }
@@ -162,6 +169,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     if let Some(last) = list_stack.last_mut() {
                         last.index += 1;
@@ -175,13 +183,14 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                     quote_depth = quote_depth.saturating_sub(1);
                 }
                 TagEnd::Link => {
                     if let Some(url) = link_url.take() {
                         let display = std::mem::take(&mut pending);
-                        let display_style = effective_style(style, in_heading)
+                        let display_style = effective_style(style, in_heading, theme)
                             .add_modifier(Modifier::UNDERLINED)
                             .fg(theme.link_fg);
                         current_spans.push(Span::styled(osc8_link(&url, &display), display_style));
@@ -189,7 +198,7 @@ pub(crate) fn markdown_lines(
                         push_pending_to_spans(
                             &mut current_spans,
                             &mut pending,
-                            effective_style(style, in_heading),
+                            effective_style(style, in_heading, theme),
                         );
                     }
                     if let Some(prev) = link_style.take() {
@@ -209,11 +218,13 @@ pub(crate) fn markdown_lines(
                 push_pending_to_spans(
                     &mut current_spans,
                     &mut pending,
-                    effective_style(style, in_heading),
+                    effective_style(style, in_heading, theme),
                 );
                 current_spans.push(Span::styled(
                     content.to_string(),
-                    Style::default().fg(Color::White).bg(theme.code_inline_bg),
+                    Style::default()
+                        .fg(theme.inline_code_fg)
+                        .bg(theme.code_inline_bg),
                 ));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
@@ -227,6 +238,7 @@ pub(crate) fn markdown_lines(
                         style,
                         &active_prefix(&list_stack, quote_depth, in_heading),
                         in_heading,
+                        theme,
                     );
                 }
             }
@@ -238,6 +250,7 @@ pub(crate) fn markdown_lines(
                     style,
                     &active_prefix(&list_stack, quote_depth, in_heading),
                     in_heading,
+                    theme,
                 );
                 lines.push(Line::from(Span::styled(
                     "────────────────────",
@@ -267,6 +280,7 @@ pub(crate) fn markdown_lines(
             style,
             &active_prefix(&list_stack, quote_depth, in_heading),
             in_heading,
+            theme,
         );
     }
 
@@ -274,17 +288,6 @@ pub(crate) fn markdown_lines(
         lines.push(Line::from(""));
     }
     lines
-}
-
-pub(crate) fn heading_color(level: u8) -> Color {
-    match level {
-        1 => Color::LightGreen,
-        2 => Color::Green,
-        3 => Color::Cyan,
-        4 => Color::Yellow,
-        5 => Color::Magenta,
-        _ => Color::DarkGray,
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -315,9 +318,11 @@ pub(crate) fn active_prefix(
     prefix
 }
 
-pub(crate) fn effective_style(style: Style, in_heading: Option<u8>) -> Style {
+pub(crate) fn effective_style(style: Style, in_heading: Option<u8>, theme: &Theme) -> Style {
     if let Some(level) = in_heading {
-        style.fg(heading_color(level)).add_modifier(Modifier::BOLD)
+        style
+            .fg(theme.heading_color(level))
+            .add_modifier(Modifier::BOLD)
     } else {
         style
     }
@@ -340,8 +345,9 @@ pub(crate) fn flush_pending(
     style: Style,
     prefix: &str,
     in_heading: Option<u8>,
+    theme: &Theme,
 ) {
-    let style = effective_style(style, in_heading);
+    let style = effective_style(style, in_heading, theme);
     push_pending_to_spans(spans, pending, style);
     if !spans.is_empty() || !prefix.is_empty() {
         let mut prefixed: Vec<Span> = vec![Span::raw(prefix.to_string())];
@@ -360,10 +366,8 @@ pub(crate) fn emit_code_block(
     if buffer.is_empty() {
         return;
     }
-    let code_style = Style::default()
-        .bg(theme.code_bg)
-        .fg(Color::Rgb(220, 220, 220));
-    let gutter_style = Style::default().bg(theme.code_bg).fg(Color::DarkGray);
+    let code_style = Style::default().bg(theme.code_bg).fg(theme.code_fg);
+    let gutter_style = Style::default().bg(theme.code_bg).fg(theme.code_gutter_fg);
     let code_lines: Vec<&str> = buffer.trim_end_matches('\n').split('\n').collect();
     let line_num_width = code_lines.len().to_string().len();
     let max_content_width = code_lines

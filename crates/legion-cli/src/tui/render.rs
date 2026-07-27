@@ -206,6 +206,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     // Single pass over the cached per-message renders: collect the visible
     // line window and the thinking-hint hitboxes together.
     state.think_hitboxes.clear();
+    state.message_rects.clear();
     let inner_chat = chat_area.inner(Margin {
         horizontal: 1,
         vertical: 1,
@@ -241,6 +242,25 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
             let sep_pos = offset + msg_lines;
             if has_sep && sep_pos >= state.scroll && sep_pos < window_end {
                 visible_lines.push(Line::from(""));
+            }
+            // Cache this message body's on-screen rectangle so clicks can
+            // hit-test via `Rect::contains`. Body only — the separator gap is
+            // deliberately excluded, so a click on the blank line between
+            // messages maps to `None`.
+            let body_start = offset.max(state.scroll);
+            let body_end = (offset + msg_lines).min(window_end);
+            if body_end > body_start {
+                let start_y = inner_chat.y + (body_start - state.scroll) as u16;
+                let height = (body_end - body_start) as u16;
+                // first_line = body_start - offset: index into the message's
+                // rendered lines of the row now at `start_y` (nonzero when the
+                // message's top is scrolled out of view).
+                let first_line = body_start - offset;
+                state.message_rects.push((
+                    msg_idx,
+                    Rect::new(inner_chat.x, start_y, inner_chat.width, height),
+                    first_line,
+                ));
             }
             for hint in &entry.think_hints {
                 let global_start = offset + hint.start_line;
@@ -331,11 +351,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
                         cmd.name, aliases, cmd.description
                     )));
                     if idx == state.slash_selected {
-                        item.style(
-                            Style::default()
-                                .fg(theme.selected_fg)
-                                .bg(theme.input_border),
-                        )
+                        item.style(Style::default().fg(theme.selected_fg).bg(theme.selected_bg))
                     } else {
                         item
                     }
@@ -368,11 +384,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
                 };
                 let item = ListItem::new(Line::from(display));
                 if idx == hs.selected {
-                    item.style(
-                        Style::default()
-                            .fg(theme.selected_fg)
-                            .bg(theme.input_border),
-                    )
+                    item.style(Style::default().fg(theme.selected_fg).bg(theme.selected_bg))
                 } else {
                     item
                 }

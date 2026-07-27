@@ -29,6 +29,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use inline::{INLINE_HEIGHT, reset_emitted_index};
+use legion_core::util::lock_recover;
 use legion_skills::SkillRegistry;
 use ratatui::Terminal;
 use ratatui::TerminalOptions;
@@ -208,7 +209,7 @@ pub async fn run_tui(
         },
     };
 
-    state.lock().unwrap().status = driver.mode_name().to_string();
+    lock_recover(&state).status = driver.mode_name().to_string();
 
     // On a fresh session show a short welcome instead of a bare workspace hint.
     if !resuming {
@@ -217,7 +218,7 @@ pub async fn run_tui(
             .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "config default".to_string());
-        state.lock().unwrap().messages.push(state::ChatMessage::new(
+        lock_recover(&state).messages.push(state::ChatMessage::new(
             state::MessageRole::System,
             format!(
                 "Welcome to Legion\n\
@@ -233,7 +234,7 @@ pub async fn run_tui(
             .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "config default".to_string());
-        state.lock().unwrap().messages.push(state::ChatMessage::new(
+        lock_recover(&state).messages.push(state::ChatMessage::new(
             state::MessageRole::System,
             format!("workspace: {ws}"),
         ));
@@ -246,7 +247,7 @@ pub async fn run_tui(
             .push(state::ChatMessage::new(state::MessageRole::System, warning));
     }
     if yolo {
-        state.lock().unwrap().messages.push(state::ChatMessage::new(
+        lock_recover(&state).messages.push(state::ChatMessage::new(
             state::MessageRole::System,
             "yolo mode: tool approvals are auto-accepted".to_string(),
         ));
@@ -264,7 +265,7 @@ pub async fn run_tui(
             Ok(Ok(resp)) if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
                 let resumed = events::history_messages_from_payload(&resp);
                 {
-                    let mut s = state.lock().unwrap();
+                    let mut s = lock_recover(&state);
                     for msg in &resumed {
                         if msg.role == state::MessageRole::User {
                             s.input_history.push(msg.content.clone());
@@ -278,7 +279,7 @@ pub async fn run_tui(
                     .get("error")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                state.lock().unwrap().messages.push(state::ChatMessage::new(
+                lock_recover(&state).messages.push(state::ChatMessage::new(
                     state::MessageRole::System,
                     format!(
                         "failed to load session history: {err} \
@@ -287,13 +288,13 @@ pub async fn run_tui(
                 ));
             }
             Ok(Err(err)) => {
-                state.lock().unwrap().messages.push(state::ChatMessage::new(
+                lock_recover(&state).messages.push(state::ChatMessage::new(
                     state::MessageRole::System,
                     format!("failed to load session history: {err}"),
                 ));
             }
             Err(_) => {
-                state.lock().unwrap().messages.push(state::ChatMessage::new(
+                lock_recover(&state).messages.push(state::ChatMessage::new(
                     state::MessageRole::System,
                     "timed out loading session history from the gateway".to_string(),
                 ));
@@ -318,28 +319,15 @@ pub async fn run_tui(
     // The sender task below moves `session_key`; keep the peer id for the
     // exit-time resume hint. `/status` shows the same value.
     let peer_id = crate::session_peer_id(&session_key).to_string();
-    state.lock().unwrap().session_peer = peer_id.clone();
+    lock_recover(&state).session_peer = peer_id.clone();
     tokio::spawn(async move {
         while let Some(command) = send_rx.recv().await {
             match command {
                 state::OutboundControl::Message(text) => {
-                    // Inject the active goal as a user-role context line, per
-                    // the OpenClaw /goal spec. Paused/blocked/terminal goals
-                    // are not injected so operator stops remain effective.
-                    let text = {
-                        let s = sender_state.lock().unwrap();
-                        if let Some(goal) = &s.goal {
-                            if goal.status.is_active() {
-                                format!("{}\n\n{}", goal.context_line(), text)
-                            } else {
-                                text
-                            }
-                        } else {
-                            text
-                        }
-                    };
+                    // The active goal is injected by the runtime at run start
+                    // (agent_loop), so the text goes out unchanged here.
                     if let Err(err) = sender_driver.run_turn(text).await {
-                        let mut s = sender_state.lock().unwrap();
+                        let mut s = lock_recover(&sender_state);
                         s.messages.push(state::ChatMessage::new(
                             state::MessageRole::System,
                             format!("failed to send: {err}"),
@@ -352,7 +340,7 @@ pub async fn run_tui(
                 }
                 state::OutboundControl::ShellCommand(command) => {
                     let output = crate::shell_commands::run_shell_command(&command).await;
-                    let mut s = sender_state.lock().unwrap();
+                    let mut s = lock_recover(&sender_state);
                     s.messages
                         .push(state::ChatMessage::new(state::MessageRole::System, output));
                     drop(s);
@@ -392,7 +380,7 @@ async fn run_terminal(
     send_tx: mpsc::UnboundedSender<state::OutboundControl>,
     event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
 ) -> Result<(), CliError> {
-    let mut current_mode = state.lock().unwrap().screen_mode;
+    let mut current_mode = lock_recover(&state).screen_mode;
 
     loop {
         enable_raw_mode()?;
@@ -421,7 +409,7 @@ async fn run_terminal(
                 // In inline mode the live viewport lives at the bottom of the
                 // normal scrollback. Reset the scrollback emission cursor so
                 // we do not dump pre-existing history onto the current line.
-                reset_emitted_index(&mut state.lock().unwrap());
+                reset_emitted_index(&mut lock_recover(&state));
                 Terminal::with_options(
                     backend,
                     TerminalOptions {
@@ -458,7 +446,7 @@ async fn run_terminal(
 
         match outcome {
             Ok(LoopOutcome::ModeSwitch) => {
-                current_mode = state.lock().unwrap().screen_mode;
+                current_mode = lock_recover(&state).screen_mode;
                 continue;
             }
             Ok(LoopOutcome::Quit) => return Ok(()),
@@ -479,19 +467,49 @@ async fn tui_loop(
     // Nothing on screen animates, so the UI only redraws when an event may
     // have changed state. Idle iterations block in `poll` and cost no CPU.
     let mut dirty = true;
-    let initial_mode = state.lock().unwrap().screen_mode;
+    let initial_mode = lock_recover(&state).screen_mode;
 
     loop {
         // Drain incoming websocket events.
         let mut had_events = false;
         while let Ok(msg) = event_rx.try_recv() {
-            events::handle_ws_event(&mut state.lock().unwrap(), msg);
+            // Goal mode: the model may have updated the session goal via the
+            // goal tools during the run; refresh the TUI's copy when the run
+            // finishes so the status bar and /goal reflect it.
+            let run_finished = msg.get("event").and_then(|v| v.as_str()) == Some("agent")
+                && msg
+                    .get("payload")
+                    .and_then(|p| p.get("stream"))
+                    .and_then(|v| v.as_str())
+                    == Some("lifecycle")
+                && matches!(
+                    msg.get("payload")
+                        .and_then(|p| p.get("phase"))
+                        .and_then(|v| v.as_str()),
+                    Some("end") | Some("error")
+                );
+            events::handle_ws_event(&mut lock_recover(&state), msg);
+            if run_finished {
+                let (goal_store, session_key) = {
+                    let s = lock_recover(&state);
+                    (s.goal_store.clone(), s.session_key.clone())
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    match goal_store.load(&session_key).await {
+                        Ok(goal) => lock_recover(&state).goal = goal,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to reload session goal")
+                        }
+                    }
+                });
+            }
             had_events = true;
         }
 
         // In inline mode, flush finalized messages to the native scrollback.
         {
-            let mut s = state.lock().unwrap();
+            let mut s = lock_recover(&state);
             inline::emit_finalized_messages(&mut s, |bytes| {
                 scrollback_tx
                     .send(bytes)
@@ -504,13 +522,13 @@ async fn tui_loop(
         if crossterm::event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    events::handle_key_event(&mut state.lock().unwrap(), key, &send_tx);
+                    events::handle_key_event(&mut lock_recover(&state), key, &send_tx);
                 }
                 Event::Paste(text) => {
-                    input::handle_paste(&mut state.lock().unwrap(), text);
+                    input::handle_paste(&mut lock_recover(&state), text);
                 }
                 Event::Mouse(mouse) => {
-                    events::handle_mouse_event(&mut state.lock().unwrap(), mouse);
+                    events::handle_mouse_event(&mut lock_recover(&state), mouse);
                 }
                 _ => {}
             }
@@ -521,7 +539,7 @@ async fn tui_loop(
         if last_tick.elapsed() >= tick_rate {
             last_tick = tokio::time::Instant::now();
             // Expire the todo panel hide timer if all items are completed.
-            let mut s = state.lock().unwrap();
+            let mut s = lock_recover(&state);
             if s.todo_hide_at
                 .is_some_and(|t| t <= std::time::Instant::now())
             {
@@ -533,7 +551,7 @@ async fn tui_loop(
         }
 
         let (should_quit, current_mode) = {
-            let s = state.lock().unwrap();
+            let s = lock_recover(&state);
             (s.quit, s.screen_mode)
         };
 
@@ -542,7 +560,7 @@ async fn tui_loop(
         }
 
         if dirty {
-            terminal.draw(|f| render::draw_ui(f, &mut state.lock().unwrap()))?;
+            terminal.draw(|f| render::draw_ui(f, &mut lock_recover(&state)))?;
             dirty = false;
         }
 
@@ -593,7 +611,7 @@ pub(crate) fn uuid_v4() -> String {
 /// each other's transcripts. Within one TUI session every message shares the
 /// same key, so multi-turn context is preserved.
 pub(crate) fn tui_session_key(session_id: &str) -> String {
-    format!("agent:main:dm:tui:default:direct:{session_id}")
+    legion_plugin_sdk::session_key::direct_session_key("main", "dm", "tui", "default", session_id)
 }
 
 #[cfg(test)]
@@ -727,6 +745,46 @@ mod tests {
             .join("\n");
         assert!(text.contains("Title"));
         assert!(text.contains("Subtitle"));
+    }
+
+    #[test]
+    fn heading_uses_theme_color() {
+        let theme = theme();
+        let lines = markdown::markdown_lines("# Title", &theme, highlighter());
+        let text_line = lines
+            .iter()
+            .find(|l| l.to_string().contains("Title"))
+            .expect("heading line must exist");
+        let colored = text_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Title"))
+            .expect("heading span must exist");
+        assert_eq!(colored.style.fg, Some(theme.heading_color(1)));
+    }
+
+    #[test]
+    fn role_backgrounds_come_from_theme() {
+        let theme = theme();
+        assert_eq!(
+            widgets::role_background(MessageRole::System, &theme),
+            theme.system_bg
+        );
+        assert_eq!(
+            widgets::role_background(MessageRole::Question, &theme),
+            theme.question_bg
+        );
+    }
+
+    #[test]
+    fn light_theme_highlighting_does_not_panic() {
+        let light = crate::tui::theme::Theme::default_light();
+        let lines = markdown::markdown_lines(
+            "```rust\nlet x = 1;\nlet y = 2;\n```",
+            &light,
+            highlighter(),
+        );
+        assert!(lines.len() >= 3);
     }
 
     #[test]

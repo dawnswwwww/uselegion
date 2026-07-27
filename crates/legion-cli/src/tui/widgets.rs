@@ -28,11 +28,9 @@ pub(crate) fn role_background(role: MessageRole, theme: &Theme) -> Color {
     match role {
         MessageRole::User => theme.user_bg,
         MessageRole::Assistant => theme.assistant_bg,
-        // These tints do not have dedicated theme knobs yet; preserve the
-        // existing colors while the rest of the palette is theme-driven.
-        MessageRole::System => Color::Rgb(42, 40, 26),
+        MessageRole::System => theme.system_bg,
         MessageRole::Tool => Color::Reset,
-        MessageRole::Question => Color::Rgb(48, 36, 48),
+        MessageRole::Question => theme.question_bg,
     }
 }
 

@@ -34,10 +34,14 @@ impl Highlighter {
         &self,
         lang: &str,
         source: &str,
-        _theme: &Theme,
+        theme: &Theme,
     ) -> Option<Vec<Line<'static>>> {
         let syntax = self.ps.find_syntax_by_token(lang)?;
-        let syntect_theme = &self.ts.themes["base16-ocean.dark"];
+        let syntect_theme = self
+            .ts
+            .themes
+            .get(theme.syntect_theme)
+            .unwrap_or(&self.ts.themes["base16-ocean.dark"]);
         let mut h = HighlightLines::new(syntax, syntect_theme);
         let mut lines = Vec::new();
         for line in source.lines() {
