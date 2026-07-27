@@ -280,8 +280,26 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
         }
     }
 
-    let chat = Paragraph::new(Text::from(visible_lines))
-        .block(Block::default().title("Legion").borders(Borders::ALL));
+    let mut chat_block = Block::default().title("Legion").borders(Borders::ALL);
+    if state.scroll < max_scroll {
+        chat_block = chat_block.title_bottom(
+            Line::from(Span::styled(
+                " ↓ more ",
+                Style::default().fg(theme.system_bar),
+            ))
+            .right_aligned(),
+        );
+    }
+    if !state.queued_messages.is_empty() {
+        chat_block = chat_block.title_top(
+            Line::from(Span::styled(
+                format!(" ⏳ {} queued ", state.queued_messages.len()),
+                Style::default().fg(theme.user_bar),
+            ))
+            .right_aligned(),
+        );
+    }
+    let chat = Paragraph::new(Text::from(visible_lines)).block(chat_block);
     f.render_widget(chat, chat_area);
 
     let scrollbar = Scrollbar::default()

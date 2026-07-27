@@ -2668,4 +2668,32 @@ mod tests {
         assert!(text.contains(widgets::SPINNER[0]));
         assert!(text.contains("esc to cancel"));
     }
+
+    #[test]
+    fn chat_block_shows_scroll_and_queue_indicators() {
+        let mut state = AppState::default();
+        for i in 0..50 {
+            state.push_message(MessageRole::Assistant, format!("line {i}"));
+        }
+        // Simulate "user scrolled up": a nonzero previous max_scroll keeps
+        // `apply_scroll` from snapping back to the bottom on the next draw.
+        state.max_scroll = 1;
+        state.scroll = 0;
+        state.queued_messages.push_back(("later".to_string(), true));
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render::draw_ui(f, &mut state))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            content.contains("↓ more"),
+            "scroll indicator missing: {content}"
+        );
+        assert!(
+            content.contains("1 queued"),
+            "queue indicator missing: {content}"
+        );
+    }
 }
