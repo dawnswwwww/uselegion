@@ -19,13 +19,15 @@ pub(crate) fn plain_lines(text: &str) -> Vec<Line<'static>> {
 /// Convert Markdown text into styled `Line`s.
 ///
 /// Supports inline **bold**, *italic*, `code`, ~~strikethrough~~, links, fenced
-/// code blocks, headings, unordered/ordered lists, blockquotes and thematic rules.
+/// code blocks, headings, unordered/ordered lists, blockquotes, thematic rules
+/// and tables.
 pub(crate) fn markdown_lines(
     text: &str,
     theme: &Theme,
     highlighter: &Highlighter,
+    _viewport_width: u16,
 ) -> Vec<Line<'static>> {
-    let parser = Parser::new(text);
+    let parser = Parser::new_ext(text, pulldown_cmark::Options::ENABLE_TABLES);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut style = Style::default();
@@ -38,6 +40,7 @@ pub(crate) fn markdown_lines(
     let mut in_heading: Option<u8> = None;
     let mut link_url: Option<String> = None;
     let mut link_style: Option<Style> = None;
+    let mut table: Option<TableState> = None;
 
     for event in parser {
         match event {
@@ -120,6 +123,29 @@ pub(crate) fn markdown_lines(
                     link_url = Some(dest_url.to_string());
                     link_style = Some(style);
                     style = style.add_modifier(Modifier::UNDERLINED).fg(theme.link_fg);
+                }
+                Tag::Table(_) => {
+                    flush_pending(
+                        &mut lines,
+                        &mut current_spans,
+                        &mut pending,
+                        style,
+                        &active_prefix(&list_stack, quote_depth, in_heading),
+                        in_heading,
+                        theme,
+                    );
+                    table = Some(TableState::default());
+                }
+                Tag::TableHead | Tag::TableRow => {
+                    if let Some(t) = table.as_mut() {
+                        t.current_row.clear();
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(t) = table.as_mut() {
+                        t.current_cell.clear();
+                        t.in_cell = true;
+                    }
                 }
                 _ => {}
             },
@@ -205,16 +231,44 @@ pub(crate) fn markdown_lines(
                         style = prev;
                     }
                 }
+                TagEnd::TableCell => {
+                    if let Some(t) = table.as_mut() {
+                        t.current_row.push(t.current_cell.trim().to_string());
+                        t.in_cell = false;
+                    }
+                }
+                TagEnd::TableRow | TagEnd::TableHead => {
+                    if let Some(t) = table.as_mut() {
+                        if !t.current_row.is_empty() {
+                            t.rows.push(std::mem::take(&mut t.current_row));
+                        }
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(t) = table.take() {
+                        render_table(&mut lines, &t.rows, theme);
+                    }
+                }
                 _ => {}
             },
             MdEvent::Text(content) => {
                 if in_code_block {
                     code_buffer.push_str(&content);
+                } else if table.as_ref().is_some_and(|t| t.in_cell) {
+                    if let Some(t) = table.as_mut() {
+                        t.current_cell.push_str(&content);
+                    }
                 } else {
                     pending.push_str(&content);
                 }
             }
             MdEvent::Code(content) => {
+                if table.as_ref().is_some_and(|t| t.in_cell) {
+                    if let Some(t) = table.as_mut() {
+                        t.current_cell.push_str(&content);
+                    }
+                    continue;
+                }
                 push_pending_to_spans(
                     &mut current_spans,
                     &mut pending,
@@ -294,6 +348,16 @@ pub(crate) fn markdown_lines(
 pub(crate) struct ListState {
     pub(crate) ordered: bool,
     pub(crate) index: u64,
+}
+
+/// Accumulates raw cell text for a markdown table until `TagEnd::Table`.
+/// Inline styling inside cells is flattened to plain text.
+#[derive(Default)]
+struct TableState {
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_cell: bool,
 }
 
 pub(crate) fn active_prefix(
@@ -415,4 +479,43 @@ pub(crate) fn emit_code_block(
     }
     buffer.clear();
     lang.clear();
+}
+
+/// Render collected table rows with ` │ ` column separators, padding every
+/// cell to its column's display width so columns align. A `─` separator
+/// line follows the first (header) row.
+fn render_table(lines: &mut Vec<Line<'static>>, rows: &[Vec<String>], theme: &Theme) {
+    if rows.is_empty() {
+        return;
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().map(char_width).sum::<usize>());
+        }
+    }
+    let cell_width = |cell: &str| cell.chars().map(char_width).sum::<usize>();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, cell) in row.iter().enumerate() {
+            let pad = widths[i].saturating_sub(cell_width(cell));
+            spans.push(Span::raw(format!("{cell}{}", " ".repeat(pad))));
+            if i + 1 < row.len() {
+                spans.push(Span::styled(" │ ", Style::default().fg(theme.tool_bar)));
+            }
+        }
+        lines.push(Line::from(spans));
+        if row_idx == 0 && rows.len() > 1 {
+            let sep = widths
+                .iter()
+                .map(|w| "─".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("─┼─");
+            lines.push(Line::from(Span::styled(
+                sep,
+                Style::default().fg(theme.tool_bar),
+            )));
+        }
+    }
 }

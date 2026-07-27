@@ -206,7 +206,7 @@ pub(crate) fn message_lines(
                     if msg.state == MessageState::Streaming || msg.state == MessageState::Loading {
                         plain_lines(text)
                     } else {
-                        markdown_lines(text, theme, highlighter)
+                        markdown_lines(text, theme, highlighter, _viewport_width)
                     };
                 if first {
                     prepend_prefix(&mut md, prefix.clone());

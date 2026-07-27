@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_bold_and_italic() {
         let theme = theme();
-        let lines = markdown::markdown_lines("**bold** and *italic*", &theme, highlighter());
+        let lines = markdown::markdown_lines("**bold** and *italic*", &theme, highlighter(), 80);
         let text = lines[0].to_string();
         assert!(text.contains("bold"));
         assert!(text.contains("italic"));
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_inline_code() {
         let theme = theme();
-        let lines = markdown::markdown_lines("use `cargo build`", &theme, highlighter());
+        let lines = markdown::markdown_lines("use `cargo build`", &theme, highlighter(), 80);
         let text = lines[0].to_string();
         assert!(text.contains("cargo build"));
     }
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_code_block() {
         let theme = theme();
-        let lines = markdown::markdown_lines("```rust\nlet x = 1;\n```", &theme, highlighter());
+        let lines = markdown::markdown_lines("```rust\nlet x = 1;\n```", &theme, highlighter(), 80);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_header() {
         let theme = theme();
-        let lines = markdown::markdown_lines("# Title\n## Subtitle", &theme, highlighter());
+        let lines = markdown::markdown_lines("# Title\n## Subtitle", &theme, highlighter(), 80);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn heading_uses_theme_color() {
         let theme = theme();
-        let lines = markdown::markdown_lines("# Title", &theme, highlighter());
+        let lines = markdown::markdown_lines("# Title", &theme, highlighter(), 80);
         let text_line = lines
             .iter()
             .find(|l| l.to_string().contains("Title"))
@@ -831,6 +831,7 @@ mod tests {
             "```rust\nlet x = 1;\nlet y = 2;\n```",
             &light,
             highlighter(),
+            80,
         );
         assert!(lines.len() >= 3);
     }
@@ -838,7 +839,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_list() {
         let theme = theme();
-        let lines = markdown::markdown_lines("- a\n- b", &theme, highlighter());
+        let lines = markdown::markdown_lines("- a\n- b", &theme, highlighter(), 80);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -851,7 +852,7 @@ mod tests {
     #[test]
     fn markdown_lines_renders_blockquote() {
         let theme = theme();
-        let lines = markdown::markdown_lines("> quoted", &theme, highlighter());
+        let lines = markdown::markdown_lines("> quoted", &theme, highlighter(), 80);
         let text = lines[0].to_string();
         assert!(text.contains("quoted"));
         assert!(text.contains("│"));
@@ -860,9 +861,38 @@ mod tests {
     #[test]
     fn markdown_lines_renders_horizontal_rule() {
         let theme = theme();
-        let lines = markdown::markdown_lines("---", &theme, highlighter());
+        let lines = markdown::markdown_lines("---", &theme, highlighter(), 80);
         let text = lines[0].to_string();
         assert!(text.contains("──"));
+    }
+
+    #[test]
+    fn markdown_table_renders_aligned_columns() {
+        let theme = theme();
+        let lines = markdown::markdown_lines(
+            "| Name | Age |\n| --- | --- |\n| Ann | 3 |\n| Bob | 42 |",
+            &theme,
+            highlighter(),
+            80,
+        );
+        let rendered: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let joined = rendered.join("\n");
+        assert!(joined.contains("Name"), "header cell missing: {joined}");
+        assert!(joined.contains("│"), "column separator missing: {joined}");
+        // Columns align: "Age" starts at the same offset in header and body rows.
+        let header_row = rendered
+            .iter()
+            .find(|l| l.contains("Name"))
+            .expect("header row");
+        let body_row = rendered
+            .iter()
+            .find(|l| l.contains("Bob"))
+            .expect("body row");
+        assert_eq!(
+            header_row.find("Age"),
+            body_row.find("42"),
+            "second column must align"
+        );
     }
 
     #[test]
