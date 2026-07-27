@@ -2104,7 +2104,26 @@ mod tests {
         let sent = rx.try_recv().expect("expected a message to be sent");
         assert_eq!(sent, state::OutboundControl::Message(content));
         assert!(state.composer.is_empty());
-        assert!(state.paste_store.is_empty());
+        // The paste store survives commits so history-recalled placeholders
+        // still expand.
+        assert_eq!(state.paste_store.len(), 1);
+    }
+
+    #[test]
+    fn recalled_history_entry_still_expands_paste_placeholder() {
+        let mut state = AppState::default();
+        let big = "x".repeat(2000); // exceeds PASTE_CHAR_THRESHOLD
+        crate::tui::input::handle_paste(&mut state, big.clone());
+        let placeholder = state.composer.join();
+        assert!(placeholder.contains("Pasted text"));
+        // Send it, then recall it from history.
+        crate::tui::input::commit_and_clear_input(&mut state, &placeholder);
+        crate::tui::input::navigate_input_history(&mut state, true);
+        let expanded = crate::tui::input::expand_paste_placeholders(
+            &state.composer.join(),
+            &state.paste_store,
+        );
+        assert_eq!(expanded, big);
     }
 
     #[test]

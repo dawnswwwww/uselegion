@@ -144,7 +144,10 @@ pub(crate) fn expand_paste_placeholders(
 }
 
 /// Record `text` in the session input history and clear the input box,
-/// resetting all transient input state.
+/// resetting all transient input state. `paste_store` is deliberately kept:
+/// history entries contain paste placeholders, and recalling one with ↑
+/// must still expand to the original pasted text. Placeholder ids are
+/// unique per session, so retention cannot cross-expand.
 pub(crate) fn commit_and_clear_input(state: &mut AppState, text: &str) {
     let trimmed = text.trim();
     if !trimmed.is_empty() {
@@ -155,7 +158,6 @@ pub(crate) fn commit_and_clear_input(state: &mut AppState, text: &str) {
     state.composer.clear();
     state.slash_selected = 0;
     state.force_scroll_bottom = true;
-    state.paste_store.clear();
 }
 
 /// Recall previous (↑) or next (↓) user input from `input_history`.
