@@ -6,11 +6,35 @@
 //! (user turns and finalized assistant/tool output) are emitted as plain text
 //! to the scrollback so the user can use their terminal's native scrolling.
 
-use crate::tui::state::{AppState, ChatMessage, MessageRole, MessageState, ScreenMode};
+use crate::tui::state::{
+    AppState, ChatMessage, MessageRole, MessageState, ScreenMode, TOOL_ARGS_MAX_CHARS,
+};
+use crate::tui::tool_card::{parse_tool_card, truncate_chars};
 use std::io;
 
 /// Height of the inline live viewport in terminal rows.
 pub(crate) const INLINE_HEIGHT: u16 = 6;
+
+/// Render a tool card as plain scrollback text (inline mode has no styling).
+fn tool_card_to_scrollback(content: &str) -> String {
+    let (state, name, arguments, result) = parse_tool_card(content);
+    let mut out = format!("\n▸ {name} · {state}\n");
+    if let Some(args) = arguments {
+        out.push_str(&format!(
+            "│ args: {}\n",
+            truncate_chars(&args, TOOL_ARGS_MAX_CHARS)
+        ));
+    }
+    if let Some(res) = result {
+        for line in res.lines().take(20) {
+            out.push_str(&format!("│ {line}\n"));
+        }
+        if res.lines().count() > 20 {
+            out.push_str("│ …\n");
+        }
+    }
+    out
+}
 
 /// Render a finalized message as plain scrollback text.
 fn message_to_scrollback(msg: &ChatMessage) -> String {
@@ -23,7 +47,7 @@ fn message_to_scrollback(msg: &ChatMessage) -> String {
                 format!("\n{}\n", msg.content.trim())
             }
         }
-        MessageRole::Tool => format!("\n{}\n", msg.content.trim()),
+        MessageRole::Tool => tool_card_to_scrollback(&msg.content),
         MessageRole::System => format!("\n[system] {}\n", msg.content.trim()),
         MessageRole::Question => format!("\n[question] {}\n", msg.content.trim()),
     }
@@ -146,5 +170,31 @@ mod tests {
         let text = String::from_utf8(captured).unwrap();
         assert!(!text.contains("first"));
         assert!(text.contains("second"));
+    }
+
+    #[test]
+    fn tool_message_emits_formatted_card_not_json() {
+        let (mut state, mut captured) = state_with_messages(ScreenMode::Inline);
+        state.messages.push(ChatMessage::new(
+            MessageRole::Tool,
+            crate::tui::tool_card::tool_card_json(
+                "done",
+                "exec",
+                Some("{\"cmd\":\"ls\"}"),
+                Some("file1\nfile2"),
+            ),
+        ));
+        emit_finalized_messages(&mut state, |bytes| {
+            captured.extend_from_slice(&bytes);
+            Ok(())
+        })
+        .unwrap();
+        let text = String::from_utf8(captured).unwrap();
+        assert!(
+            text.contains("▸ exec · done"),
+            "card header missing: {text}"
+        );
+        assert!(text.contains("file1"), "result body missing: {text}");
+        assert!(!text.contains("\"state\""), "raw JSON leaked: {text}");
     }
 }
