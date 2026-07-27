@@ -373,8 +373,10 @@ fn cmd_status(state: &mut AppState, _args: &str) -> CommandResult {
     state.push_message(
         MessageRole::System,
         format!(
-            "status: {}\nsession: {peer} (resume with `legion --session {peer}`)",
-            state.status
+            "status: {}\nsession: {peer} (resume with `legion --session {peer}`)\ntheme: {} · viewport: {}",
+            state.status,
+            state.theme_name,
+            state.screen_mode.name()
         ),
     );
     CommandResult::Handled

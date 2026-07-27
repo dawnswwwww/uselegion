@@ -21,7 +21,7 @@
 |---|---|---|---|
 | **产品定位** | 单用户终端 AI 编码 agent，强调沉浸式 TUI | 多通道 AI agent gateway，强调通道/自动化/多 agent 编排 | 定位不同，但 Legion 的 CLI 面明显更薄 |
 | **交互深度** | 全屏 TUI、40+ 斜杠命令、Dashboard、主题、语音 | TUI 基础（`legion-cli/src/tui.rs`）、斜杠命令有限 | Legion CLI 远未达到 Grok 的终端体验深度 |
-| **Agent 内核** | AgentBuilder、compaction 预触发、goal 编排、plan mode、scheduler、turn-end gating | Agent loop、compaction、subagent/coordinator/swarm、prompt management | Legion 内核基本具备，但缺少 goal/plan/scheduler 等高级控制 |
+| **Agent 内核** | AgentBuilder、compaction 预触发、goal 编排、plan mode、scheduler、turn-end gating | Agent loop、compaction、subagent/coordinator/swarm、prompt management、goal turns + goal 工具、scheduler 工具 | Legion 内核基本具备；plan mode 与完整 goal 编排（planner/strategist 等）仍缺 |
 | **工具丰富度** | 文件/终端/搜索/web/LSP/子 agent/调度/图片视频生成/监控 | 文件/终端/web/子 agent/coordinator/图片/TTS/浏览器/session 工具 | 互有覆盖；Grok 在 LSP、scheduler、视频生成上领先；Legion 在多 agent 编排、浏览器、通道原生工具上领先 |
 | **Workspace/VCS** | 深度集成：worktree、checkpoint、rewind、hunk tracker、folder trust、`.envrc` | 仅有 `exec` sandbox 和基础工作目录 | Legion 几乎无 VCS 工程化能力 |
 | **MCP** | rmcp、OAuth、streamable HTTP、liveness、credentials store | 四种传输、metrics、session 过期重连、adapter | Grok 在 OAuth/credential 管理上更完整 |
@@ -95,10 +95,12 @@
 #### Gap
 
 - **TUI 深度差距巨大**：Legion 没有 fullscreen/inline/minimal 三种模式、没有 block viewer、没有 file search/project picker、没有 dashboard。
-- **斜杠命令生态薄弱**：Grok 的 40+ 命令覆盖 session、model、context、plan、tools、plugins、settings、help、media；Legion 缺少 `/compact`、`/fork`、`/rewind`、`/context`、`/plan`、`/tasks`、`/queue`、`/skills`、`/mcps`、`/theme`、`/voice`、`/imagine` 等。
+- **斜杠命令生态薄弱**：Grok 的 40+ 命令覆盖 session、model、context、plan、tools、plugins、settings、help、media；Legion 缺少 `/compact`、`/fork`、`/rewind`、`/context`、`/plan`、`/tasks`、`/queue`、`/skills`、`/mcps`、`/voice`、`/imagine` 等。
 - **无语音输入**：Legion 有 TTS（`TtsTool`）但无 STT/语音交互。
 - **无媒体生成 UI**：Legion 的 `image_generate` 是 tool，没有 `/imagine` 这样的 TUI 快捷入口；无视频生成。
-- **主题/可访问性**：Legion TUI 无主题系统、OSC 颜色探测、cursor styling。
+- **主题/可访问性**：Legion TUI 已有主题系统（`/theme` + `[tui]` 配置持久化），但主题仅限 dark/light（无用户自定义主题），缺少 OSC 颜色探测（终端主题自动检测）与 cursor styling。
+- **Gateway 模式取消不受支持**：Esc 取消仅 local 模式可用；`agent.cancel` RPC 尚未实现，gateway 模式下 WsDriver 返回明确错误提示（需跨 crate 协议变更）。
+- **Setup 向导未共享 TUI 主题**：`setup.rs` 是独立的行式 UI（非 ratatui），不随 TUI 主题变化，统一主题化是独立工程。
 
 ---
 
@@ -131,10 +133,11 @@
 | Prompt management | `SystemPromptBuilder` section 化、override 优先级链、`--dump-prompts`、`legion context` | `legion-host/src/` |
 | Task Flow DAG | 声明式 `flows` + `FlowRunner` | `legion-automation/src/flow.rs` |
 | Standing Orders / Inferred Commitments | cacheable prompt section、轻量 LLM 抽取 commitment | `legion-automation/src/` |
+| Goal mode | `GoalGate` turn-end 自动续轮（goal turns，无 turn 上限）、`get_goal`/`create_goal`/`update_goal` 工具、`/goal` 立即开跑、`[goals]` 配置 | `legion-runtime/src/{goal.rs,goal_gate.rs}`、`legion-host/src/goal_tools.rs` |
 
 #### Gap
 
-- **Goal 编排缺失**：Legion 没有 goal planner/strategist/classifier/orchestrator 这一层；任务流是声明式 DAG，而非 agent 自我规划的 goal loop。
+- **Goal 编排层仍缺**：goal turns + model-facing 工具已落地（2026-07-17，`GoalGate` + goal tools）；仍缺 planner/strategist/classifier/orchestrator 这一 agent 自我规划层，任务流仍是声明式 DAG。
 - **Plan mode 缺失**：Legion 有 Task Flow，但缺少面向用户的 plan mode（`enter_plan_mode`/`exit_plan_mode` tools + plan approval view）。
 - **Scheduler 缺失**：Legion 的 cron 调度在 `legion-automation` 中，但缺少 agent 可调用 的 `scheduler_create/delete/list` tools 以及 `/loop` 斜杠命令。
 - **Compaction 深度不足**：Grok 有双阶段 compaction + prefire；Legion compaction 相对简单（参见 `docs/design/gaps/03-shallow/compaction.md`）。
@@ -352,7 +355,6 @@
 
 - **托管配置与企业管控**：Legion 缺少 `/etc/` 级 managed config、requirements.toml、MDM 集成。
 - **Setup 命令**：Legion 没有 `legion setup` 来拉取组织级配置。
-- **主题/UI 配置**：Legion 配置无 TUI 主题、screen mode 等 UI 相关段。
 - **Telemetry 配置**：Legion 没有 Mixpanel/Sentry/OTLP 等产品遥测配置段。
 
 ---

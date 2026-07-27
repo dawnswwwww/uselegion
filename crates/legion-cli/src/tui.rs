@@ -2767,4 +2767,22 @@ mod tests {
         assert!(!text.contains("copied"));
         assert!(text.contains("local"));
     }
+
+    #[test]
+    fn status_command_reports_theme_and_viewport() {
+        let mut state = AppState {
+            status: "local".to_string(),
+            session_peer: "peer123".to_string(),
+            theme_name: "light".to_string(),
+            ..AppState::default()
+        };
+        let result = crate::slash_commands::dispatch(&mut state, "/status");
+        assert!(matches!(
+            result,
+            crate::slash_commands::CommandResult::Handled
+        ));
+        let last = state.messages().last().expect("status message");
+        assert!(last.content.contains("theme: light"));
+        assert!(last.content.contains("viewport: fullscreen"));
+    }
 }

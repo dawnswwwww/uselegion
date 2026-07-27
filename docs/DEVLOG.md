@@ -43,7 +43,7 @@
 
 ## Gap 实施进度速览
 
-> 共 **14 个 gap**(详见 `docs/design/gaps/00-overview.md` 优先级矩阵)。按优先级(P0→P1→P2)排序。
+> 共 **15 个 gap**(详见 `docs/design/gaps/00-overview.md` 优先级矩阵)。按优先级(P0→P1→P2)排序。
 
 | Gap | 类目 | 优先级 | 状态 | 当前阶段 | 最近更新 |
 |---|---|---|---|---|---|
@@ -61,12 +61,315 @@
 | [providers](design/gaps/04-breadth/providers.md) | breadth | P2 | ✅ 已完成 | Phase A(retry/限流/timeout/成本)+ B(Gemini/Ollama)+ C(cache 接线 + Bedrock SigV4);Phase D Azure/国内暂不承诺 | 2026-07-11 |
 | [tools-p1p2](design/gaps/04-breadth/tools-p1p2.md) | breadth | P2 | ✅ 已完成 | Phase A(session_*)+ B(a2a_send/image_generate)+ C(browser 轻量 CDP/tts)已落地;Phase D canvas/video/nodes_* 暂不承诺 | 2026-07-11 |
 | [automation-advanced](design/gaps/04-breadth/automation-advanced.md) | breadth | P2 | ✅ 已完成 | Phase A(Standing Orders)+ B(Inferred Commitments)+ C(Task Flow DAG + cron webhook)已落地;Phase D 条件分支/revision 暂不承诺 | 2026-07-11 |
+| [session-loop](design/gaps/03-shallow/session-loop.md) | shallow | P2 | ✅ Phase A 已实施 | LocalDriver 内嵌 CronScheduler + session store;TUI local `/loop` 可用 | 2026-07-16 |
 
-**进度统计**:⬜ 0 未开始 · 🚧 0 进行中 · ✅ 14 已完成 · ⏸️ 0 阻塞
+**进度统计**:⬜ 0 未开始 · 🚧 0 进行中 · ✅ 15 已完成 · ⏸️ 0 阻塞
 
 ---
 
 ## 开发日志(最新在上)
+
+### 2026-07-25 · TUI 交互与视觉大修:主题持久化、取消/队列、指示器、OSC 8 与渲染修复
+- **type**: feature
+- **gap**: [grok-cli-comparison](design/gaps/05-grok-cli-comparison.md)(TUI 与交互部分)
+- **目标**:对照 Grok CLI 的 TUI 差距做一轮交互与视觉大修:`/theme` 主题系统与持久化、运行中取消/消息队列/多行输入、spinner 与滚动/队列指示器,以及 OSC 8 超链接、代码块背景、paste 占位符等渲染修复;`/status` 同步展示 UI 状态。
+- **改动**(分支 `feature/tui-interaction-visual`,`crates/legion-cli/`):
+  - 主题系统:`/theme dark|light` 切换主题,`[tui]` 配置段(theme/screen mode)持久化,`AppState.theme_name` 记录当前主题名。
+  - 交互:运行中 Esc 取消(local;gateway 模式 WsDriver 返回明确错误,`agent.cancel` RPC 留后续)、运行中输入进入队列并在 run 结束后自动发送、多行输入(newline)。
+  - 视觉:spinner 与 chat frame 滚动/队列指示器、status bar 通知。
+  - 渲染修复:OSC 8 超链接按显示宽度测量与换行(escape 序列作为零宽原子单元)、代码块按视口宽度填充统一背景、history 召回的 paste 占位符仍可展开(paste_store 不随提交清空)、inline 模式 tool card 渲染为纯文本而非原始 JSON。
+  - `/status` 新增 `theme: <name> · viewport: <mode>` 行,展示当前主题与视口模式。
+  - 文档:`docs/design/gaps/05-grok-cli-comparison.md` 刷新已过时的 TUI 差距声明(主题系统、`/theme`、TUI 配置段已落地),剩余差距改为 gateway 模式取消、setup 向导主题化、主题仅限 dark/light、无终端主题检测。
+- **决策**:
+  - gateway 模式取消需要跨 crate 协议变更(`agent.cancel` RPC),本轮不做,WsDriver 返回清晰错误提示。
+  - `paste_store` 故意不随 commit 清空:history 条目内含 paste 占位符,召回后必须仍能展开;占位符 id 每 session 唯一,不会交叉展开。
+- **验证**:`cargo test -p legion-cli`、`cargo clippy -p legion-cli --all-targets` 零告警、`cargo fmt` 通过。
+- **遗留**:
+  - gateway 模式取消(`agent.cancel` RPC)。
+  - setup 向导与 TUI 主题统一(`setup.rs` 为独立行式 UI)。
+  - 主题仅 dark/light,无用户自定义主题与 OSC 终端主题检测;render 延迟(EventStream + tokio::select!)与 composer 鼠标定位未动。
+
+### 2026-07-23 · 代码健康与复用优化:13 项架构/代码层重构(P1–P13)
+- **type**: refactor
+- **gap**: —(配套计划文档:[code-health-plan](design/code-health-plan.md))
+- **目标**:落实 2026-07-23 全库只读分析(4 路并行)发现的架构与代码层优化/复用机会,共 13 项,全部完成。
+- **改动**(按 P 编号,详见 code-health-plan.md):
+  - P1 `legion-tools/src/tools.rs`(3148 行)→ `tools/` 目录 5 域拆分(fs/exec/web/memory/orchestration),tools.rs 变为 mod 根 + re-export,调用方零改动。
+  - P2 `legion-provider`:新增 `http.rs`(check_status/sse_stream/json_client/post_json/is_prompt_too_long 并集/with_idle_timeout);`types.rs` 加 ToolCallAccumulator/apply_extra_to/merged_system_text 等;router chat/embed/one-shot 骨架泛型化;gemini JSON 解析错误统一为 JsonParse;**行为修复**:router timeout 原本只包到 stream 建立,现加 per-chunk idle timeout。
+  - P3 `legion-channel`:新增 `util.rs`(Lifecycle 基座 + StopPolicy/cfg_str/send_json/lark_envelope/slack_envelope/reconnect_delay),五家 provider 骨架收敛,telegram await vs 其余 abort 差异保留为策略;WS read 循环评估后不抽(discord heartbeat 差异大)。
+  - P4 `legion-core/src/fs.rs`(新):expand_tilde/legion_home/atomic_write/atomic_write_async,迁移 6 处原子写 + 3 份 expand_tilde(统一到 dirs::home_dir)+ HOME 散落点;`legion-runtime/src/llm.rs`(新):chat_text_with_timeout/extract_json_array,收敛 4 份"LLM+timeout+抠 JSON"模板。
+  - P5 `legion-provider/src/model_ref.rs`:`resolve_agent_model` + `DEFAULT_MODEL`,6 份逐字复制收敛(host/gateway/automation×3/runtime)。
+  - P6 依赖 workspace 继承:async-trait(13 处)、chrono、dirs、tokio-tungstenite、tokio-test 入根或继承;reqwest 用 crate 级 features 追加(不污染全 workspace TLS)。
+  - P7 **channel 入站接入 host 管线**:`route_inbound_to_runtime` 从 legion-channel 上移到 `legion-host/src/channel_inbound.rs`(避免 channel→host 循环依赖),改走 prepare_run + drive_run_stream——频道会话(Telegram/Slack/Discord/Lark/Matrix/webchat)从此有历史、转录落盘、模型按 config 解析(原硬编码 openai/gpt-4o);`AgentParams` 加可选 `sender` 字段。
+  - P8 协议对齐:`Features::default()` 11→27 个 method + 分发表同步测试;sessions.history 提取为 `legion-host::turn::load_session_history`(gateway/cli 共用);CLI 握手改用类型化 WsFrame::Connect/HelloPayload;iso_now/next_id 收敛 `legion-core/src/util.rs`;**顺带修复** turn.rs "run-run-N" 双重前缀笔误。
+  - P9 session key 单一事实源:`legion-plugin-sdk/src/session_key.rs`(因 PeerKind 在 plugin-sdk,所有消费方本已依赖);**修复潜伏 bug**:flow(5 段)/a2a(4 段)非法 key → 合法 7 段(此前这些会话无法被 sessions.history/goal store 访问);a2a 硬编码模型 → resolve_agent_model;cron.rs 原子写迁移。
+  - P10 `legion-core/src/jsonrpc.rs`(新):next_id/build_request/build_notification/parse_result;MCP list_tools/call_tool 下沉 trait 默认方法 + request 原语统一;LSP 收敛;ACP 评估后不收敛(类型化泛型 DTO 形状不同)。
+  - P11 `run_loop`(618 行/20 参数)→ `legion-runtime/src/run_loop.rs`:RunContext + prepare_turn/run_iteration/finish_run;build_context_engine 重复 builder 链合并;agent_loop.rs 生产代码降至 ~254 行。
+  - P12 `gateway_manager.rs`(生产 ~1444 行)→ `gateway_manager/{installer,ops}.rs`;CurrentPointer 三重字面量收敛为 switched/restored 构造器;补 13 个测试(签名校验/指针构造/回滚路径,均为真实路径)。
+  - P13 `legion-core::util::lock_recover`:gateway/cli 生产 53 处 `lock().unwrap()` 全改恢复式加锁(消除 Mutex 中毒级联 panic);clippy await_holding_lock 零告警(无跨 await 持锁,不换 tokio::Mutex)。
+  - 另:legion-host dev-dep 补 tokio test-util(修复单 crate check 失败)。
+- **决策**:
+  - 纯重构原则:除明确列出的行为修复点(P2 idle timeout、P7 频道有状态化、P8 run-run-N、P9 非法 key/模型、P13 中毒恢复)外不改可观察行为。
+  - helper 一律放调用方都能依赖的最底层 crate(fs/jsonrpc/util → legion-core;session_key → plugin-sdk;resolve_agent_model → provider;chat_text_with_timeout → runtime)。
+  - 保持各家 provider/channel 边界差异(anthropic 空 content 跳过、telegram await 退出、slack/lark 业务信封),抽小 helper 不做大一统 IR。
+- **验证**:每项由子任务独立完成 check/test/clippy/fmt;最终门禁(2026-07-23)`cargo build --workspace --all-targets` ✅、`cargo clippy --workspace --all-targets` ✅ 零告警、`cargo fmt -- --check` ✅、`cargo test --workspace --all-targets` ✅(38 个测试目标,1331 passed / 0 failed / 4 ignored——ignored 为需 MINIMAX_API_KEY 的 e2e)。
+- **遗留**:
+  - plan-mode 持久化目录(`~/.legion/sessions`)与 agents/ 布局分裂,涉及磁盘数据迁移,未动。
+  - channel 长消息拆分(Telegram 4096/Discord 2000)与出站重试为功能缺口,非重复,另行立项。
+  - tracing-subscriber ×2、cron ×2 两组依赖未入 workspace.dependencies。
+  - ws_rpc 蛇形字段名(peer_id 等)改 camelCase 会破坏线上协议,须走协议 revision。
+  - flow id/step name 含 `:` 或空白时仍得不到持久化(config 标识符,实践中安全)。
+
+### 2026-07-17 · Goal mode:model-facing goal 工具 + GoalGate 自动续轮 + /goal 立即开跑
+- **type**: feature
+- **gap**: [grok-cli-comparison](design/gaps/05-grok-cli-comparison.md)(Goal 编排的 goal turns/工具部分)
+- **目标**:把 `/goal` 从"纯本地状态"升级为完整 goal mode:设置 goal 后 agent 立即开跑;turn 结束时 goal 仍 active 则自动续轮(goal turns);模型通过 model-facing 工具自行收尾(complete/blocked/paused)。
+- **改动**:
+  - `crates/legion-runtime/src/goal.rs`(自 legion-cli 迁入):`Goal`/`GoalStatus`/`GoalStore`/`parse_goal`/`apply_action`。
+  - `crates/legion-runtime/src/goal_gate.rs`(新建):turn-end gate——goal active 时注入 system reminder 续跑;无 turn 上限,goal 本身是 limiter;disabled 恒 Pass。
+  - `crates/legion-runtime/src/agent_loop.rs`/`context_engine.rs`:`run_loop` 接入 GoalGate(TodoGate 通过之后,仅 `depth == 0`,subagent/Fork 不受影响);goal active 时取消 per-run 迭代上限(含 mid-run 经 `create_goal` 自建 goal 的动态取消);goal 上下文行改为 runtime 侧按 run 注入(内存态,不落 transcript);新增 `with_goal_store` 供测试隔离。
+  - `crates/legion-core/src/config.rs`:新增 `[goals]` 配置(`enabled` 默认 true)。
+  - `crates/legion-host/src/goal_tools.rs`(新建):`get_goal`/`create_goal`/`update_goal` 三个 model-facing 工具,goal 文件由 `ctx.session_id` 派生,cross-agent 拒绝;`assembly.rs` 在 `goals.enabled` 时统一注册(local/gateway/ACP 共用),默认 `Approval::Off`。
+  - `crates/legion-cli`:`goal.rs` 改为 re-export shim;`/goal start|resume` 真正激活 goal 时返回 `CommandResult::SendToAgent` 立即开跑("already exists"/"already active" 等错误回复不触发);删除 TUI 侧上下文注入(已下沉 runtime);run 结束/出错时异步 reload goal 保持状态栏与 `/goal` 显示一致。
+- **决策**:
+  - 续轮挂在 `run_loop` 内(GoalGate,与 TodoGate 同层)而非 driver 链式 run:单一 hook 覆盖 local/gateway/channel/cron 全部 transport,approval/compaction/transcript 管线零改动。
+  - **不设 turn 预算**(用户决策):加限制与"用 goal 让 agent 干到完成为止"的初衷背离;goal 本身是 limiter,失控防护依赖操作员 `/goal pause|clear` 与模型 `update_goal` 收尾。OpenClaw spec 的 token 预算未实现。
+  - 操作员停止(`/goal pause|clear`)通过落盘 + gate 每次 check 重读生效——无 CancellationToken 前提下的最小机制。
+  - goal 工具只写本 session 的 goal 文件,默认 `Approval::Off`(同 todo_write 理据);`update_goal` 多字段更新采用 all-or-nothing,任一 action 失败不落盘。
+- **验证**:
+  - `cargo test -p legion-runtime` 通过(含 2 个 run_loop 级 goal gate 集成测试:续轮直至 complete、goal pursuit 越过 10 次迭代上限直至完成)
+  - `cargo test -p legion-host` 通过(goal 工具 10 个新测试)
+  - `cargo test -p legion-cli` 全绿(kickoff dispatch 测试 4 个)
+  - `cargo build/clippy/test/fmt --workspace --all-targets` 通过
+- **遗留**:
+  - 未实现任何维度预算(turn/token/时间);如日后需要,OpenClaw spec 的 `budget_limited`/`usage_limited` 状态与 `GoalStatus` 枚举已预留。
+  - goal run 进行中用户再发消息会产生并行 run(既有行为,非本次引入)。
+  - 未做 GoalOrchestrator(planner/strategist/classifier,仍为 P2 方向)。
+
+### 2026-07-16 · 修复 `/loop` 停止条件不生效（cron 时区 + scheduler_create 不支持一次性任务）
+- **type**: fix
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**: 修复 `/loop` 带"持续 20 分钟"等停止条件时,清理任务迟迟不触发、循环无法自动停止的问题。
+- **根因**:
+  1. `CronJob::compute_next_run` 用 UTC 解析 cron 字段。模型按本地时间写 `53 18 16 7 *` 想 18:53 触发,实际被算成 `18:53 UTC` (= 本地次日 02:53),清理任务晚 8 小时。
+  2. `/loop` 系统指令让模型建一次性 `__at__` 任务,但 `scheduler_create` 工具只接受 cron 表达式,导致模型只能用"每年 7 月 16 日 18:53"这种 cron 凑,并在日志里出现 `date -d`、`python` 算时间戳的弯路。
+- **改动**:
+  - `crates/legion-automation/src/cron.rs`:
+    - `compute_next_run` 将 cron 字段按**本地时间**解析,再转回 UTC 存储;符合标准 cron 语义和 `/loop` 指令中的"local time"约定;
+    - 新增回归测试 `cron_fields_are_interpreted_in_local_time`。
+  - `crates/legion-tools/src/scheduler.rs`:
+    - `SchedulerCreateTool` 新增可选 `at` 参数(本地 `YYYY-MM-DD HH:MM:SS` 或 RFC3339),创建 `schedule="__at__"` 的一次性任务;
+    - `cron` 改为可选(与 `at` 二选一);
+    - 更新工具描述和 JSON schema;
+    - 新增测试 `create_one_shot_job_with_at`、`create_requires_cron_or_at`。
+  - `crates/legion-cli/src/slash_commands.rs`:
+    - `LOOP_SCHEDULING_INSTRUCTION` 明确 cron 按本地时间解析,并要求用 `at` 参数创建一次性清理任务。
+- **决策**:
+  - 同时修两个根因:单纯改时区只能让"每年一次"的 cron 凑法生效,仍不优雅;支持 `at` 后模型可以直接建一次性任务,语义正确且任务执行后会被 `tick()` 自动删除。
+- **验证**:
+  - `cargo check -p legion-automation -p legion-tools -p legion-cli --all-targets` 通过。
+  - 相关单元测试通过(legion-automation cron 27、legion-tools scheduler 6、legion-cli slash_commands 17)。
+  - `cargo fmt`、`cargo clippy -p legion-automation -p legion-tools -p legion-cli --all-targets -- -D warnings` 通过。
+  - `cargo install --path crates/legion-cli --force && cargo install --path crates/legion-gateway --force` 完成。
+- **遗留 / 用户操作**:
+  - 当前正在运行的 TUI 进程仍使用旧代码和旧的 in-memory job map;外部改文件无法让它停掉。
+  - 要立即停止现在的日记循环,在 TUI 里说"停止刚才的日记循环"/"删除 cron-1784198048664802000-1",模型会调 `scheduler_delete`,共享 map 会立即生效。
+  - 或者重启 TUI:新二进制会让本地时区的一次性清理任务准时触发。
+
+### 2026-07-16 · gateway automation 挪到 bind 成功之后启动
+- **type**: fix
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**: 修复重复启动的 gateway 进程在 bind 失败前就已经跑起 cron/heartbeat/task runner,导致 cron job 被多个短命进程重复触发、`tasks.jsonl` 残留 "running" 僵尸任务的问题。
+- **根因**: `Gateway::new()` 内直接调用 `start_automation()`(旧 `gateway.rs:153-155`),而 bind 发生在之后的 `start()`/`start_bound()`。launchd `com.legion.gateway`(KeepAlive)与手动 gateway 并存时,每次重试进程都会初始化插件、启动 automation、bind 失败退出——`gateway.log` 累计 2 万余条 `Address already in use`,每条对应一次短暂 cron_loop,`tasks.jsonl` 出现多条并发 "running" 记录,串行 tick 又被分钟级长任务阻塞,表现为"老 job 迟迟不触发"。
+- **改动**:
+  - `crates/legion-gateway/src/gateway.rs`:
+    - `Gateway` 新增 `cron_store` 字段保存 host 传入的 cron store;
+    - `Gateway::new()` 不再启动 automation,相关字段初始化为空;
+    - 新增幂等方法 `Gateway::start_automation()`,在 `start()`/`start_bound()` bind 成功后调用;
+    - `start_bound()` 改为 `mut self`。
+  - `crates/legion-gateway/tests/ws_tests.rs`、`webhook_tests.rs`:直接 serve `router()` 的测试显式调用 `gateway.start_automation()`。
+  - 新增 `crates/legion-gateway/tests/automation_start_order.rs`:回归测试 `failed_bind_does_not_start_automation`,占用端口后断言 `start_bound()` 失败且不创建 `tasks.jsonl`。
+- **决策**:
+  - 只挪 automation,不挪 channel providers/MCP:它们不产生调度副作用,改动面最小。
+  - `start_automation()` 保持幂等,便于测试与 `router()` 直出场景显式调用。
+- **验证**:
+  - `cargo check -p legion-gateway --all-targets` 通过。
+  - `cargo test -p legion-gateway` 全套件通过(含 ws_tests 18、webhook_tests 3、新回归测试 1)。
+  - `cargo clippy -p legion-gateway --all-targets -- -D warnings` 通过。
+- **遗留**:
+  - 运行中的旧 gateway(pid 99834)与 launchd `com.legion.gateway` 的端口冲突仍需用户二选一收尾(bootout launchd 或 kill 手动进程);修复后即使冲突存在,重试进程也只会 bind 失败退出,不再污染调度状态。
+  - 串行 `cron_loop` 被分钟级长任务阻塞的问题未处理,建议后续并发执行或 per-job 超时。
+
+### 2026-07-16 · 修复 session cron 与 scheduler 工具 store 隔离导致 `/loop` 不触发
+- **type**: fix
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**: 修复 local TUI 中 `/loop` 创建的 cron job 只写入 session JSONL 但从不执行的问题。
+- **根因**: `JsonlCronJobStore` 每次 `open` 都构建独立的 in-memory `HashMap`。local TUI 同时存在两个实例(host/tool registry 一个,`LocalDriver` 内嵌 `CronScheduler` 一个),`scheduler_create` 只把新 job 写进自己的 map + 落盘;scheduler 的 map 不感知,`tick` 的 `list()` 永远看不到后续创建的 job,导致只执行了 `/loop` 触发时模型立即写的第一篇,后续到点不触发。
+- **改动**:
+  - `crates/legion-automation/src/cron.rs`:
+    - `JsonlCronJobStore` 的 `jobs` 改为 `SharedJobMap = Arc<Mutex<HashMap<String, CronJob>>>`;
+    - 新增全局 `STORE_CACHE`(按路径缓存 `Weak<SharedJobMap>`),`open` 时优先复用同一路径的 in-memory map,避免同一进程内多个实例各存各的状态;
+    - 增加 `JobMap` / `SharedJobMap` / `SharedJobMapWeak` / `PathSharedMap` 类型别名以通过 clippy `type_complexity`;
+    - 新增回归测试 `separate_handles_at_same_path_share_jobs`,确保两个同路径 handle 共享写入。
+- **决策**:
+  - 选择同路径共享 in-memory map,而不是让 scheduler 每次 tick 重新读盘或把 store 实例从 assembly 一路透传到 registry:改动面最小,且同时消除了 scheduler `update` 覆盖 `scheduler_create` 新 job 的竞态。
+  - 不使用文件 watch / mtime 触发重载:同进程共享 map 已经保证强一致,且不需要额外线程。
+- **验证**:
+  - `cargo check -p legion-automation -p legion-cli -p legion-tools -p legion-host` 通过。
+  - `cargo test -p legion-automation -p legion-cli --lib` 通过(59 + 211,含新回归测试)。
+  - `cargo fmt -- --check` 通过。
+  - `cargo clippy -p legion-automation -p legion-cli --all-targets -- -D warnings` 通过。
+  - `cargo install --path crates/legion-cli --force` 完成,替换 `/Users/ringconn/.cargo/bin/legion`。
+- **遗留**:
+  - 已运行中的 TUI 进程仍持有旧 store 实例,需要重启 TUI(或等进程重启)后该修复生效。
+  - cleanup job(`__at__` one-shot)若通过 `scheduler_delete` 先删 loop 再删自己,scheduler 后续的 remove 会报 NotFound 但仅 warn,行为可接受。
+
+### 2026-07-16 · `/loop` 改为模型驱动调度
+- **type**: refactor
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**: 把 `/loop` 从 CLI 直接解析/直接写 cron store 改成交给模型调用 `scheduler_create` 等工具,支持复杂停止条件并让模型知道 loop 存在。
+- **改动**:
+  - `crates/legion-cli/src/slash_commands.rs`:
+    - 删除 `CommandResult::ScheduleLoop` 变体;
+    - `/loop` 从 Local 调度改为返回 `SendToAgent`,附带系统级指令 `LOOP_SCHEDULING_INSTRUCTION`;
+    - 指令要求模型解析间隔、调用 `scheduler_create`、立即执行一次、并在有停止条件时安排清理任务。
+  - `crates/legion-cli/src/tui.rs`:
+    - 删除 `OutboundControl::ScheduleLoop` 及所有相关处理逻辑;
+    - `/loop` 现在和普通用户消息一样走 `run_turn`,由 agent runtime 驱动。
+- **决策**:
+  - 非交互式 `legion loop` 子命令保留原来的直接调度路径(无对话上下文,无法让模型处理)。
+  - TUI 内的 `/loop` 完全复用已有的 session-aware `scheduler_create`,不再维护一套独立的 cron 创建代码。
+- **验证**:
+  - `cargo check --workspace --all-targets`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test -p legion-cli --lib slash_commands`
+
+### 2026-07-16 · local session loop 继承 yolo 自动审批
+- **type**: fix
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**: 修复 local TUI 的 `/loop` 在 yolo 模式下仍因无人审批而超时/失败的 bug。
+- **改动**:
+  - `crates/legion-automation/src/cron.rs`:
+    - `CronScheduler` 新增 `approval_gate` 字段与 `with_approval_gate()`;
+    - `execute()` 中 cron run 标记 `interactive: false`,并在有 gate 时附加到 `RunRequest`。
+  - `crates/legion-cli/src/driver.rs`:
+    - `build_session_cron_scheduler()` 接收 `yolo` 参数;
+    - yolo 模式下为 session cron scheduler 构建一个自动通过的 `ApprovalGate`,使 `exec` 等 Prompt/Required 工具在无人值守时也能执行。
+- **决策**:
+  - 只有 local session 级 scheduler 继承 TUI 的 yolo 状态;gateway 全局 cron 保持默认无 gate,继续 fail-closed,符合 unattended 安全预期。
+- **验证**:
+  - `cargo check --workspace --all-targets`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test -p legion-cli --lib local_driver`
+- **遗留**: non-yolo 的 local `/loop` 仍会因为没有人在场而拒绝需要审批的工具;这是预期行为,可考虑后续让 cron 在启动前显式要求 `--yolo` 或单独配置。
+
+### 2026-07-16 · local TUI cron 事件转发 + session 级 scheduler + telemetry 默认启用
+- **type**: fix + feature
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md) / observability
+- **目标**: 修复 local TUI 中 `/loop` 与 `scheduler_create` 结果不显示、local 模式下 `scheduler_create` 写入全局 store、以及 `telemetry.enabled=true` 默认不生成日志目录的三个问题。
+- **改动**:
+  - `crates/legion-automation/src/cron.rs`:
+    - `CronEventSink` 增加 `run_id` 参数,`execute()` 将每次 `RunEvent` 连同 task id 一起转发给 sink。
+  - `crates/legion-cli/src/driver.rs`:
+    - `build_session_cron_scheduler()` 接收 `event_tx`,构造 sink 把 cron 运行事件序列化为 `{"type":"event","event":"agent",...}` 并注入 TUI 事件通道;
+    - 新增 `session_cron_store_path()` 计算 session 级 cron JSONL 路径;
+    - `build_local_host()` 支持传入可选的 cron store path。
+  - `crates/legion-cli/src/tui.rs` / `main.rs`:
+    - local / auto-fallback 模式使用 session 级 cron store 组装 host;
+    - `legion agent` one-shot 也按 session key 选择对应 store。
+  - `crates/legion-host/src/host.rs` / `assembly.rs`:
+    - 新增 `AgentHost::new_with_cron_store_path()`;
+    - `assemble_agent_host()` 接收可选 `cron_store_path`,将其传给 `CoreToolRegistry` 与 cron store;
+    - 当 `config.telemetry.enabled` 时初始化 `TelemetryClient` 并 `with_telemetry()` 接入 runtime,默认创建 `~/.legion/logs/`。
+  - `crates/legion-tools/src/registry.rs`:
+    - 新增 `new_with_*_cron_store_path` 系列构造函数;
+    - `scheduler_create` / `scheduler_delete` / `scheduler_list` 在传入 path 时使用该 path,否则回退默认全局 store。
+- **决策**:
+  - local 模式使用 session 级 store,使 `/loop` 与 `scheduler_create` 在同一 session 内互相可见,且不影响 gateway 全局 cron。
+  - cron 事件直接复用 `legion_host::run_event_to_payload` + `WsFrame::event("agent", ...)`,保证 TUI 渲染路径与 gateway WebSocket 完全一致。
+- **验证**:
+  - `cargo check --workspace --all-targets`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test --workspace --all-targets` (运行中)
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无依赖
+- **遗留**: 待确认 gateway 模式 `/loop` 是否也需要把事件回显到发起客户端;当前仅解决 local TUI 场景。
+
+### 2026-07-16 · `/loop` 支持自然语言时间解析(中文/英文)
+- **type**: feature
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**:让 `/loop` 命令能够理解自然语言表达的时间间隔,解决用户输入 `/loop每2分钟...` 被错误解析为默认 10 分钟的问题。
+- **改动**:
+  - `crates/legion-cli/src/loop_cmd.rs`:
+    - 新增 `regex` 依赖并用于解析自然语言;
+    - 新增 `extract_natural_language_interval`、`extract_chinese_interval`、`extract_english_interval`;
+    - 新增 `strip_duration` 函数,将 "持续10分钟" / "for 10 minutes" 等 duration 描述从 prompt 中剥离,避免被误当 interval;
+    - 新增 `parse_chinese_number` 支持阿拉伯数字 + 中文数字(一至九十九);
+    - 新增 `normalize_prompt` 折叠因移除 interval 子句产生的多余空格;
+    - 扩展 `parse_loop` 规则 3:支持 `每2分钟`、`每隔5分钟一次`、`每两小时`、`every 2 minutes` 等。
+    - 新增 7 个单元测试覆盖中文前缀/中缀/中文数字/小时单位/英文任意位置/duration 剥离。
+  - `crates/legion-cli/Cargo.toml`:新增 `regex = { workspace = true }`。
+- **决策**:
+  - 解析优先级:leading compact token > trailing English `every` > natural language (English/Chinese) > default 10m。
+  - Duration 短语("持续X分钟"/"for X minutes")只用于清理 prompt,不参与 interval 决策。
+  - 中文数字仅支持常见 1-99,满足分钟/小时/天场景。
+- **验证**:
+  - `cargo test -p legion-cli loop_cmd` 21 个测试全过
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+  - `cargo test --workspace --all-targets` 全量通过
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
+- **遗留**:极端中文数字(如一百、两百)未支持;未覆盖 "每隔两分半" 等分数单位。
+
+### 2026-07-16 · 实现 session-loop Phase A:local TUI `/loop` 不再强制依赖 gateway
+- **type**: feature
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**:让 TUI local(embedded) 模式下的 `/loop` 命令可用,由当前 TUI 进程管理会话级循环,与 gateway 管理的全局循环分层。
+- **改动**:
+  - `crates/legion-host/src/session.rs`:将 `SessionStore::session_path` 设为 `pub`,供 CLI 定位 session 目录。
+  - `crates/legion-automation/src/cron.rs`:
+    - `AddJobRequest` 新增 `id_prefix: Option<String>`;
+    - `CronScheduler::add` 按前缀生成 job id,用于区分 session loop(`session-cron-*`)与 global loop(`cron-*`);
+    - 新增单元测试 `add_with_id_prefix_uses_prefix`。
+  - `crates/legion-gateway/src/websocket.rs`:更新 `cron.add` RPC 的 `AddJobRequest` 构造,显式传 `id_prefix: None`。
+  - `crates/legion-cli/src/driver.rs`:
+    - `LocalDriver` 新增 `cron_scheduler: Option<Arc<CronScheduler>>`;
+    - `LocalDriver::new` 改为 `async`,在 session 目录下创建 `JsonlCronJobStore`(`<peer>.cron.jsonl`) 与 `JsonlTaskStore`(`<peer>.tasks.jsonl`),启动后台 `cron_loop`;
+    - `LocalDriver::schedule_loop` 从报错改为实际创建 session job;
+    - 新增辅助函数 `build_session_cron_scheduler`;
+    - 更新现有 4 个 `LocalDriver::new` 测试调用点至 `.await`;
+    - 新增集成测试 `local_driver_schedules_session_loop`,验证 session loop 创建、session store 写入、手动触发后 task store 生成 completed 记录。
+  - `crates/legion-cli/src/tui.rs`:两处 `LocalDriver::new(...)` 调用加 `.await?`。
+  - `EMBEDDED_NOTICE` 更新为 "channels inactive; session loops available"。
+- **决策**:
+  - 会话级 loop 与 gateway global loop 使用同一 `CronScheduler` / `CronJobStore` trait,仅 store 路径与进程宿主不同。
+  - session loop 的后续触发仍运行在独立的 cron session(`agent:<agent>:cron:cron:default:direct:<job_id>`),与现有 gateway cron 行为一致;TUI 首次触发仍走当前会话(由 TUI 在 schedule 成功后立即 `run_turn` 保证)。
+  - 未加 `automation.cron.enabled_for_local` 开关(Phase A),默认始终开启;Phase C 再考虑配置项。
+- **验证**:
+  - `cargo fmt -- --check` 通过
+  - `cargo clippy --workspace --all-targets -- -D warnings` 零警告
+  - `cargo test --workspace --all-targets` 全量通过
+  - `cargo tree -p legion-cli | rg 'legion-gateway'` 无输出
+- **遗留**:Phase B(`/loops` 列表、`/loop --stop`、错误提示优化)与 Phase C(`--global` 标志、配置开关)待后续。
+
+### 2026-07-16 · 产出 session-loop gap 设计文档
+- **type**: docs
+- **gap**: [session-loop](design/gaps/03-shallow/session-loop.md)
+- **目标**:将用户反馈的“local 模式 `/loop` 必须依赖 gateway”问题编码为可执行的 gap 设计方案,明确全局 loop(gateway)与会话 loop(local TUI)的分层架构。
+- **改动**:
+  - 新增 `docs/design/gaps/03-shallow/session-loop.md`(13.7 KB):按 gap 文档九节模板(元信息/现状证据/设计目标/架构设计/接口设计/集成点/风险与权衡/实现路线图/验收标准)完整记录方案。
+  - 更新 `docs/design/gaps/03-shallow/_index.md`:gap 数量 6→7,增加 session-loop 行、推荐阅读路径、依赖关系。
+  - 更新 `docs/design/gaps/00-overview.md`:gap 总数 14→15,优先级矩阵增加 session-loop(P2, S-M),依赖链增加 `automation-advanced → session-loop`,Phase C 路线图增加 session-loop。
+  - 更新 `docs/DEVLOG.md`:Gap 实施进度速览增加 session-loop(🚧 设计中),进度统计更新为 14 完成/1 进行中。
+- **决策**:
+  - 能力复用,生命周期分离:`CronScheduler` / `CronJobStore` trait 全部复用 `legion-automation`,不同作用域仅替换 store 路径与宿主进程。
+  - session-loop 使用 session 目录下的 `JsonlCronJobStore`,允许崩溃恢复,但不跨 TUI 实例自动激活。
+  - 任务 ID 加 `session-cron-` 前缀,避免与 global `cron-` 混淆。
+  - 默认行为不变:`legion loop` CLI 子命令与 TUI `--gateway` 模式仍走 gateway;仅 TUI local 模式新增 session-scope `/loop`。
+- **验证**:
+  - 新文档内 43 处文件/行号引用均基于当前源码(如 `driver.rs:421-424`、`cron.rs:247-259`)。
+  - `cargo fmt -- --check` 通过(文档为 Markdown,无需编译)。
+  - 交叉引用链接有效:`docs/design/gaps/03-shallow/session-loop.md` ↔ `_index.md` ↔ `00-overview.md` ↔ `DEVLOG.md`。
+- **遗留**:Phase A/B/C 实现待后续开发 session 启动。
 
 ### 2026-07-16 · Phase 5 完成：Tool taxonomy + LSP + 多媒体工具扩展
 - **type**: feature
@@ -1257,4 +1560,4 @@
 
 ---
 
-*最后更新:2026-07-13*
+*最后更新:2026-07-25*
