@@ -2566,4 +2566,34 @@ mod tests {
         );
         assert!(rx.try_recv().is_err(), "idle Esc must not send anything");
     }
+
+    #[test]
+    fn alt_enter_inserts_newline_instead_of_sending() {
+        let mut state = AppState::default();
+        state.composer.set_text("first line");
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::ALT),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err(), "Alt+Enter must not send");
+        assert_eq!(state.composer.join(), "first line\n");
+    }
+
+    #[test]
+    fn plain_enter_still_sends() {
+        let mut state = AppState::default();
+        state.composer.set_text("hello");
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().expect("plain Enter must send"),
+            state::OutboundControl::Message("hello".to_string())
+        );
+    }
 }

@@ -97,6 +97,11 @@ impl Composer {
         self.textarea.insert_str(text);
     }
 
+    /// Insert a newline at the cursor (Alt+Enter).
+    pub fn insert_newline(&mut self) {
+        self.textarea.insert_newline();
+    }
+
     /// Clear the textarea, resetting it to a single empty line.
     pub fn clear(&mut self) {
         self.textarea.select_all();

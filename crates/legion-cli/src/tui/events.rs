@@ -131,6 +131,12 @@ pub(crate) fn handle_key_event(
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.history_search = Some(HistorySearch::new());
         }
+        // Alt+Enter inserts a newline; plain Enter sends. (Shift+Enter is
+        // indistinguishable from Enter without the kitty keyboard protocol,
+        // which we do not enable.)
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            state.composer.insert_newline();
+        }
         KeyCode::Enter => {
             if let Some(cmd) = sugg.get(state.slash_selected).cloned() {
                 // The completion menu is open: Enter accepts the selection.
