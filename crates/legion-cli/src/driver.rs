@@ -86,6 +86,10 @@ pub trait TurnDriver: Send + Sync {
     /// Run one turn; events are injected into the TUI event channel as the
     /// exact same frame JSON the gateway WebSocket would deliver.
     async fn run_turn(&self, text: String) -> Result<(), CliError>;
+    /// Cancel the in-flight run, if any. Embedded mode aborts the drive
+    /// task and emits a synthetic lifecycle error frame so the TUI resets.
+    /// The gateway has no cancel RPC yet, so the WS driver returns an error.
+    async fn cancel(&self) -> Result<(), CliError>;
     /// Fetch session history, shaped like the `sessions.history` RPC
     /// response (`ok` + `payload.messages`).
     async fn history(&self, session_key: &str) -> Result<Value, CliError>;
@@ -159,6 +163,12 @@ impl TurnDriver for WsDriver {
             "params": params
         });
         self.client.send_json(&req).await
+    }
+
+    async fn cancel(&self) -> Result<(), CliError> {
+        Err(CliError::Other(
+            "cancel is not supported in gateway mode; the run continues on the gateway".to_string(),
+        ))
     }
 
     async fn history(&self, session_key: &str) -> Result<Value, CliError> {
@@ -312,6 +322,8 @@ pub struct LocalDriver {
     /// The question gate of the in-flight turn, if any. Same lifetime as
     /// `current_gate`: a new turn replaces it and stale resolves are misses.
     current_question_gate: Mutex<Option<Arc<QuestionGate>>>,
+    /// Drive task of the in-flight turn, aborted by `cancel`.
+    current_run: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Session-scope cron scheduler. Only present when the session key can be
     /// resolved to a valid on-disk path; it manages `/loop` jobs that live as
     /// long as this TUI process.
@@ -345,6 +357,7 @@ impl LocalDriver {
             workspace_override,
             current_gate: Mutex::new(None),
             current_question_gate: Mutex::new(None),
+            current_run: Mutex::new(None),
             cron_scheduler,
             cron_handle,
         })
@@ -389,8 +402,9 @@ impl TurnDriver for LocalDriver {
         .await?;
         let event_tx = self.event_tx.clone();
         // Drive the run in the background so the TUI stays responsive;
-        // events arrive on the same channel the WS reader would use.
-        tokio::spawn(async move {
+        // events arrive on the same channel the WS reader would use. The
+        // handle is stored so `cancel` can abort the turn.
+        let handle = tokio::spawn(async move {
             if let Err(err) = legion_host::drive_run_stream(
                 stream,
                 session_store,
@@ -408,6 +422,7 @@ impl TurnDriver for LocalDriver {
                 tracing::error!(error = %err, "failed to persist session transcript");
             }
         });
+        *lock_recover(&self.current_run) = Some(handle);
         Ok(())
     }
 
@@ -443,6 +458,28 @@ impl TurnDriver for LocalDriver {
         if let Some(gate) = gate {
             gate.resolve(prompt_id, output).await;
         }
+    }
+
+    async fn cancel(&self) -> Result<(), CliError> {
+        let handle = lock_recover(&self.current_run).take();
+        // Drop the gates so a late resolve cannot target a cancelled turn.
+        *lock_recover(&self.current_gate) = None;
+        *lock_recover(&self.current_question_gate) = None;
+        if let Some(handle) = handle {
+            handle.abort();
+            // Synthetic lifecycle frame: the TUI's existing error handler
+            // resets pending_request and marks the turn as failed.
+            let _ = self.event_tx.send(json!({
+                "type": "event",
+                "event": "agent",
+                "payload": {
+                    "stream": "lifecycle",
+                    "phase": "error",
+                    "error": "cancelled by user"
+                }
+            }));
+        }
+        Ok(())
     }
 
     async fn schedule_loop(&self, cron: &str, prompt: &str) -> Result<String, CliError> {

@@ -370,6 +370,18 @@ pub async fn run_tui(
                 state::OutboundControl::ResolveQuestion { prompt_id, output } => {
                     sender_driver.resolve_question(&prompt_id, output).await;
                 }
+                state::OutboundControl::Cancel => {
+                    if let Err(err) = sender_driver.cancel().await {
+                        let mut s = lock_recover(&sender_state);
+                        s.messages.push(state::ChatMessage::new(
+                            state::MessageRole::System,
+                            format!("{err}"),
+                        ));
+                        drop(s);
+                        let _ =
+                            wake_tx.send(json!({ "type": "internal", "event": "cancel-failed" }));
+                    }
+                }
             }
         }
     });
@@ -2453,5 +2465,37 @@ mod tests {
         let last = state.messages().last().expect("feedback message");
         assert!(last.content.contains("theme set to light"));
         assert!(!last.content.contains("saved"));
+    }
+
+    #[test]
+    fn esc_during_active_run_sends_cancel() {
+        let mut state = AppState {
+            pending_request: true, // run in flight, no first token yet
+            ..AppState::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Esc, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().expect("cancel must be sent"),
+            state::OutboundControl::Cancel
+        );
+        let last = state.messages().last().expect("feedback message");
+        assert!(last.content.contains("cancelling"));
+    }
+
+    #[test]
+    fn esc_when_idle_sends_nothing() {
+        let mut state = AppState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Esc, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err(), "idle Esc must not send anything");
     }
 }

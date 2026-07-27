@@ -95,6 +95,8 @@ impl ChatMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OutboundControl {
     Message(String),
+    /// Cancel the in-flight run (Esc while the agent is working).
+    Cancel,
     /// Run a shell command locally and display the output in the chat.
     ShellCommand(String),
     ResolveApproval {

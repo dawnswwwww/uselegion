@@ -233,6 +233,17 @@ pub(crate) fn handle_key_event(
         KeyCode::End if key.modifiers.contains(KeyModifiers::ALT) => {
             state.composer.move_cursor_bottom();
         }
+        // Esc cancels the in-flight run. When idle it does nothing, matching
+        // its previous behavior (tui-textarea ignores Esc).
+        KeyCode::Esc => {
+            if state.is_active() {
+                let _ = send_tx.send(OutboundControl::Cancel);
+                state.messages.push(ChatMessage::new(
+                    MessageRole::System,
+                    "cancelling run…".to_string(),
+                ));
+            }
+        }
         // All other keys are handled by the rich textarea editor.
         _ => {
             state.composer.input(key);
