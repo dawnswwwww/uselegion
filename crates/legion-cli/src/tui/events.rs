@@ -16,6 +16,54 @@ use serde_json::json;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+/// Send a user-typed message now, or queue it behind the in-flight run.
+/// Queued messages do not appear in the chat until they are actually sent,
+/// so streaming deltas always append to the last assistant message.
+fn send_user_message(
+    state: &mut AppState,
+    send_tx: &mpsc::UnboundedSender<OutboundControl>,
+    text: String,
+) {
+    if state.is_active() {
+        state.queued_messages.push_back((text, true));
+    } else {
+        state
+            .messages
+            .push(ChatMessage::new(MessageRole::User, text.clone()));
+        state.pending_request = true;
+        let _ = send_tx.send(OutboundControl::Message(text));
+    }
+}
+
+/// Send an agent-directed payload (slash-command/skill bodies): never
+/// rendered in the chat, but still serialized behind an in-flight run.
+fn send_agent_message(
+    state: &mut AppState,
+    send_tx: &mpsc::UnboundedSender<OutboundControl>,
+    message: String,
+) {
+    if state.is_active() {
+        state.queued_messages.push_back((message, false));
+    } else {
+        state.pending_request = true;
+        let _ = send_tx.send(OutboundControl::Message(message));
+    }
+}
+
+/// Pop the oldest queued message into the chat and send it. Called when a
+/// run lifecycle ends (normally, with an error, or cancelled).
+fn drain_queued_message(state: &mut AppState, send_tx: &mpsc::UnboundedSender<OutboundControl>) {
+    if let Some((text, show_in_chat)) = state.queued_messages.pop_front() {
+        if show_in_chat {
+            state
+                .messages
+                .push(ChatMessage::new(MessageRole::User, text.clone()));
+        }
+        state.pending_request = true;
+        let _ = send_tx.send(OutboundControl::Message(text));
+    }
+}
+
 pub(crate) fn handle_key_event(
     state: &mut AppState,
     key: event::KeyEvent,
@@ -93,8 +141,7 @@ pub(crate) fn handle_key_event(
                     match crate::slash_commands::dispatch(state, &text) {
                         CommandResult::Handled => {}
                         CommandResult::SendToAgent { message } => {
-                            state.pending_request = true;
-                            let _ = send_tx.send(OutboundControl::Message(message));
+                            send_agent_message(state, send_tx, message);
                         }
                         CommandResult::ScheduleLoop { .. } => {
                             state.messages.push(ChatMessage::new(
@@ -141,8 +188,7 @@ pub(crate) fn handle_key_event(
                             }
                             CommandResult::SendToAgent { message } => {
                                 crate::tui::input::commit_and_clear_input(state, &text);
-                                state.pending_request = true;
-                                let _ = send_tx.send(OutboundControl::Message(message));
+                                send_agent_message(state, send_tx, message);
                             }
                             CommandResult::ScheduleLoop { .. } => {
                                 state.messages.push(ChatMessage::new(
@@ -154,27 +200,17 @@ pub(crate) fn handle_key_event(
                             }
                             CommandResult::NotACommand => {
                                 // Fall through: treat as a normal message.
-                                state
-                                    .messages
-                                    .push(ChatMessage::new(MessageRole::User, text.clone()));
                                 crate::tui::input::commit_and_clear_input(state, &text);
-                                state.pending_request = true;
-                                let _ = send_tx.send(OutboundControl::Message(text));
+                                send_user_message(state, send_tx, text);
                             }
                         }
                     } else {
-                        state
-                            .messages
-                            .push(ChatMessage::new(MessageRole::User, text.clone()));
-                        // Do not add an empty assistant placeholder here. An
-                        // empty placeholder still renders to a couple of lines
-                        // (prefix + cursor) and, when the viewport is small,
-                        // can push the user's own message off-screen. The
-                        // assistant row is created lazily by handle_ws_event
-                        // when the first delta arrives.
+                        // Queued behind an in-flight run when necessary. No
+                        // empty assistant placeholder is added here either
+                        // way; the assistant row is created lazily by
+                        // handle_ws_event when the first delta arrives.
                         crate::tui::input::commit_and_clear_input(state, &text);
-                        state.pending_request = true;
-                        let _ = send_tx.send(OutboundControl::Message(text));
+                        send_user_message(state, send_tx, text);
                     }
                 }
             }
@@ -521,7 +557,11 @@ pub(crate) fn handle_mouse_event(state: &mut AppState, mouse: MouseEvent) {
     }
 }
 
-pub(crate) fn handle_ws_event(state: &mut AppState, msg: serde_json::Value) {
+pub(crate) fn handle_ws_event(
+    state: &mut AppState,
+    msg: serde_json::Value,
+    send_tx: &mpsc::UnboundedSender<OutboundControl>,
+) {
     match msg.get("type").and_then(|v| v.as_str()) {
         Some("event") if msg.get("event").and_then(|v| v.as_str()) == Some("question") => {
             let payload = msg.get("payload").cloned().unwrap_or(json!({}));
@@ -603,6 +643,7 @@ pub(crate) fn handle_ws_event(state: &mut AppState, msg: serde_json::Value) {
                                     last.state = MessageState::Done;
                                 }
                             }
+                            drain_queued_message(state, send_tx);
                         }
                         Some("error") => {
                             state.pending_request = false;
@@ -624,6 +665,7 @@ pub(crate) fn handle_ws_event(state: &mut AppState, msg: serde_json::Value) {
                                 msg.state = MessageState::Error;
                                 state.messages.push(msg);
                             }
+                            drain_queued_message(state, send_tx);
                         }
                         _ => {}
                     },

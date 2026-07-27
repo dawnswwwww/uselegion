@@ -152,6 +152,11 @@ pub struct AppState {
     /// arrives, without adding an empty assistant placeholder that would push
     /// the user's own message out of the viewport.
     pub(crate) pending_request: bool,
+    /// User messages typed while a run is active, sent (in order) when the
+    /// run finishes. The bool marks whether the text should appear in the
+    /// chat as a user message when it is finally sent (false for
+    /// agent-directed slash-command payloads).
+    pub(crate) queued_messages: std::collections::VecDeque<(String, bool)>,
     /// A tool-approval prompt awaiting the user's y/n answer:
     /// `(prompt_id, tool)`. While set, key input is intercepted by the
     /// approval handler instead of reaching the input box.

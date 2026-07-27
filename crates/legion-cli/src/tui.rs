@@ -518,7 +518,7 @@ async fn tui_loop(
                         .and_then(|v| v.as_str()),
                     Some("end") | Some("error")
                 );
-            events::handle_ws_event(&mut lock_recover(&state), msg);
+            events::handle_ws_event(&mut lock_recover(&state), msg, &send_tx);
             if run_finished {
                 let (goal_store, session_key) = {
                     let s = lock_recover(&state);
@@ -995,7 +995,8 @@ mod tests {
             "event": "agent",
             "payload": { "stream": "assistant", "delta": "hi" }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
         assert_eq!(state.messages[0].content, "hi");
         assert_eq!(state.messages[0].state, MessageState::Streaming);
     }
@@ -1014,7 +1015,8 @@ mod tests {
             "event": "agent",
             "payload": { "stream": "lifecycle", "phase": "end" }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
         assert_eq!(state.messages[0].state, MessageState::Done);
     }
 
@@ -1031,7 +1033,8 @@ mod tests {
             "event": "agent",
             "payload": { "stream": "lifecycle", "phase": "error", "error": "HTTP 422: nope" }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert!(!state.pending_request);
         assert_eq!(state.messages.len(), 2);
@@ -1059,7 +1062,8 @@ mod tests {
                 "tool_call": { "name": "exec", "arguments": r#"{"command":"ls"}"# }
             }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[0].state, MessageState::Done);
@@ -1098,7 +1102,8 @@ mod tests {
                 "result": result
             }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].state, MessageState::Done);
@@ -1125,7 +1130,8 @@ mod tests {
             "event": "agent",
             "payload": { "stream": "assistant", "delta": "Here is the result." }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[1].role, MessageRole::Assistant);
@@ -1147,7 +1153,8 @@ mod tests {
                 "sessionKey": "agent:main:dm:tui:default:direct:p1"
             }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert_eq!(
             state.pending_approval,
@@ -1168,12 +1175,71 @@ mod tests {
             "event": "agent",
             "payload": { "stream": "lifecycle", "phase": "end" }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert!(
             state.pending_approval.is_none(),
             "a prompt left pending at run end (gate timeout) must be cleared"
         );
+    }
+
+    #[test]
+    fn enter_during_active_run_queues_message() {
+        let mut state = AppState {
+            pending_request: true, // run in flight
+            ..AppState::default()
+        };
+        state.composer.set_text("follow-up question");
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "queued message must not be sent yet"
+        );
+        assert_eq!(state.queued_messages.len(), 1);
+        assert!(
+            !state
+                .messages()
+                .iter()
+                .any(|m| m.content.contains("follow-up")),
+            "queued message must not appear in chat before it is sent"
+        );
+        assert_eq!(state.composer.join(), "");
+    }
+
+    #[test]
+    fn lifecycle_end_drains_queue() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        state
+            .queued_messages
+            .push_back(("next question".to_string(), true));
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        let end = serde_json::json!({
+            "type": "event",
+            "event": "agent",
+            "payload": { "stream": "lifecycle", "phase": "end" }
+        });
+        events::handle_ws_event(&mut state, end, &tx);
+        assert!(state.queued_messages.is_empty());
+        assert_eq!(
+            rx.try_recv().expect("queued message must be sent"),
+            state::OutboundControl::Message("next question".to_string())
+        );
+        assert!(
+            state.pending_request,
+            "the drained message starts a new run"
+        );
+        let last = state.messages().last().expect("user message in chat");
+        assert_eq!(last.content, "next question");
+        assert_eq!(last.role, MessageRole::User);
     }
 
     #[test]
@@ -2383,7 +2449,8 @@ mod tests {
                 ]
             }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert_eq!(state.todos.len(), 2);
         assert_eq!(state.todos[0].content, "Updated");
@@ -2404,7 +2471,7 @@ mod tests {
                 ]
             }
         });
-        events::handle_ws_event(&mut state, all_done);
+        events::handle_ws_event(&mut state, all_done, &tx);
         assert!(state.todo_hide_at.is_some(), "hide scheduled when all done");
     }
 
@@ -2425,7 +2492,8 @@ mod tests {
             "event": "agent",
             "payload": { "stream": "todo_update", "items": [] }
         });
-        events::handle_ws_event(&mut state, event);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_ws_event(&mut state, event, &tx);
 
         assert!(state.todos.is_empty());
         assert!(state.todo_hide_at.is_none());
