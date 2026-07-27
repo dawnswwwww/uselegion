@@ -555,7 +555,7 @@ async fn tui_loop(
                     events::handle_key_event(&mut lock_recover(&state), key, &send_tx);
                 }
                 Event::Paste(text) => {
-                    input::handle_paste(&mut lock_recover(&state), text);
+                    events::route_paste(&mut lock_recover(&state), text);
                 }
                 Event::Mouse(mouse) => {
                     events::handle_mouse_event(&mut lock_recover(&state), mouse);
@@ -2595,5 +2595,57 @@ mod tests {
             rx.try_recv().expect("plain Enter must send"),
             state::OutboundControl::Message("hello".to_string())
         );
+    }
+
+    #[test]
+    fn paste_during_approval_is_dropped() {
+        let mut state = AppState {
+            pending_approval: Some(("p1".to_string(), "exec".to_string())),
+            ..Default::default()
+        };
+        events::route_paste(&mut state, "rm -rf /".to_string());
+        assert_eq!(state.composer.join(), "");
+    }
+
+    #[test]
+    fn paste_during_question_is_dropped() {
+        let mut state = AppState::default();
+        state.pending_question = Some(crate::tui::state::PendingQuestion {
+            prompt_id: "q1".to_string(),
+            questions: vec![],
+            current: 0,
+            selected_labels: std::collections::HashMap::new(),
+            focused: 0,
+            message_index: 0,
+        });
+        events::route_paste(&mut state, "answer text".to_string());
+        assert_eq!(state.composer.join(), "");
+    }
+
+    #[test]
+    fn paste_into_history_search_extends_query_single_line() {
+        let mut state = AppState {
+            history_search: Some(crate::tui::history_search::HistorySearch::new()),
+            ..Default::default()
+        };
+        events::route_paste(&mut state, "cargo\nbuild".to_string());
+        let hs = state.history_search.as_ref().expect("search still open");
+        assert_eq!(hs.query, "cargo build");
+        assert_eq!(state.composer.join(), "");
+    }
+
+    #[test]
+    fn ctrl_char_does_not_leak_into_history_search_query() {
+        let mut state = AppState {
+            history_search: Some(crate::tui::history_search::HistorySearch::new()),
+            ..Default::default()
+        };
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Char('w'), event::KeyModifiers::CONTROL),
+            &mpsc::unbounded_channel::<state::OutboundControl>().0,
+        );
+        let hs = state.history_search.as_ref().expect("search still open");
+        assert_eq!(hs.query, "");
     }
 }

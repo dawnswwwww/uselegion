@@ -427,11 +427,24 @@ pub(crate) fn handle_history_search_key(state: &mut AppState, key: event::KeyEve
             hs.query.pop();
             hs.selected = 0;
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             hs.query.push(c);
             hs.selected = 0;
         }
         _ => {}
+    }
+}
+
+/// Route a bracketed-paste event. Pastes are modal-gated like keys: while an
+/// approval or question prompt owns the keyboard the paste is dropped (the
+/// input box is invisible, so stuffing text into it is never intended), and
+/// while the history-search popup is open the paste extends the query.
+pub(crate) fn route_paste(state: &mut AppState, text: String) {
+    if let Some(ref mut hs) = state.history_search {
+        hs.query.push_str(&text.replace(['\n', '\r'], " "));
+        hs.selected = 0;
+    } else if state.pending_approval.is_none() && state.pending_question.is_none() {
+        crate::tui::input::handle_paste(state, text);
     }
 }
 
