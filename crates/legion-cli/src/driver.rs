@@ -466,18 +466,23 @@ impl TurnDriver for LocalDriver {
         *lock_recover(&self.current_gate) = None;
         *lock_recover(&self.current_question_gate) = None;
         if let Some(handle) = handle {
-            handle.abort();
-            // Synthetic lifecycle frame: the TUI's existing error handler
-            // resets pending_request and marks the turn as failed.
-            let _ = self.event_tx.send(json!({
-                "type": "event",
-                "event": "agent",
-                "payload": {
-                    "stream": "lifecycle",
-                    "phase": "error",
-                    "error": "cancelled by user"
-                }
-            }));
+            // A finished task already emitted its real lifecycle "end" frame;
+            // aborting is a no-op and a synthetic error frame would clobber
+            // the completed turn (spurious "run failed", double queue drain).
+            if !handle.is_finished() {
+                handle.abort();
+                // Synthetic lifecycle frame: the TUI's existing error handler
+                // resets pending_request and marks the turn as failed.
+                let _ = self.event_tx.send(json!({
+                    "type": "event",
+                    "event": "agent",
+                    "payload": {
+                        "stream": "lifecycle",
+                        "phase": "error",
+                        "error": "cancelled by user"
+                    }
+                }));
+            }
         }
         Ok(())
     }

@@ -47,7 +47,9 @@ pub(crate) fn next_display_unit(s: &str) -> (&str, &str) {
         let end = escape_sequence_len(s);
         s.split_at(end)
     } else {
-        let c = s.chars().next().expect("non-empty input");
+        let Some(c) = s.chars().next() else {
+            return ("", "");
+        };
         s.split_at(c.len_utf8())
     }
 }

@@ -94,7 +94,7 @@
 
 #### Gap
 
-- **TUI 深度差距巨大**：Legion 没有 fullscreen/inline/minimal 三种模式、没有 block viewer、没有 file search/project picker、没有 dashboard。
+- **TUI 深度差距仍大**：Legion 已有 fullscreen/inline 两种屏幕模式（`/mode` 切换，经 `[tui]` 配置持久化），但没有 minimal（scrollback-native）模式、没有 block viewer、没有 file search/project picker、没有 dashboard。
 - **斜杠命令生态薄弱**：Grok 的 40+ 命令覆盖 session、model、context、plan、tools、plugins、settings、help、media；Legion 缺少 `/compact`、`/fork`、`/rewind`、`/context`、`/plan`、`/tasks`、`/queue`、`/skills`、`/mcps`、`/voice`、`/imagine` 等。
 - **无语音输入**：Legion 有 TTS（`TtsTool`）但无 STT/语音交互。
 - **无媒体生成 UI**：Legion 的 `image_generate` 是 tool，没有 `/imagine` 这样的 TUI 快捷入口；无视频生成。

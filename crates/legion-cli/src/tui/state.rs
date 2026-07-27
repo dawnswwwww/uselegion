@@ -89,9 +89,11 @@ impl ChatMessage {
     }
 }
 
-/// A command from the TUI loop to the background sender task: either a user
-/// message to run as a turn, or a y/n answer to a pending tool-approval
-/// prompt (routed to the driver's `resolve_approval`).
+/// A command from the TUI loop to the background sender task: a user
+/// message to run as a turn (`Message`), a run cancellation (`Cancel`, sent
+/// on Esc), a local shell escape (`ShellCommand`), or a resolution for a
+/// pending prompt — `ResolveApproval` for a y/n tool-approval answer and
+/// `ResolveQuestion` for an `ask_user` answer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OutboundControl {
     Message(String),

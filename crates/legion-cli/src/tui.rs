@@ -349,12 +349,7 @@ pub async fn run_tui(
                     // (agent_loop), so the text goes out unchanged here.
                     if let Err(err) = sender_driver.run_turn(text).await {
                         let mut s = lock_recover(&sender_state);
-                        s.messages.push(state::ChatMessage::new(
-                            state::MessageRole::System,
-                            format!("failed to send: {err}"),
-                        ));
-                        s.messages.last_mut().unwrap().state = state::MessageState::Error;
-                        s.pending_request = false;
+                        events::fail_pending_send(&mut s, &err.to_string());
                         drop(s);
                         let _ = wake_tx.send(json!({ "type": "internal", "event": "send-failed" }));
                     }
@@ -1315,6 +1310,76 @@ mod tests {
         let last = state.messages().last().expect("user message in chat");
         assert_eq!(last.content, "next question");
         assert_eq!(last.role, MessageRole::User);
+    }
+
+    #[test]
+    fn lifecycle_error_drains_queue() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        state
+            .queued_messages
+            .push_back(("next question".to_string(), true));
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        let error = serde_json::json!({
+            "type": "event",
+            "event": "agent",
+            "payload": { "stream": "lifecycle", "phase": "error" }
+        });
+        events::handle_ws_event(&mut state, error, &tx);
+        assert!(state.queued_messages.is_empty());
+        assert_eq!(
+            rx.try_recv().expect("queued message must be sent"),
+            state::OutboundControl::Message("next question".to_string())
+        );
+        assert!(
+            state.pending_request,
+            "the drained message starts a new run"
+        );
+    }
+
+    #[test]
+    fn fail_pending_send_discards_queued_messages() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        state.queued_messages.push_back(("first".to_string(), true));
+        state
+            .queued_messages
+            .push_back(("second".to_string(), true));
+
+        events::fail_pending_send(&mut state, "boom");
+
+        assert!(!state.pending_request);
+        assert!(
+            state.queued_messages.is_empty(),
+            "queued messages of a run that never started must be discarded"
+        );
+        let systems: Vec<_> = state
+            .messages()
+            .iter()
+            .filter(|m| m.role == MessageRole::System)
+            .collect();
+        assert!(
+            systems.iter().any(|m| m.content == "failed to send: boom"
+                && m.state == crate::tui::state::MessageState::Error),
+            "the send error must surface as an error-state system message"
+        );
+        assert!(
+            systems
+                .iter()
+                .any(|m| m.content.contains("2 queued message(s) discarded")),
+            "the discard note must report how many queued messages were dropped"
+        );
+    }
+
+    #[test]
+    fn visible_width_ignores_csi_sequences() {
+        use crate::tui::input::visible_width;
+        assert_eq!(visible_width("\x1b[1;31mhi\x1b[0m"), 2);
+        assert_eq!(visible_width("plain"), 5);
     }
 
     #[test]

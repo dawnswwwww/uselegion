@@ -64,6 +64,24 @@ fn drain_queued_message(state: &mut AppState, send_tx: &mpsc::UnboundedSender<Ou
     }
 }
 
+/// Mutate state after a failed `run_turn`: surface the error, reset
+/// `pending_request`, and discard any queued messages (their run never
+/// started, so no lifecycle event will ever drain them).
+pub(crate) fn fail_pending_send(state: &mut AppState, err: &str) {
+    let mut msg = ChatMessage::new(MessageRole::System, format!("failed to send: {err}"));
+    msg.state = MessageState::Error;
+    state.messages.push(msg);
+    state.pending_request = false;
+    let dropped = state.queued_messages.len();
+    if dropped > 0 {
+        state.queued_messages.clear();
+        state.messages.push(ChatMessage::new(
+            MessageRole::System,
+            format!("{dropped} queued message(s) discarded after send failure"),
+        ));
+    }
+}
+
 pub(crate) fn handle_key_event(
     state: &mut AppState,
     key: event::KeyEvent,
