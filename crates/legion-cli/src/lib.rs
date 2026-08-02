@@ -9,6 +9,8 @@ pub mod gateway_manager;
 pub mod goal;
 pub mod loop_cmd;
 pub mod mcp;
+pub mod mcp_cmd;
+pub mod mcp_config;
 pub mod setup;
 pub mod shell_commands;
 pub mod skills;
@@ -707,7 +709,11 @@ pub async fn start_gateway_with_options(
 /// Resolve the default release manifest URL.
 ///
 /// Priority: `LEGION_RELEASES_URL` environment variable, `gateway.manifestUrl`
-/// config value, then a placeholder built-in URL.
+/// config value, then the stable channel's well-known URL.
+///
+/// The stable manifest is published by the release workflow to the
+/// `releases/stable` branch of the repository, served via GitHub's raw
+/// endpoint. It points at the newest signed release of `legion-gateway`.
 pub fn default_manifest_url(_config: &Config) -> Option<String> {
     if let Ok(url) = std::env::var("LEGION_RELEASES_URL") {
         return Some(url);
@@ -720,8 +726,12 @@ pub fn default_manifest_url(_config: &Config) -> Option<String> {
             return Some(url.to_string());
         }
     }
-    None
+    Some(STABLE_MANIFEST_URL.to_string())
 }
+
+/// Well-known URL of the signed stable-channel release manifest.
+const STABLE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/dawnswwwww/uselegion/releases/stable/manifest.json";
 
 /// Stop the running background Gateway process using the pid file.
 pub fn stop_gateway() -> Result<(), CliError> {
@@ -769,26 +779,6 @@ pub fn gateway_logs(n: usize) -> Result<(), CliError> {
         println!("{}", line);
     }
     Ok(())
-}
-
-/// Check whether the background Gateway appears to be running.
-pub fn gateway_status() -> Result<String, CliError> {
-    let pid_path = pid_file_path().ok_or_else(|| CliError::Other("no home dir".to_string()))?;
-    if !pid_path.exists() {
-        return Ok("gateway is not running".to_string());
-    }
-
-    let pid: u32 = std::fs::read_to_string(&pid_path)?
-        .trim()
-        .parse()
-        .map_err(|_| CliError::Other(format!("invalid pid file: {}", pid_path.display())))?;
-
-    if process_alive(pid) {
-        Ok(format!("gateway is running (pid {})", pid))
-    } else {
-        let _ = std::fs::remove_file(&pid_path);
-        Ok("gateway is not running (stale pid file removed)".to_string())
-    }
 }
 
 #[cfg(unix)]

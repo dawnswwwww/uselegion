@@ -1,9 +1,9 @@
 //! TUI rendering and layout.
 
-use crate::tui::input::{apply_scroll, char_width, input_visual_lines};
+use crate::tui::input::{apply_scroll, char_width, wrap_display_line};
 use crate::tui::selection::{highlight_line_selection, line_selection_range};
-use crate::tui::state::{AppState, ChatMessage, RenderKey, RenderedMessage, ThinkHint};
-use crate::tui::widgets::{render_todo_panel, status_bar_lines};
+use crate::tui::state::{AppState, ChatMessage, RenderKey, RenderedMessage, ThinkHint, ToolHint};
+use crate::tui::widgets::{render_queue_panel, render_todo_panel, status_bar_lines};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
@@ -101,11 +101,16 @@ pub(crate) fn render_key(
     msg: &ChatMessage,
     msg_index: usize,
     expanded: &HashSet<(usize, usize)>,
+    expanded_tools: &HashSet<usize>,
     width: u16,
 ) -> RenderKey {
     use std::hash::{Hash, Hasher};
     let mut content_hasher = std::collections::hash_map::DefaultHasher::new();
     msg.content.hash(&mut content_hasher);
+    // Fold the tool-card expand state for this message into the same expanded
+    // hash: a tool card re-renders (title-only ↔ full body) when its membership
+    // in `expanded_tools` flips.
+    let tool_expanded = expanded_tools.contains(&msg_index);
     let mut expanded_idxs: Vec<usize> = expanded
         .iter()
         .filter(|(m, _)| *m == msg_index)
@@ -114,6 +119,7 @@ pub(crate) fn render_key(
     expanded_idxs.sort_unstable();
     let mut expanded_hasher = std::collections::hash_map::DefaultHasher::new();
     expanded_idxs.hash(&mut expanded_hasher);
+    tool_expanded.hash(&mut expanded_hasher);
     RenderKey {
         content_hash: content_hasher.finish(),
         state: msg.state,
@@ -127,7 +133,7 @@ pub(crate) fn render_key(
 pub(crate) fn wrap_and_remap(
     rendered: RenderedMessage,
     width: u16,
-) -> (Vec<Line<'static>>, Vec<ThinkHint>) {
+) -> (Vec<Line<'static>>, Vec<ThinkHint>, Option<ToolHint>) {
     let mut lines = Vec::new();
     let mut wrapped_start = Vec::with_capacity(rendered.lines.len());
     for line in rendered.lines {
@@ -153,51 +159,137 @@ pub(crate) fn wrap_and_remap(
             }
         })
         .collect();
-    (lines, think_hints)
+    // A tool card's title is always a single row; remap its line index into
+    // wrapped space. There is no line_count to recompute (the title does not
+    // wrap into the body).
+    let tool_hint = rendered.tool_hint.map(|hint| ToolHint {
+        start_line: wrapped_start[hint.start_line],
+    });
+    (lines, think_hints, tool_hint)
+}
+
+/// Vertical layout plan for the main screen, as row heights per region
+/// (top to bottom: chat, todo panel, queue panel, input, status bar).
+///
+/// Invariants, in priority order (highest first):
+/// 1. The input box is always fully visible: `input` is the composer's
+///    content lines plus 2 border rows, clamped to 3..=10 (taller content
+///    scrolls inside the box), capped only by the chat minimum below.
+///    Nothing may overlap it.
+/// 2. The chat keeps at least 1 row whenever the terminal is >= 5 rows tall.
+/// 3. The status bar shrinks from 2 rows (status + shortcut hints) to 1,
+///    then disappears entirely before the chat minimum is touched.
+/// 4. Panels yield before the status bar: the todo panel is sacrificed
+///    first, then the queue panel. A panel is hidden entirely when showing
+///    it would push the chat below 5 rows.
+/// 5. Floating popups (slash completion, history search) are drawn by the
+///    caller strictly above the input area, never over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayoutPlan {
+    pub chat: u16,
+    pub todo: u16,
+    pub queue: u16,
+    pub input: u16,
+    pub status: u16,
+}
+
+pub(crate) fn plan_layout(
+    total_height: u16,
+    input_lines: usize,
+    todos: usize,
+    todo_max_display: usize,
+    queued_messages: usize,
+) -> LayoutPlan {
+    let h = total_height;
+    // 1. Input first: non-negotiable, capped only by the rows the chat
+    // minimum below must keep.
+    let chat_min = if h >= 5 { 1 } else { 0 };
+    let input = (input_lines.max(1) as u16 + 2)
+        .clamp(3, 10)
+        .min(h.saturating_sub(chat_min));
+    let mut remaining = h - input;
+    // 2. Chat minimum outranks everything below it.
+    let chat_min = chat_min.min(remaining);
+    remaining -= chat_min;
+    // 3. Status bar: 2 rows on tall terminals, 1 otherwise, 0 when squeezed.
+    let status_want = if h >= 15 { 2 } else { 1 };
+    let status = status_want.min(remaining);
+    remaining -= status;
+    // 4. Panels, lowest priority. A panel keeps its desired height only when
+    // the chat still gets at least 5 rows with it shown.
+    let queue = if queued_messages == 0 {
+        0
+    } else {
+        // One row per visible item, plus a hint footer and the border (2);
+        // capped to a quarter of the viewport.
+        let desired = (queued_messages as u16 + 3).min(h / 4).max(3);
+        let chat_left = h.saturating_sub(input + status + desired);
+        if chat_left >= 5 {
+            desired.min(remaining)
+        } else {
+            0
+        }
+    };
+    remaining -= queue;
+    let todo = if todos == 0 || h < 12 {
+        0
+    } else {
+        // Capped by max_display and a third of the viewport.
+        let desired = (todo_max_display.min(10) as u16 + 2).min(h / 3).max(3);
+        let chat_left = h.saturating_sub(input + status + queue + desired);
+        if chat_left >= 5 {
+            desired.min(remaining)
+        } else {
+            0
+        }
+    };
+    remaining -= todo;
+    let chat = chat_min + remaining;
+    LayoutPlan {
+        chat,
+        todo,
+        queue,
+        input,
+        status,
+    }
 }
 
 pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     let theme = state.theme;
     state.viewport_height = f.area().height;
 
-    // Dynamic input area: grows with content up to a cap, but always leaves
-    // room for the chat (min 5) and the status bar.
     let input_width = f.area().width.saturating_sub(2) as usize;
-    let input_line_count = input_visual_lines(&state.composer.join(), input_width)
-        .len()
+    let input_line_count: usize = state
+        .composer
+        .lines()
+        .iter()
+        .map(|line| wrap_display_line(line, input_width).len())
+        .sum::<usize>()
         .max(1);
-    let input_height = (input_line_count as u16 + 2).clamp(3, 10);
-    // On very short terminals keep a compact single-line status bar; otherwise
-    // split it into a status line plus a shortcuts line so it is readable.
-    let status_height = if f.area().height >= 15 { 2 } else { 1 };
-
-    // Todo panel height: capped by max_display and total height so the chat
-    // always keeps at least 5 lines. Hide entirely when empty or short terminal.
-    let max_todo_lines = state.todo_max_display.min(10);
-    let todo_height = if state.todos.is_empty() || f.area().height < 12 {
-        0
-    } else {
-        let desired = (max_todo_lines as u16 + 2).min(f.area().height / 3).max(3);
-        let remaining_for_chat = f
-            .area()
-            .height
-            .saturating_sub(desired + input_height + status_height);
-        if remaining_for_chat < 5 { 0 } else { desired }
-    };
+    let plan = plan_layout(
+        f.area().height,
+        input_line_count,
+        state.todos.len(),
+        state.todo_max_display,
+        state.queued_messages.len(),
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),
-            Constraint::Length(todo_height),
-            Constraint::Length(input_height),
-            Constraint::Length(status_height),
+            Constraint::Length(plan.chat),
+            Constraint::Length(plan.todo),
+            Constraint::Length(plan.queue),
+            Constraint::Length(plan.input),
+            Constraint::Length(plan.status),
         ])
         .split(f.area());
 
     let chat_area = chunks[0];
     let todo_area = chunks[1];
-    let input_area = chunks[2];
+    let queue_area = chunks[2];
+    let input_area = chunks[3];
+    let status_area = chunks[4];
     state.chat_area = chat_area;
     state.input_area_width = input_area.width.saturating_sub(2);
 
@@ -215,6 +307,7 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     // Single pass over the cached per-message renders: collect the visible
     // line window and the thinking-hint hitboxes together.
     state.think_hitboxes.clear();
+    state.tool_hitboxes.clear();
     state.message_rects.clear();
     let inner_chat = chat_area.inner(Margin {
         horizontal: 1,
@@ -281,6 +374,16 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
                     state.think_hitboxes.push((rect, msg_idx, hint.block_index));
                 }
             }
+            // Tool-card title row: a single-line hitbox that toggles the card's
+            // expand state. Mirrors the think-hint computation above.
+            if let Some(hint) = &entry.tool_hint {
+                let global_start = offset + hint.start_line;
+                if global_start < window_end && global_start + 1 > state.scroll {
+                    let start_y = inner_chat.y + global_start.saturating_sub(state.scroll) as u16;
+                    let rect = Rect::new(inner_chat.x, start_y, inner_chat.width, 1);
+                    state.tool_hitboxes.push((rect, msg_idx));
+                }
+            }
         }
 
         offset = msg_end;
@@ -295,15 +398,6 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
             Line::from(Span::styled(
                 " ↓ more ",
                 Style::default().fg(theme.system_bar),
-            ))
-            .right_aligned(),
-        );
-    }
-    if !state.queued_messages.is_empty() {
-        chat_block = chat_block.title_top(
-            Line::from(Span::styled(
-                format!(" ⏳ {} queued ", state.queued_messages.len()),
-                Style::default().fg(theme.user_bar),
             ))
             .right_aligned(),
         );
@@ -325,12 +419,22 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
     );
 
     // Todo panel.
-    if todo_height > 0 && !state.todos.is_empty() {
+    if plan.todo > 0 && !state.todos.is_empty() {
         let todo_lines =
             render_todo_panel(state, todo_area.width.saturating_sub(2) as usize, &theme);
         let todo = Paragraph::new(Text::from(todo_lines))
             .block(Block::default().title("Tasks").borders(Borders::ALL));
         f.render_widget(todo, todo_area);
+    }
+
+    // Queue panel: the list of messages waiting behind the in-flight run,
+    // with the selected item highlighted and a keybind hint footer.
+    if plan.queue > 0 && !state.queued_messages.is_empty() {
+        let queue_lines =
+            render_queue_panel(state, queue_area.width.saturating_sub(2) as usize, &theme);
+        let queue = Paragraph::new(Text::from(queue_lines))
+            .block(Block::default().title("Queued").borders(Borders::ALL));
+        f.render_widget(queue, queue_area);
     }
 
     // Input box.
@@ -391,41 +495,174 @@ pub(crate) fn draw_ui(f: &mut ratatui::Frame, state: &mut AppState) {
         }
     }
 
-    // History search popup.
+    // History search popup. Floating layers must never cover the input box,
+    // so the popup is centered in the rows above it and skipped when there
+    // is no room.
     if let Some(ref hs) = state.history_search {
-        let filtered = hs.filtered(&state.input_history);
-        let height = (filtered.len() as u16 + 4).min(f.area().height / 2).max(5);
-        let width = (f.area().width * 4 / 5).max(20);
-        let x = f.area().x + (f.area().width - width) / 2;
-        let y = f.area().y + (f.area().height - height) / 2;
-        let area = Rect::new(x, y, width, height);
+        let filtered = hs.filtered(state.input_history.entries());
+        let region_height = input_area.y - f.area().y;
+        if region_height >= 3 {
+            let height = (filtered.len() as u16 + 4)
+                .min(f.area().height / 2)
+                .max(3)
+                .min(region_height);
+            let width = (f.area().width * 4 / 5).max(20);
+            let x = f.area().x + (f.area().width - width) / 2;
+            let y = f.area().y + (region_height - height) / 2;
+            let area = Rect::new(x, y, width, height);
 
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .enumerate()
-            .map(|(idx, (_, text))| {
-                let display = if text.len() > width as usize - 4 {
-                    format!("{}…", &text[..width as usize - 5])
-                } else {
-                    text.to_string()
-                };
-                let item = ListItem::new(Line::from(display));
-                if idx == hs.selected {
-                    item.style(Style::default().fg(theme.selected_fg).bg(theme.selected_bg))
-                } else {
-                    item
-                }
-            })
-            .collect();
-        let list = List::new(items).block(Block::default().title("history").borders(Borders::ALL));
-        f.render_widget(Clear, area);
-        f.render_widget(list, area);
+            let items: Vec<ListItem> = filtered
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, text))| {
+                    let display = if text.len() > width as usize - 4 {
+                        format!("{}…", &text[..width as usize - 5])
+                    } else {
+                        text.to_string()
+                    };
+                    let item = ListItem::new(Line::from(display));
+                    if idx == hs.selected {
+                        item.style(Style::default().fg(theme.selected_fg).bg(theme.selected_bg))
+                    } else {
+                        item
+                    }
+                })
+                .collect();
+            let list =
+                List::new(items).block(Block::default().title("history").borders(Borders::ALL));
+            f.render_widget(Clear, area);
+            f.render_widget(list, area);
+        }
     }
 
     // Status bar. A pending tool-approval prompt takes precedence over the
     // usual status so the user always sees what is blocking the run.
-    let status_lines = status_bar_lines(state, &theme, status_height);
-    let status =
-        Paragraph::new(Text::from(status_lines)).style(Style::default().bg(theme.status_bg));
-    f.render_widget(status, chunks[3]);
+    if plan.status > 0 {
+        let status_lines = status_bar_lines(state, &theme, plan.status);
+        let status =
+            Paragraph::new(Text::from(status_lines)).style(Style::default().bg(theme.status_bg));
+        f.render_widget(status, status_area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The invariants that must hold for every terminal height:
+    /// regions tile the screen exactly, and the input box always gets its
+    /// full clamped height (the "input is always fully visible" contract).
+    fn assert_invariants(plan: LayoutPlan, h: u16, input_lines: usize) {
+        assert_eq!(
+            plan.chat + plan.todo + plan.queue + plan.input + plan.status,
+            h,
+            "regions must tile the screen exactly; plan: {plan:?}"
+        );
+        let want_input = (input_lines.max(1) as u16 + 2)
+            .clamp(3, 10)
+            .min(h.saturating_sub(if h >= 5 { 1 } else { 0 }));
+        assert_eq!(
+            plan.input, want_input,
+            "input box must always get its full height; plan: {plan:?}"
+        );
+        if h >= 5 {
+            assert!(plan.chat >= 1, "chat keeps at least 1 row; plan: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn invariants_hold_across_heights() {
+        for h in [3, 4, 5, 6, 8, 10, 12, 15, 20, 30, 50] {
+            for input_lines in [1, 5, 9, 30] {
+                // Empty panels.
+                assert_invariants(plan_layout(h, input_lines, 0, 10, 0), h, input_lines);
+                // Both panels populated.
+                assert_invariants(plan_layout(h, input_lines, 7, 10, 2), h, input_lines);
+            }
+        }
+    }
+
+    #[test]
+    fn input_grows_with_content_up_to_cap() {
+        assert_eq!(plan_layout(30, 1, 0, 10, 0).input, 3);
+        assert_eq!(plan_layout(30, 4, 0, 10, 0).input, 6);
+        // 30 content lines still cap at 10 rows; the rest scrolls inside.
+        assert_eq!(plan_layout(30, 30, 0, 10, 0).input, 10);
+    }
+
+    #[test]
+    fn status_two_rows_on_tall_terminals_one_on_short() {
+        assert_eq!(plan_layout(15, 1, 0, 10, 0).status, 2);
+        assert_eq!(plan_layout(14, 1, 0, 10, 0).status, 1);
+    }
+
+    #[test]
+    fn panels_visible_when_room_allows() {
+        let plan = plan_layout(30, 1, 7, 10, 2);
+        assert!(plan.todo > 0, "todo panel should show; plan: {plan:?}");
+        assert!(plan.queue > 0, "queue panel should show; plan: {plan:?}");
+        assert_eq!(plan.status, 2);
+        assert!(plan.chat >= 5);
+    }
+
+    #[test]
+    fn todo_sacrificed_before_queue() {
+        // h=15, input=3, status=2: room for the queue panel (3 rows) and a
+        // 7-row chat, but showing the todo panel too would drop chat below 5.
+        let plan = plan_layout(15, 1, 7, 10, 2);
+        assert_eq!(plan.queue, 3, "queue panel survives; plan: {plan:?}");
+        assert_eq!(
+            plan.todo, 0,
+            "todo panel is sacrificed first; plan: {plan:?}"
+        );
+        assert_eq!(plan.status, 2);
+        assert!(plan.chat >= 5);
+    }
+
+    #[test]
+    fn panels_and_hints_yield_before_status_and_chat_minimum() {
+        // h=8: panels hidden, status down to 1 row, chat keeps the rest.
+        let plan = plan_layout(8, 1, 7, 10, 2);
+        assert_eq!((plan.todo, plan.queue), (0, 0));
+        assert_eq!(plan.status, 1);
+        assert_eq!(plan.chat, 4);
+    }
+
+    #[test]
+    fn extreme_heights_keep_input_intact() {
+        // h=5: input 3, status 1, chat exactly 1.
+        let plan = plan_layout(5, 1, 7, 10, 2);
+        assert_eq!(
+            plan,
+            LayoutPlan {
+                chat: 1,
+                todo: 0,
+                queue: 0,
+                input: 3,
+                status: 1,
+            }
+        );
+        // h=4: below the chat-minimum threshold the chat drops to 0; the
+        // status bar takes the one leftover row.
+        let plan = plan_layout(4, 1, 0, 10, 0);
+        assert_eq!(plan.input, 3);
+        assert_eq!(plan.status, 1);
+        assert_eq!(plan.chat, 0);
+        // h=3: the input box is all that fits.
+        let plan = plan_layout(3, 1, 0, 10, 0);
+        assert_eq!(plan.input, 3);
+        assert_eq!(plan.status, 0);
+        assert_eq!(plan.chat, 0);
+    }
+
+    #[test]
+    fn tall_input_pushes_panels_out_first() {
+        // A 10-row input on a 15-row terminal: panels hidden, chat still
+        // gets 3 rows (>= its 1-row minimum) alongside the 2-row status bar.
+        let plan = plan_layout(15, 30, 7, 10, 2);
+        assert_eq!(plan.input, 10);
+        assert_eq!((plan.todo, plan.queue), (0, 0));
+        assert_eq!(plan.status, 2);
+        assert_eq!(plan.chat, 3);
+    }
 }

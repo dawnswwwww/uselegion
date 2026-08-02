@@ -276,6 +276,17 @@ impl Policy {
     /// If `permissionMode` is present it takes precedence; otherwise the mode
     /// is derived from `approval`.
     pub fn from_config(config: Option<&ToolConfig>, default_approval: Approval) -> Self {
+        Self::from_config_with_workspace_default(config, default_approval, false)
+    }
+
+    /// Like [`Self::from_config`] but allows the caller to choose the default
+    /// for `workspace_only`. This is used for write-class tools where the safe
+    /// default is `true` while preserving explicit opt-out via configuration.
+    pub fn from_config_with_workspace_default(
+        config: Option<&ToolConfig>,
+        default_approval: Approval,
+        default_workspace_only: bool,
+    ) -> Self {
         let config = config.cloned().unwrap_or_default();
         let approval = config
             .approval
@@ -291,7 +302,7 @@ impl Policy {
             approval,
             permission_mode,
             allow_from: config.allow_from,
-            workspace_only: config.workspace_only.unwrap_or(false),
+            workspace_only: config.workspace_only.unwrap_or(default_workspace_only),
         }
     }
 

@@ -57,11 +57,6 @@ impl MetricsRegistry {
         self.add_counter_with_labels(name, help, &[], 1);
     }
 
-    /// Add `value` to a counter (without labels).
-    pub fn add_counter(&self, name: impl Into<String>, help: impl Into<String>, value: u64) {
-        self.add_counter_with_labels(name, help, &[], value);
-    }
-
     /// Increment a labeled counter series by one. Each distinct label set forms
     /// its own series under the same metric name.
     pub fn increment_counter_with_labels(

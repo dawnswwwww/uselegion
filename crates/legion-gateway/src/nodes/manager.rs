@@ -1,6 +1,7 @@
 //! Node manager: registry, command routing, and synchronous invoke handling.
 
 use super::registry::{Node, NodeRegistry};
+use legion_core::util::lock_recover;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -50,7 +51,7 @@ impl NodeManager {
     /// Register a connected node and return a receiver for frames destined to it.
     pub fn connect(&self, node: Node) -> mpsc::UnboundedReceiver<serde_json::Value> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut senders = self.senders.lock().unwrap();
+        let mut senders = lock_recover(&self.senders);
         senders.insert(node.id.clone(), tx);
         self.registry.register(node);
         rx
@@ -58,12 +59,12 @@ impl NodeManager {
 
     /// Disconnect a node and clean up its sender.
     pub fn disconnect(&self, node_id: &str) {
-        let mut senders = self.senders.lock().unwrap();
+        let mut senders = lock_recover(&self.senders);
         senders.remove(node_id);
         self.registry.unregister(node_id);
         // Drop pending invocations for this node without a response so that
         // waiting callers receive NodeDisconnected.
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = lock_recover(&self.pending);
         pending.retain(|_, (nid, _)| nid != node_id);
     }
 
@@ -76,7 +77,7 @@ impl NodeManager {
         timeout: Duration,
     ) -> Result<serde_json::Value, NodeInvokeError> {
         let sender = {
-            let senders = self.senders.lock().unwrap();
+            let senders = lock_recover(&self.senders);
             senders
                 .get(node_id)
                 .cloned()
@@ -93,7 +94,7 @@ impl NodeManager {
         );
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = lock_recover(&self.pending);
             pending.insert(correlation.clone(), (node_id.to_string(), tx));
         }
 
@@ -111,7 +112,7 @@ impl NodeManager {
 
         let result = tokio::time::timeout(timeout, rx).await;
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = lock_recover(&self.pending);
             pending.remove(&correlation);
         }
 
@@ -125,7 +126,7 @@ impl NodeManager {
     /// Complete a pending invocation with the node's response.
     pub fn resolve(&self, correlation: &str, response: serde_json::Value) {
         let tx = {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = lock_recover(&self.pending);
             pending.remove(correlation).map(|(_, tx)| tx)
         };
         if let Some(tx) = tx {

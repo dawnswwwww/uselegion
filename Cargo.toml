@@ -21,15 +21,23 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1-rc.1"
 edition = "2024"
 license = "MIT"
 authors = ["Legion Contributors"]
 rust-version = "1.86"
+description = "Self-hosted, multi-channel AI agent gateway and CLI"
+repository = "https://github.com/dawnswwwww/uselegion"
+homepage = "https://github.com/dawnswwwww/uselegion"
+documentation = "https://github.com/dawnswwwww/uselegion#readme"
+keywords = ["ai", "agent", "llm", "gateway", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [workspace.dependencies]
 # async runtime
 tokio = { version = "1.44", features = ["full"] }
+async-trait = "0.1"
 
 # serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -49,7 +57,12 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # web / http
-reqwest = { version = "0.12", features = ["json"] }
+# `default-features = false` + explicit rustls avoids pulling `hyper-tls`/`native-tls`/OpenSSL,
+# keeping distributed binaries free of system OpenSSL dependencies. `system-proxy`
+# is intentionally omitted: LLM provider + channel traffic should go direct
+# unless the user configures a proxy explicitly, and it keeps connect-error
+# semantics stable for tests.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "charset", "http2"] }
 eventsource-stream = "0.2"
 regex = "1.12"
 axum = { version = "0.8", features = ["ws"] }
@@ -58,10 +71,16 @@ base64 = "0.22"
 
 # cli
 clap = { version = "4.5", features = ["derive"] }
-tokio-tungstenite = "0.26"
+# `rustls-tls-native-roots` provides wss:// support while statically linking
+# (no system OpenSSL dependency), which keeps distributed binaries self-
+# contained on Linux/musl. Native roots are used to remain compatible with
+# enterprise self-signed CAs.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 
 # validation
-jsonschema = "0.29"
+# `default-features = false` drops `resolve-http` (which would pull a default-tls
+# reqwest). Legion only validates local schemas, so file retrieval is enough.
+jsonschema = { version = "0.29", default-features = false, features = ["resolve-file"] }
 
 # tokenization
 tiktoken-rs = "0.12"
@@ -78,6 +97,7 @@ linkify = "0.10"
 
 # testing
 rstest = "0.25"
+tokio-test = "0.4"
 tempfile = "3.21"
 temp-env = "0.3"
 wiremock = "0.6"

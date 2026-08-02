@@ -1,19 +1,20 @@
 //! Legion automation subsystem.
 //!
-//! Provides cron scheduling, periodic heartbeat turns, lifecycle hooks, and a
-//! minimal task ledger.
+//! Provides cron scheduling, periodic heartbeat turns, and a minimal task
+//! ledger.
 
 pub mod commitments;
 pub mod cron;
 pub mod flow;
 pub mod heartbeat;
-pub mod hooks;
+pub mod job_id;
 pub mod task_runner;
 pub mod tasks;
 
 use std::path::PathBuf;
 
 pub use commitments::LlmCommitmentExtractor;
+pub use job_id::generate_job_id;
 
 /// Return the default Legion workspace path (`~/.legion/workspace`).
 pub fn home_workspace() -> PathBuf {

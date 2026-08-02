@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::adapter::{McpToolAdapter, truncate_description};
@@ -25,6 +26,19 @@ pub struct LoadReport {
     pub connected: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub tools: usize,
+}
+
+/// Point-in-time snapshot of a connected server, for status UIs.
+#[derive(Debug, Clone)]
+pub struct McpServerStatus {
+    /// Configured server name.
+    pub server: String,
+    /// Negotiated protocol version.
+    pub protocol_version: String,
+    /// Capabilities the server reported during negotiation.
+    pub capabilities: Value,
+    /// Number of tools discovered from this server.
+    pub tool_count: usize,
 }
 
 /// Concurrency limits for MCP connections.
@@ -165,6 +179,54 @@ impl McpManager {
         &self.adapters
     }
 
+    /// Look up a connected client by server name.
+    fn client(&self, server: &str) -> Result<&Arc<dyn McpClient>, McpError> {
+        self.clients.get(server).ok_or_else(|| {
+            McpError::Protocol(format!("unknown or unconnected MCP server '{server}'"))
+        })
+    }
+
+    /// List a server's resources (`resources/list`, paginated).
+    pub async fn list_resources(&self, server: &str) -> Result<Vec<Value>, McpError> {
+        self.client(server)?.list_resources().await
+    }
+
+    /// Read a single resource from a server (`resources/read`).
+    pub async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, McpError> {
+        self.client(server)?.read_resource(uri).await
+    }
+
+    /// List a server's prompts (`prompts/list`, paginated).
+    pub async fn list_prompts(&self, server: &str) -> Result<Vec<Value>, McpError> {
+        self.client(server)?.list_prompts().await
+    }
+
+    /// Fetch a single prompt from a server (`prompts/get`).
+    pub async fn get_prompt(
+        &self,
+        server: &str,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value, McpError> {
+        self.client(server)?.get_prompt(name, arguments).await
+    }
+
+    /// Snapshot every connected server for a status view, sorted by name.
+    pub fn server_status(&self) -> Vec<McpServerStatus> {
+        let mut statuses: Vec<McpServerStatus> = self
+            .clients
+            .iter()
+            .map(|(name, client)| McpServerStatus {
+                server: name.clone(),
+                protocol_version: client.protocol_version(),
+                capabilities: client.server_capabilities(),
+                tool_count: self.adapters.iter().filter(|a| a.server() == name).count(),
+            })
+            .collect();
+        statuses.sort_by(|a, b| a.server.cmp(&b.server));
+        statuses
+    }
+
     /// Close all server connections. Errors are logged but ignored.
     pub async fn shutdown_all(&self) {
         for (name, client) in &self.clients {
@@ -271,6 +333,8 @@ mod tests {
             enabled: true,
             auto_approve: vec!["read_file".to_string()],
             connect_timeout_ms: 5_000,
+            protocol_version: None,
+            tool_timeout_ms: 60_000,
         };
 
         let mut manager = McpManager::new();
@@ -305,6 +369,8 @@ mod tests {
             enabled: true,
             auto_approve: Vec::new(),
             connect_timeout_ms: 200,
+            protocol_version: None,
+            tool_timeout_ms: 60_000,
         };
 
         let mut manager = McpManager::new();
@@ -330,11 +396,142 @@ mod tests {
             enabled: false,
             auto_approve: Vec::new(),
             connect_timeout_ms: 200,
+            protocol_version: None,
+            tool_timeout_ms: 60_000,
         };
         let mut manager = McpManager::new();
         let report = manager.load(&[cfg]).await;
         assert!(report.connected.is_empty());
         assert!(report.failed.is_empty());
         assert!(manager.tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_surfaces_introspection_and_status() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rpc_result = |result: serde_json::Value| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": result
+            }))
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "initialize" }),
+            ))
+            .respond_with(rpc_result(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "resources": {}, "prompts": {} }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "tools/list" }),
+            ))
+            .respond_with(rpc_result(serde_json::json!({
+                "tools": [
+                    { "name": "read_file", "description": "read", "inputSchema": {"type": "object"} }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "resources/list" }),
+            ))
+            .respond_with(rpc_result(serde_json::json!({
+                "resources": [{ "uri": "file:///a.txt" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "resources/read" }),
+            ))
+            .respond_with(rpc_result(serde_json::json!({
+                "contents": [{ "uri": "file:///a.txt", "text": "hi" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "prompts/list" }),
+            ))
+            .respond_with(rpc_result(serde_json::json!({
+                "prompts": [{ "name": "greet" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "prompts/get" }),
+            ))
+            .respond_with(rpc_result(serde_json::json!({
+                "messages": []
+            })))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/rpc", server.uri());
+        let cfg = McpServerConfig {
+            name: "fs".to_string(),
+            transport: McpTransport::Http {
+                url,
+                headers: HashMap::new(),
+            },
+            enabled: true,
+            auto_approve: Vec::new(),
+            connect_timeout_ms: 5_000,
+            protocol_version: None,
+            tool_timeout_ms: 60_000,
+        };
+
+        let mut manager = McpManager::new();
+        let report = manager.load(&[cfg]).await;
+        assert_eq!(report.connected, vec!["fs"]);
+
+        let resources = manager.list_resources("fs").await.unwrap();
+        assert_eq!(resources.len(), 1);
+        let contents = manager.read_resource("fs", "file:///a.txt").await.unwrap();
+        assert!(contents.get("contents").is_some());
+        let prompts = manager.list_prompts("fs").await.unwrap();
+        assert_eq!(prompts.len(), 1);
+        let prompt = manager.get_prompt("fs", "greet", None).await.unwrap();
+        assert!(prompt.get("messages").is_some());
+
+        let status = manager.server_status();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].server, "fs");
+        assert_eq!(status[0].protocol_version, "2024-11-05");
+        assert_eq!(status[0].tool_count, 1);
+        assert_eq!(
+            status[0].capabilities,
+            serde_json::json!({ "resources": {}, "prompts": {} })
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_introspection_unknown_server_errors() {
+        let manager = McpManager::new();
+        let err = manager.list_resources("nope").await.unwrap_err();
+        match err {
+            McpError::Protocol(msg) => assert!(msg.contains("nope"), "got: {msg}"),
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+        let err = manager.get_prompt("nope", "greet", None).await.unwrap_err();
+        assert!(matches!(err, McpError::Protocol(_)));
+        assert!(manager.server_status().is_empty());
     }
 }

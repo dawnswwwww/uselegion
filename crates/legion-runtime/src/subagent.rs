@@ -12,7 +12,8 @@ use tracing::{Instrument, info_span};
 use crate::agent_loop::AgentRuntime;
 use crate::context::sessions_dir;
 use crate::types::{LifecyclePhase, RunEvent, RunRequest, RunStream};
-use legion_core::config::{Config, SubagentConfig};
+use legion_core::config::SubagentConfig;
+use legion_provider::model_ref::resolve_agent_model;
 
 /// Kind of sub-agent to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,8 @@ pub struct SubagentRequest {
     /// conversation.
     pub history: Vec<legion_provider::types::ChatMessage>,
     /// Per-child iteration cap override; defaults to `subagents.default_max_iterations`.
+    /// `None` (the config default) means no cap: the child falls back to the
+    /// runtime's own `max_iterations`, bounded by the wall-clock timeout.
     pub max_iterations: Option<usize>,
     /// Per-child timeout override; defaults to `subagents.default_timeout_ms`.
     pub timeout: Option<Duration>,
@@ -165,12 +168,18 @@ impl SubagentSpawner for RuntimeSubagentSpawner {
             });
         }
 
-        let permit = self
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| SubagentError::Concurrency)?;
+        // Bound the permit wait by the child's effective timeout: without it a
+        // nested fan-out (a child spawning its own sub-agent while every
+        // permit is held by siblings doing the same) deadlocks the parent's
+        // turn, because the wall-clock timeout only starts after acquisition.
+        let acquire_timeout = req
+            .timeout
+            .unwrap_or_else(|| Duration::from_millis(self.cfg.default_timeout_ms));
+        let permit =
+            match tokio::time::timeout(acquire_timeout, self.sem.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => return Err(SubagentError::Concurrency),
+            };
 
         let handle_id = next_handle_id();
         let (tx, rx) = oneshot::channel();
@@ -201,20 +210,53 @@ async fn run_child(
         SubagentKind::Fork => req.parent_agent_id.clone(),
     };
     let child_depth = req.parent_depth.saturating_add(1);
-    let session_id = format!("agent:{child}:subagent:spawn:local:direct:{handle_id}");
+    let session_id = legion_plugin_sdk::session_key::direct_session_key(
+        &child, "subagent", "spawn", "local", &handle_id,
+    );
+
+    // Validate an explicit model override up front so a bogus value fails
+    // fast with recovery guidance instead of burning a child run on the same
+    // provider error. The config-derived default keeps its existing
+    // resolve-at-chat behavior.
+    if let Some(explicit) = &req.model {
+        let invalid = match runtime.router_for(&child) {
+            Some(router) => router
+                .validate_model_ref(explicit)
+                .err()
+                .map(|e| e.to_string()),
+            None => Some(format!("no provider router for agent '{child}'")),
+        };
+        if let Some(err) = invalid {
+            return SubagentResult {
+                handle_id,
+                text: String::new(),
+                tool_call_count: 0,
+                transcript_path: None,
+                status: SubagentStatus::Failed(format!(
+                    "invalid model '{explicit}': {err}. Omit the model parameter to inherit \
+                     the default model, or pass a configured alias / provider-model ref"
+                )),
+            };
+        }
+    }
+
     let model_ref = req
         .model
         .clone()
-        .unwrap_or_else(|| resolve_model(runtime.config(), &child));
-    let eff_iter = req.max_iterations.unwrap_or(cfg.default_max_iterations);
+        .unwrap_or_else(|| resolve_agent_model(runtime.config(), &child));
+    // `None` (the config default) leaves the run uncapped: the child then
+    // falls back to the runtime's own `max_iterations`, same as the parent.
+    let eff_iter = req.max_iterations.or(cfg.default_max_iterations);
     let timeout_dur = req
         .timeout
         .unwrap_or_else(|| Duration::from_millis(cfg.default_timeout_ms));
 
     let mut request = RunRequest::new(&session_id, &child, &req.prompt, model_ref)
         .with_interactive(false)
-        .with_depth(child_depth)
-        .with_max_iterations(eff_iter);
+        .with_depth(child_depth);
+    if let Some(cap) = eff_iter {
+        request = request.with_max_iterations(cap);
+    }
     if !req.history.is_empty() {
         request = request.with_history(req.history.clone());
     }
@@ -226,15 +268,16 @@ async fn run_child(
     }
 
     let span = info_span!("subagent", handle = %handle_id, agent = %child, depth = child_depth);
-    let outcome = tokio::time::timeout(timeout_dur, drive(&runtime, request))
-        .instrument(span)
-        .await;
+    let outcome = drive(&runtime, request, timeout_dur).instrument(span).await;
 
     let (text, tool_call_count, status, events) = match outcome {
-        Ok(Ok((t, c, ev, None))) => (t, c, SubagentStatus::Completed, ev),
-        Ok(Ok((t, c, ev, Some(err)))) => (t, c, SubagentStatus::Failed(err), ev),
-        Ok(Err(err)) => (String::new(), 0, SubagentStatus::Failed(err), Vec::new()),
-        Err(_elapsed) => (String::new(), 0, SubagentStatus::TimedOut, Vec::new()),
+        // A timed-out child keeps the events it collected before the
+        // deadline: the sidechain transcript is the only window into where
+        // it got stuck.
+        Ok((_, _, ev, _, true)) => (String::new(), 0, SubagentStatus::TimedOut, ev),
+        Ok((t, c, ev, None, false)) => (t, c, SubagentStatus::Completed, ev),
+        Ok((t, c, ev, Some(err), false)) => (t, c, SubagentStatus::Failed(err), ev),
+        Err(err) => (String::new(), 0, SubagentStatus::Failed(err), Vec::new()),
     };
 
     let transcript_path =
@@ -252,19 +295,33 @@ async fn run_child(
 async fn drive(
     runtime: &AgentRuntime,
     request: RunRequest,
-) -> Result<(String, usize, Vec<RunEvent>, Option<String>), String> {
+    timeout_dur: Duration,
+) -> Result<(String, usize, Vec<RunEvent>, Option<String>, bool), String> {
     let stream = runtime.run(request).map_err(|e| e.to_string())?;
-    Ok(collect(stream).await)
+    Ok(collect(stream, timeout_dur).await)
 }
 
-async fn collect(stream: RunStream) -> (String, usize, Vec<RunEvent>, Option<String>) {
+/// Drain the run's event stream, accumulating the child's text and events.
+/// The wall-clock deadline is enforced per iteration (rather than wrapping
+/// the whole future) so a timeout keeps the events collected so far; the
+/// final bool reports whether the deadline fired.
+async fn collect(
+    stream: RunStream,
+    timeout_dur: Duration,
+) -> (String, usize, Vec<RunEvent>, Option<String>, bool) {
     tokio::pin!(stream);
+    let deadline = tokio::time::Instant::now() + timeout_dur;
     let mut text = String::new();
     let mut tool_call_count = 0usize;
     let mut events: Vec<RunEvent> = Vec::new();
     let mut err: Option<String> = None;
 
-    while let Some(ev) = stream.next().await {
+    loop {
+        let next = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(next) => next,
+            Err(_elapsed) => return (String::new(), 0, events, None, true),
+        };
+        let Some(ev) = next else { break };
         match &ev {
             RunEvent::AssistantDelta { delta } => text.push_str(delta),
             RunEvent::ToolEnd { .. } => tool_call_count += 1,
@@ -287,7 +344,7 @@ async fn collect(stream: RunStream) -> (String, usize, Vec<RunEvent>, Option<Str
         }
     }
 
-    (text, tool_call_count, events, err)
+    (text, tool_call_count, events, err, false)
 }
 
 async fn write_sidechain(
@@ -321,21 +378,6 @@ async fn write_sidechain(
             None
         }
     }
-}
-
-fn resolve_model(config: &Config, agent_id: &str) -> String {
-    if agent_id == "main" {
-        config.agents.defaults.model.clone()
-    } else {
-        config
-            .agents
-            .list
-            .iter()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.model.clone())
-            .or_else(|| config.agents.defaults.model.clone())
-    }
-    .unwrap_or_else(|| "openai/gpt-4o".to_string())
 }
 
 fn next_handle_id() -> String {
@@ -557,40 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_prefers_agent_then_default() {
-        let config = Config::from_json(
-            r#"{
-                "gateway": { "auth": { "token": "x" } },
-                "agents": {
-                    "defaults": { "model": "openai/default-model" },
-                    "list": [
-                        { "id": "main", "model": "anthropic/main-model" },
-                        { "id": "researcher", "model": "anthropic/agent-model" },
-                        { "id": "writer" }
-                    ]
-                }
-            }"#,
-        )
-        .expect("test config parses");
-
-        // An agent's own model wins over the default.
-        assert_eq!(
-            resolve_model(&config, "researcher"),
-            "anthropic/agent-model"
-        );
-        // A listed agent without a model, and unlisted agents, use the default.
-        assert_eq!(resolve_model(&config, "writer"), "openai/default-model");
-        assert_eq!(resolve_model(&config, "ghost"), "openai/default-model");
-        // "main" always uses the default, even when listed with its own model.
-        assert_eq!(resolve_model(&config, "main"), "openai/default-model");
-
-        // No model configured anywhere falls back to the built-in default.
-        let bare = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#)
-            .expect("test config parses");
-        assert_eq!(resolve_model(&bare, "researcher"), "openai/gpt-4o");
-    }
-
-    #[test]
     fn status_display_is_stable() {
         assert_eq!(SubagentStatus::Completed.to_string(), "completed");
         assert_eq!(SubagentStatus::TimedOut.to_string(), "timed_out");
@@ -685,6 +693,168 @@ mod tests {
         // A timed-out child still gets a (possibly empty) sidechain in the
         // injected dir, never in the real home directory.
         assert_sidechain_in(&result, dir.path());
+    }
+
+    /// With the permit pool exhausted, a queued spawn must fail explicitly
+    /// once its acquire wait exceeds the child timeout instead of hanging the
+    /// parent's turn (nested fan-outs would otherwise deadlock the semaphore).
+    #[tokio::test]
+    async fn spawn_permit_wait_times_out_as_concurrency_error() {
+        let runtime = build_runtime(Arc::new(PendingProvider));
+        let cfg = SubagentConfig {
+            max_concurrent: 1,
+            ..SubagentConfig::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawner =
+            RuntimeSubagentSpawner::new(runtime, cfg).with_sessions_dir(dir.path().to_path_buf());
+
+        // The first child holds the only permit until its own timeout fires
+        // (PendingProvider never yields).
+        let first = spawner
+            .spawn(SubagentRequest {
+                kind: SubagentKind::Typed("main".into()),
+                prompt: "hold the permit".into(),
+                model: Some("pending/gpt-4o".into()),
+                allowed_tools: None,
+                parent_agent_id: "main".into(),
+                parent_depth: 0,
+                history: Vec::new(),
+                system_prompt: None,
+                max_iterations: None,
+                timeout: Some(Duration::from_millis(1000)),
+            })
+            .await
+            .expect("first spawn accepted");
+
+        let err = match spawner
+            .spawn(SubagentRequest {
+                kind: SubagentKind::Typed("main".into()),
+                prompt: "needs a permit".into(),
+                model: Some("pending/gpt-4o".into()),
+                allowed_tools: None,
+                parent_agent_id: "main".into(),
+                parent_depth: 0,
+                history: Vec::new(),
+                system_prompt: None,
+                max_iterations: None,
+                timeout: Some(Duration::from_millis(100)),
+            })
+            .await
+        {
+            Ok(_) => panic!("second spawn must fail on the exhausted semaphore"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SubagentError::Concurrency),
+            "expected Concurrency error, got {err:?}"
+        );
+
+        // Drain the first child so its sidechain lands while the tempdir lives.
+        let result = first.join().await.expect("join ok");
+        assert_eq!(result.status, SubagentStatus::TimedOut);
+    }
+
+    /// An explicit model override that does not resolve to a registered
+    /// provider fails fast with recovery guidance, without starting a child
+    /// run (no transcript is written).
+    #[tokio::test]
+    async fn spawn_invalid_model_override_fails_fast() {
+        let runtime = build_runtime(Arc::new(RoutingProvider));
+        let (spawner, _dir) = spawner_with_temp_sessions(runtime);
+        let request = |model: &str| SubagentRequest {
+            kind: SubagentKind::Typed("main".into()),
+            prompt: "junk model".into(),
+            model: Some(model.to_string()),
+            allowed_tools: None,
+            parent_agent_id: "main".into(),
+            parent_depth: 0,
+            history: Vec::new(),
+            system_prompt: None,
+            max_iterations: None,
+            timeout: None,
+        };
+
+        for bad in ["default", "ghost/gpt-4o"] {
+            let handle = spawner.spawn(request(bad)).await.expect("spawn accepted");
+            let result = handle.join().await.expect("join ok");
+            match &result.status {
+                SubagentStatus::Failed(err) => {
+                    assert!(
+                        err.contains(&format!("invalid model '{bad}'")),
+                        "error must name the bad ref, got {err:?}"
+                    );
+                    assert!(
+                        err.contains("Omit the model parameter"),
+                        "error must guide recovery, got {err:?}"
+                    );
+                }
+                other => panic!("expected Failed status for '{bad}', got {other:?}"),
+            }
+            assert!(
+                result.transcript_path.is_none(),
+                "no child run means no transcript"
+            );
+        }
+    }
+
+    /// Emits one chunk and then never finishes; used to verify a timed-out
+    /// child keeps the events it collected before the deadline.
+    struct ChunkThenPendingProvider;
+
+    #[async_trait]
+    impl Provider for ChunkThenPendingProvider {
+        fn id(&self) -> &str {
+            "chunk-pending"
+        }
+        fn supported_models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+        async fn chat(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+            let chunk = ChatChunk {
+                index: 0,
+                delta: "partial-answer".to_string(),
+                finish_reason: None,
+                tool_calls: None,
+            };
+            let stream = futures::stream::iter(vec![Ok(chunk)])
+                .chain(futures::stream::pending::<Result<ChatChunk, ProviderError>>());
+            Ok(Box::pin(stream))
+        }
+        async fn embed(&self, _req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_child_keeps_partial_event_stream() {
+        let runtime = build_runtime(Arc::new(ChunkThenPendingProvider));
+        let (spawner, dir) = spawner_with_temp_sessions(runtime);
+        let handle = spawner
+            .spawn(SubagentRequest {
+                kind: SubagentKind::Typed("main".into()),
+                prompt: "hang after one chunk".into(),
+                model: Some("chunk-pending/gpt-4o".into()),
+                allowed_tools: None,
+                parent_agent_id: "main".into(),
+                parent_depth: 0,
+                history: Vec::new(),
+                system_prompt: None,
+                max_iterations: None,
+                timeout: Some(Duration::from_millis(200)),
+            })
+            .await
+            .expect("spawn accepted");
+        let result = handle.join().await.expect("join ok");
+        assert_eq!(result.status, SubagentStatus::TimedOut);
+
+        let path = result.transcript_path.expect("transcript written");
+        assert!(path.starts_with(dir.path()));
+        let contents = std::fs::read_to_string(path).expect("transcript readable");
+        assert!(
+            contents.contains("partial-answer"),
+            "timed-out transcript must keep pre-deadline events, got {contents:?}"
+        );
     }
 
     /// Captures the messages of every chat call; always replies "child-answer".

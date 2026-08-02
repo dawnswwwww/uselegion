@@ -4,9 +4,7 @@
 use chrono::Utc;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
-use legion_protocol::{
-    Artifact, ProtocolCompatibility, ReleaseEntry, ReleaseManifest, STABLE_RELEASE_PUBLIC_KEY,
-};
+use legion_protocol::{Artifact, ProtocolCompatibility, ReleaseEntry, ReleaseManifest};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -178,31 +176,6 @@ impl GatewayManager {
         )
     }
 
-    /// Fetch and parse a release manifest over HTTPS.
-    ///
-    /// Rejects non-HTTPS URLs.
-    pub async fn fetch_manifest(&self, url: &str) -> Result<ReleaseManifest> {
-        if !url.starts_with("https://") {
-            return Err(GatewayManagerError::Other(
-                "manifest URL must use HTTPS".to_string(),
-            ));
-        }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| GatewayManagerError::OfflineOrProxy(e.to_string()))?;
-        let text = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| GatewayManagerError::OfflineOrProxy(e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| GatewayManagerError::OfflineOrProxy(e.to_string()))?;
-        let manifest: ReleaseManifest = serde_json::from_str(&text)?;
-        Ok(manifest)
-    }
-
     /// Verify an Ed25519 signature over the manifest bytes.
     ///
     /// `signature_bytes` may be base64 or hex encoded.
@@ -212,7 +185,7 @@ impl GatewayManager {
         signature_bytes: &[u8],
     ) -> Result<()> {
         let sig = decode_signature(signature_bytes)?;
-        let public_key = VerifyingKey::from_bytes(&STABLE_RELEASE_PUBLIC_KEY)?;
+        let public_key = VerifyingKey::from_bytes(&self.release_public_key)?;
         public_key
             .verify(manifest_bytes, &sig)
             .map_err(GatewayManagerError::Signature)
@@ -470,32 +443,46 @@ impl GatewayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway_manager::tests::test_manager;
+    use crate::gateway_manager::tests::{test_manager, test_manager_with_key};
     use ed25519_dalek::{Signer, SigningKey};
     use legion_protocol::ProtocolRange;
     use std::fs::File;
 
+    /// A fresh Ed25519 keypair for the manifest-signing tests. Each test run
+    /// uses a deterministic key so the manager and signer agree, without ever
+    /// touching the production `STABLE_RELEASE_PUBLIC_KEY`.
+    fn test_keypair() -> (SigningKey, [u8; 32]) {
+        let seed: [u8; 32] = *b"legion-test-signing-keypair-seed"; // exactly 32 bytes
+        let signing = SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key().to_bytes();
+        (signing, verifying)
+    }
+
     fn sign_manifest(bytes: &[u8]) -> Vec<u8> {
-        let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-            .unwrap();
-        let signing_key = SigningKey::from_bytes(&seed.try_into().unwrap());
+        let (signing_key, _) = test_keypair();
         let sig = signing_key.sign(bytes);
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.to_bytes())
             .into_bytes()
+    }
+
+    fn manager_with_test_key() -> GatewayManager {
+        let (_, public_key) = test_keypair();
+        let (mgr, _tmp) = test_manager_with_key(public_key);
+        mgr
     }
 
     const TEST_MANIFEST: &[u8] = br#"{"formatVersion":1,"channel":"stable","publishedAt":"2026-07-14T00:00:00Z","releases":[]}"#;
 
     #[test]
     fn verify_manifest_signature_accepts_base64() {
-        let (mgr, _tmp) = test_manager();
+        let mgr = manager_with_test_key();
         let sig = sign_manifest(TEST_MANIFEST);
         mgr.verify_manifest_signature(TEST_MANIFEST, &sig).unwrap();
     }
 
     #[test]
     fn verify_manifest_signature_accepts_hex() {
-        let (mgr, _tmp) = test_manager();
+        let mgr = manager_with_test_key();
         let sig_b64 = sign_manifest(TEST_MANIFEST);
         let raw =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &sig_b64).unwrap();
@@ -506,7 +493,7 @@ mod tests {
 
     #[test]
     fn verify_manifest_signature_rejects_tampered() {
-        let (mgr, _tmp) = test_manager();
+        let mgr = manager_with_test_key();
         let sig = sign_manifest(TEST_MANIFEST);
         let mut tampered = TEST_MANIFEST.to_vec();
         tampered[20] ^= 1;
@@ -515,7 +502,7 @@ mod tests {
 
     #[test]
     fn verify_manifest_signature_rejects_wrong_key() {
-        let (mgr, _tmp) = test_manager();
+        let mgr = manager_with_test_key();
         // A well-formed Ed25519 signature from a key that is not the release key.
         let other_key = SigningKey::from_bytes(&[42u8; 32]);
         let sig = other_key.sign(TEST_MANIFEST);

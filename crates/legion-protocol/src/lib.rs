@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod compatibility;
+pub mod harness;
 pub mod manifest;
 pub mod websocket;
 

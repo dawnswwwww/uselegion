@@ -5,16 +5,23 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 legion-core = { path = "../legion-core" }
 legion-plugin-sdk = { path = "../legion-plugin-sdk" }
-async-trait = "0.1"
+async-trait = { workspace = true }
 dirs = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 hmac = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+reqwest = { workspace = true, features = ["stream", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -26,5 +33,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
-tokio-test = "0.4"
+tokio-test = { workspace = true }
 wiremock = { workspace = true }

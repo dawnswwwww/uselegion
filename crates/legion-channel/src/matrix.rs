@@ -1,3 +1,7 @@
+use crate::util::{
+    Lifecycle, StopPolicy, cfg_required, cfg_str, cfg_str_or, ensure_success, reconnect_delay,
+    send_json,
+};
 use async_trait::async_trait;
 use legion_plugin_sdk::channel::{
     ChannelCapabilities, ChannelError, ChannelProvider, InboundMessage, Media, OutboundMessage,
@@ -9,7 +13,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 /// Built-in Matrix channel provider using the client-server `/sync` long poll.
 ///
@@ -21,11 +25,8 @@ use tokio::sync::{Mutex, mpsc};
 /// homeserver in this environment.
 #[derive(Debug)]
 pub struct MatrixProvider {
-    http: reqwest::Client,
-    config: Mutex<Option<MatrixConfig>>,
-    running: Arc<AtomicBool>,
+    lifecycle: Lifecycle<MatrixConfig>,
     txn_counter: Arc<AtomicU64>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,11 +40,8 @@ struct MatrixConfig {
 impl MatrixProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
-            config: Mutex::new(None),
-            running: Arc::new(AtomicBool::new(false)),
+            lifecycle: Lifecycle::new(),
             txn_counter: Arc::new(AtomicU64::new(1)),
-            task: Mutex::new(None),
         }
     }
 }
@@ -68,6 +66,7 @@ impl ChannelProvider for MatrixProvider {
             thread: false,
             reactions: false,
             typing: false,
+            buttons: false,
         }
     }
 
@@ -78,41 +77,32 @@ impl ChannelProvider for MatrixProvider {
     ) -> Result<(), ChannelError> {
         let mut cfg = parse_config(config)?;
         if cfg.user_id.is_none() {
-            cfg.user_id = Some(fetch_user_id(&self.http, &cfg).await?);
+            cfg.user_id = Some(fetch_user_id(&self.lifecycle.http, &cfg).await?);
         }
-        *self.config.lock().await = Some(cfg.clone());
-        self.running.store(true, Ordering::SeqCst);
 
-        let running = self.running.clone();
-        let http = self.http.clone();
+        let running = self.lifecycle.running.clone();
+        let http = self.lifecycle.http.clone();
         let account_id = cfg.account_id.clone();
+        let task_cfg = cfg.clone();
 
-        let handle = tokio::spawn(async move {
-            sync_loop(&http, &cfg, inbound_tx, running).await;
-        });
+        self.lifecycle
+            .begin(cfg, async move {
+                sync_loop(&http, &task_cfg, inbound_tx, running).await;
+            })
+            .await;
 
-        *self.task.lock().await = Some(handle);
         tracing::info!(channel = "matrix", account = %account_id, "Matrix channel started");
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), ChannelError> {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.task.lock().await.take() {
-            handle.abort();
-        }
-        *self.config.lock().await = None;
+        self.lifecycle.stop(StopPolicy::Abort).await;
         tracing::info!(channel = "matrix", "Matrix channel stopped");
         Ok(())
     }
 
     async fn send(&self, message: OutboundMessage) -> Result<(), ChannelError> {
-        let cfg = self
-            .config
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChannelError::NotStarted)?;
+        let cfg = self.lifecycle.config().await?;
 
         let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
         let url = format!(
@@ -124,57 +114,31 @@ impl ChannelProvider for MatrixProvider {
             "body": message.text.unwrap_or_default(),
         });
 
-        let response = self
-            .http
-            .put(&url)
-            .bearer_auth(&cfg.access_token)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".into());
-            return Err(ChannelError::SendFailed(format!(
-                "matrix send message failed: {status} {body}"
-            )));
-        }
+        let response = send_json(
+            self.lifecycle.http.put(&url).bearer_auth(&cfg.access_token),
+            &payload,
+        )
+        .await?;
+        ensure_success(response, "matrix send message").await?;
 
         Ok(())
     }
 }
 
 fn parse_config(config: Value) -> Result<MatrixConfig, ChannelError> {
-    let homeserver = config
-        .get("homeserver")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChannelError::InvalidConfig("matrix homeserver is required".into()))?
+    let homeserver = cfg_required(&config, &["homeserver"], "matrix homeserver is required")?
         .trim_end_matches('/')
         .to_string();
 
-    let access_token = config
-        .get("accessToken")
-        .or_else(|| config.get("access_token"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChannelError::InvalidConfig("matrix accessToken is required".into()))?
-        .to_string();
+    let access_token = cfg_required(
+        &config,
+        &["accessToken", "access_token"],
+        "matrix accessToken is required",
+    )?;
 
-    let account_id = config
-        .get("accountId")
-        .or_else(|| config.get("account_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+    let account_id = cfg_str_or(&config, &["accountId", "account_id"], "default");
 
-    let user_id = config
-        .get("userId")
-        .or_else(|| config.get("user_id"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let user_id = cfg_str(&config, &["userId", "user_id"]).map(str::to_string);
 
     Ok(MatrixConfig {
         homeserver,
@@ -387,12 +351,12 @@ async fn sync_loop(
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to decode matrix sync response");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    reconnect_delay().await;
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "matrix sync request failed");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                reconnect_delay().await;
             }
         }
     }

@@ -6,13 +6,17 @@ pub mod compaction;
 pub mod context;
 pub mod context_engine;
 pub mod coordinator;
+pub mod goal;
+pub mod goal_gate;
 pub mod harness;
+pub mod llm;
 pub mod memory;
 pub mod messenger;
 pub mod plan_mode;
 pub mod prompt;
 pub mod question;
 pub mod recall_selector;
+pub(crate) mod run_loop;
 pub mod secret_scanner;
 pub mod skill_selector;
 pub mod skills_prompt;
@@ -41,6 +45,8 @@ pub use coordinator::{
     CoordinatorError, CoordinatorPhase, CoordinatorPlan, CoordinatorReport, CoordinatorTask,
     PhaseReport, run_coordinator_plan,
 };
+pub use goal::{Goal, GoalAction, GoalError, GoalStatus, GoalStore, apply_action, parse_goal};
+pub use goal_gate::{GoalGate, GoalGateResult};
 pub use harness::{Harness, HarnessRegistry};
 pub use memory::{DecayReport, MemoryBackend, MemoryError, MemoryKind, MemoryNote, RecallContext};
 pub use messenger::{AgentMessenger, MessengerError};
@@ -68,14 +74,4 @@ pub use tools::{
 };
 pub use types::{LifecyclePhase, RunEvent, RunRequest, RunStream, RuntimeError};
 
-use std::path::PathBuf;
-
-/// Expand a leading `~` in a path using the `HOME` environment variable.
-pub(crate) fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
+pub(crate) use legion_core::fs::expand_tilde;

@@ -25,7 +25,10 @@ fn send_user_message(
     text: String,
 ) {
     if state.is_active() {
-        state.queued_messages.push_back((text, true));
+        state.queued_messages.push((text, true));
+        if state.queue_selected.is_none() {
+            state.queue_selected = Some(0);
+        }
     } else {
         state
             .messages
@@ -43,7 +46,7 @@ fn send_agent_message(
     message: String,
 ) {
     if state.is_active() {
-        state.queued_messages.push_back((message, false));
+        state.queued_messages.push((message, false));
     } else {
         state.pending_request = true;
         let _ = send_tx.send(OutboundControl::Message(message));
@@ -53,7 +56,8 @@ fn send_agent_message(
 /// Pop the oldest queued message into the chat and send it. Called when a
 /// run lifecycle ends (normally, with an error, or cancelled).
 fn drain_queued_message(state: &mut AppState, send_tx: &mpsc::UnboundedSender<OutboundControl>) {
-    if let Some((text, show_in_chat)) = state.queued_messages.pop_front() {
+    if let Some((text, show_in_chat)) = state.queued_messages.first().cloned() {
+        state.queued_messages.remove(0);
         if show_in_chat {
             state
                 .messages
@@ -61,6 +65,13 @@ fn drain_queued_message(state: &mut AppState, send_tx: &mpsc::UnboundedSender<Ou
         }
         state.pending_request = true;
         let _ = send_tx.send(OutboundControl::Message(text));
+        // Keep the selection valid after the front item shifted.
+        state.queue_selected = match state.queued_messages.len() {
+            0 => None,
+            n => Some(state.queue_selected.unwrap_or(0).min(n - 1)),
+        };
+    } else {
+        state.queue_selected = None;
     }
 }
 
@@ -75,10 +86,147 @@ pub(crate) fn fail_pending_send(state: &mut AppState, err: &str) {
     let dropped = state.queued_messages.len();
     if dropped > 0 {
         state.queued_messages.clear();
+        state.queue_selected = None;
         state.messages.push(ChatMessage::new(
             MessageRole::System,
             format!("{dropped} queued message(s) discarded after send failure"),
         ));
+    }
+}
+
+/// Begin editing the queued item at `idx`: remove it from the queue (the
+/// queue stays drain-safe with no dangling entry), prefill the composer,
+/// and record the position to re-insert at on commit.
+fn begin_queue_edit(state: &mut AppState, idx: usize) {
+    if let Some((text, _show_in_chat)) = state.queued_messages.get(idx).cloned() {
+        state.queued_messages.remove(idx);
+        // Removing the item may have invalidated the selection; re-clamp it
+        // so the panel still shows a sensible highlight while editing.
+        state.queue_selected = if state.queued_messages.is_empty() {
+            None
+        } else {
+            Some(idx.min(state.queued_messages.len() - 1))
+        };
+        state.composer.set_text(&text);
+        state.queue_edit = Some(idx);
+    }
+}
+
+/// Modal key handler while the composer is editing a queued item. Enter
+/// commits the edited text back at the original position; Esc drops the
+/// edit and clears the composer (the item is not restored, matching
+/// "discard"); everything else edits freely.
+fn handle_queue_edit_key(state: &mut AppState, key: event::KeyEvent, idx: usize) {
+    match key.code {
+        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+            let text = state.composer.join();
+            let text = text.trim();
+            if !text.is_empty() {
+                let insert_at = idx.min(state.queued_messages.len());
+                state
+                    .queued_messages
+                    .insert(insert_at, (text.to_string(), true));
+                if state.queue_selected.is_none() {
+                    state.queue_selected = Some(insert_at);
+                }
+            }
+            state.composer.clear();
+            state.queue_edit = None;
+        }
+        KeyCode::Esc => {
+            state.composer.clear();
+            state.queue_edit = None;
+        }
+        _ => {
+            state.composer.input(key);
+        }
+    }
+}
+
+/// Act on a queue-panel key when the queue is non-empty. Returns true when
+/// the key was consumed (so the caller short-circuits); false lets it fall
+/// through to the normal input path — notably Enter with non-empty editor
+/// text still sends/queues as usual.
+fn handle_queue_key(
+    state: &mut AppState,
+    key: event::KeyEvent,
+    send_tx: &mpsc::UnboundedSender<OutboundControl>,
+) -> bool {
+    let len = state.queued_messages.len();
+    if len == 0 {
+        return false;
+    }
+    let cur = state.queue_selected.unwrap_or(0);
+    match key.code {
+        KeyCode::Up => {
+            state.queue_selected = Some(if cur == 0 { len - 1 } else { cur - 1 });
+            true
+        }
+        KeyCode::Down => {
+            state.queue_selected = Some((cur + 1) % len);
+            true
+        }
+        // Edit the selected item, but only when the composer is empty: a
+        // non-empty composer with Enter is the user sending a new message
+        // (which queues behind the run), so let it fall through.
+        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+            if state.composer.join().trim().is_empty() {
+                begin_queue_edit(state, cur);
+                true
+            } else {
+                false
+            }
+        }
+        // Steer: promote the selected item to the front of the queue, then
+        // cancel the in-flight run. The resulting lifecycle/error event
+        // drains the (new) front item — the steered message — and starts a
+        // fresh turn with it. No new OutboundControl variant needed.
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if cur > 0 {
+                let item = state.queued_messages.remove(cur);
+                state.queued_messages.insert(0, item);
+            }
+            state.queue_selected = Some(0);
+            let _ = send_tx.send(OutboundControl::Cancel);
+            state.messages.push(ChatMessage::new(
+                MessageRole::System,
+                "steering: cancelling current run…".to_string(),
+            ));
+            true
+        }
+        // Remove the selected item from the queue.
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.queued_messages.remove(cur);
+            state.queue_selected = if state.queued_messages.is_empty() {
+                None
+            } else {
+                Some(cur.min(state.queued_messages.len() - 1))
+            };
+            true
+        }
+        // Clear the entire queue (does not affect the in-flight run).
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.queued_messages.clear();
+            state.queue_selected = None;
+            true
+        }
+        // Reorder the selected item up.
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if cur > 0 {
+                state.queued_messages.swap(cur - 1, cur);
+                state.queue_selected = Some(cur - 1);
+            }
+            true
+        }
+        // Reorder the selected item down.
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if cur + 1 < len {
+                state.queued_messages.swap(cur, cur + 1);
+                state.queue_selected = Some(cur + 1);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -134,6 +282,21 @@ pub(crate) fn handle_key_event(
         handle_history_search_key(state, key);
         return;
     }
+    // While editing a queued message (Enter on a selected queue item), the
+    // composer is a modal: Enter commits the edit in place, Esc abandons,
+    // everything else is free editing. The item has already been removed
+    // from the queue on entry, so the queue stays drain-safe throughout.
+    if let Some(idx) = state.queue_edit {
+        handle_queue_edit_key(state, key, idx);
+        return;
+    }
+    // While the queue panel is visible (queue non-empty), ↑/↓ select items
+    // instead of browsing input history; the other keys act on the selected
+    // item. When the queue is empty these branches fall through and ↑/↓
+    // resume their usual history-browsing role.
+    if !state.queued_messages.is_empty() && handle_queue_key(state, key, send_tx) {
+        return;
+    }
     // Computed once per key: the completion menu state for `/` input. It is
     // derived from the input alone, so every handler below sees the same view.
     let sugg = state.slash_suggestions();
@@ -143,6 +306,11 @@ pub(crate) fn handle_key_event(
         // a bare 'q'/'t' can be interpreted as a command.
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             toggle_nearest_thinking(state);
+        }
+        // Ctrl+o ("open") expands/collapses the most recent tool card, so the
+        // mouse-free path mirrors clicking a card's title row.
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            toggle_nearest_tool(state);
         }
         KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.composer.undo();
@@ -347,6 +515,8 @@ pub(crate) fn refresh_question_message(state: &mut AppState) {
 /// Left/Right arrows switch tabs (wrapping), Up/Down navigate options within
 /// the current question tab, Space toggles multi-select options, Enter selects
 /// the focused option or submits on the Submit tab, and Esc cancels the prompt.
+/// Selecting a single-select option answers that question, so it advances to
+/// the next question tab (or the Submit tab when it was the last one).
 pub(crate) fn handle_question_key(
     state: &mut AppState,
     key: event::KeyEvent,
@@ -410,6 +580,10 @@ pub(crate) fn handle_question_key(
                 pq.toggle(&question, &label);
             } else {
                 pq.select_only(&question, &label);
+                // A single-select choice answers this question; advance to the
+                // next question tab, or to the Submit tab if none remain.
+                pq.current = (pq.current + 1).min(pq.questions.len());
+                pq.focused = 0;
             }
             refresh_question_message(state);
             return;
@@ -428,7 +602,7 @@ pub(crate) fn handle_history_search_key(state: &mut AppState, key: event::KeyEve
     let Some(ref mut hs) = state.history_search else {
         return;
     };
-    let filtered = hs.filtered(&state.input_history);
+    let filtered = hs.filtered(state.input_history.entries());
     match key.code {
         KeyCode::Esc => {
             state.history_search = None;
@@ -569,7 +743,22 @@ pub(crate) fn handle_mouse_event(state: &mut AppState, mouse: MouseEvent) {
                     break;
                 }
             }
+            // Tool-card title rows toggle the card's expand state.
+            let mut hit_tool = false;
             if !hit_think {
+                for (rect, msg_idx) in &state.tool_hitboxes {
+                    if rect.contains(pos) {
+                        if state.expanded_tools.contains(msg_idx) {
+                            state.expanded_tools.remove(msg_idx);
+                        } else {
+                            state.expanded_tools.insert(*msg_idx);
+                        }
+                        hit_tool = true;
+                        break;
+                    }
+                }
+            }
+            if !hit_think && !hit_tool {
                 state.selection = None;
                 if let Some(cursor) =
                     position_to_cursor(pos, &state.message_rects, &state.render_cache)
@@ -842,6 +1031,22 @@ pub(crate) fn toggle_nearest_thinking(state: &mut AppState) {
             }
             return;
         }
+    }
+}
+
+/// Toggle the expand state of the most recent tool-card message, mirroring
+/// [`toggle_nearest_thinking`] for keyboard users.
+pub(crate) fn toggle_nearest_tool(state: &mut AppState) {
+    for (msg_idx, msg) in state.messages.iter().enumerate().rev() {
+        if msg.role != MessageRole::Tool {
+            continue;
+        }
+        if state.expanded_tools.contains(&msg_idx) {
+            state.expanded_tools.remove(&msg_idx);
+        } else {
+            state.expanded_tools.insert(msg_idx);
+        }
+        return;
     }
 }
 

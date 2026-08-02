@@ -4,7 +4,7 @@ use crate::tui::input::char_width;
 use crate::tui::markdown::{markdown_lines, plain_lines};
 use crate::tui::state::{
     AppState, ChatMessage, MessageRole, MessageState, PendingQuestion, RenderedMessage,
-    SUBMIT_LABEL, ThinkHint,
+    SUBMIT_LABEL, ThinkHint, ToolHint,
 };
 use crate::tui::syntax::Highlighter;
 use crate::tui::theme::Theme;
@@ -161,12 +161,15 @@ pub(crate) fn message_lines(
     msg: &ChatMessage,
     msg_index: usize,
     expanded: &HashSet<(usize, usize)>,
+    expanded_tools: &HashSet<usize>,
     viewport_width: u16,
     theme: &Theme,
     highlighter: &Highlighter,
 ) -> RenderedMessage {
     if msg.role == MessageRole::Tool {
-        let mut lines = render_tool_card(&msg.content, theme);
+        let is_expanded = expanded_tools.contains(&msg_index);
+        let rendered = render_tool_card(&msg.content, theme, is_expanded);
+        let mut lines = rendered.lines;
         if msg.state == MessageState::Streaming || msg.state == MessageState::Loading {
             lines.push(Line::from(Span::styled(
                 "▌",
@@ -176,6 +179,9 @@ pub(crate) fn message_lines(
         return RenderedMessage {
             lines,
             think_hints: Vec::new(),
+            tool_hint: Some(ToolHint {
+                start_line: rendered.header_line,
+            }),
         };
     }
 
@@ -186,6 +192,7 @@ pub(crate) fn message_lines(
         return RenderedMessage {
             lines,
             think_hints: Vec::new(),
+            tool_hint: None,
         };
     }
 
@@ -280,7 +287,11 @@ pub(crate) fn message_lines(
         )));
     }
 
-    RenderedMessage { lines, think_hints }
+    RenderedMessage {
+        lines,
+        think_hints,
+        tool_hint: None,
+    }
 }
 
 /// Truncate a string to fit within `width` display columns, adding an ellipsis
@@ -372,6 +383,49 @@ pub(crate) fn render_todo_panel(
             Style::default().fg(theme.tool_bar),
         )));
     }
+
+    lines
+}
+
+/// Render the queue panel: one line per visible queued message, with the
+/// selected item highlighted and a trailing keybind hint line. Only items
+/// that will appear in the chat (`show_in_chat == true`) are shown —
+/// agent-directed slash/skill payloads are kept out of the panel.
+pub(crate) fn render_queue_panel(
+    state: &AppState,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let selected = state.queue_selected;
+    let hint_style = Style::default().fg(theme.tool_bar);
+    let selected_style = Style::default().fg(theme.selected_fg).bg(theme.selected_bg);
+    let normal_style = Style::default().fg(theme.status_fg);
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, (text, show_in_chat)) in state.queued_messages.iter().enumerate() {
+        if !show_in_chat {
+            continue;
+        }
+        let is_selected = selected == Some(idx);
+        let style = if is_selected {
+            selected_style
+        } else {
+            normal_style
+        };
+        let marker = if is_selected { "▶" } else { " " };
+        let display = truncate_to_width(text, width.saturating_sub(2));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), hint_style),
+            Span::styled(display, style),
+        ]));
+    }
+
+    // Trailing hint line documents the available keys. Always rendered so the
+    // affordances are discoverable even with a single queued item.
+    let hint = "↑↓ select · enter edit · ^s steer · ^d remove · ^k clear · alt-j/k reorder";
+    lines.push(Line::from(Span::styled(
+        truncate_to_width(hint, width),
+        hint_style,
+    )));
 
     lines
 }

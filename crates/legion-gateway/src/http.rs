@@ -4,6 +4,8 @@ use axum::extract::{Extension, Path};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::response::Json;
+use legion_automation::task_runner::EnqueueRequest;
+use legion_automation::tasks::TaskKind;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -66,9 +68,27 @@ pub async fn webhook_handler(
             Json(json!({ "error": "invalid signature" })),
         );
     }
-    tracing::info!(job_id = %job_id, "webhook triggered cron job");
-    match scheduler.run(&job_id).await {
-        Ok(task) => (StatusCode::OK, Json(json!({ "task_id": task.id }))),
+    let Some(task_runner) = state.task_runner.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task runner not available" })),
+        );
+    };
+
+    tracing::info!(job_id = %job_id, "webhook triggered cron job; enqueuing background task");
+    match task_runner
+        .enqueue(EnqueueRequest {
+            agent_id: job.agent_id,
+            message: job.message,
+            kind: TaskKind::Cron,
+            depends_on: Vec::new(),
+        })
+        .await
+    {
+        Ok(task) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "task_id": task.id, "status": "enqueued" })),
+        ),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),

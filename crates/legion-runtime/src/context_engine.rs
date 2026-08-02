@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::auto_extract::AutoExtractor;
 use crate::commitments::CommitmentExtractor;
 use crate::compaction::TwoPassCompactor;
+use crate::goal::GoalStore;
 use crate::memory::MemoryBackend;
 use crate::messenger::AgentMessenger;
 use crate::recall_selector::LlmRecallSelector;
@@ -60,6 +61,7 @@ pub struct LegacyContextEngine {
     messenger: Option<Arc<dyn AgentMessenger>>,
     swarm: Option<Arc<SwarmManager>>,
     todo_gate: TodoGate,
+    goal_store: GoalStore,
     telemetry: Option<Arc<TelemetryClient>>,
 }
 
@@ -91,6 +93,7 @@ impl LegacyContextEngine {
             messenger: None,
             swarm: None,
             todo_gate,
+            goal_store: GoalStore::default(),
             telemetry: None,
         }
     }
@@ -134,6 +137,13 @@ impl LegacyContextEngine {
     /// in earlier turns of the same session (Phase C).
     pub fn with_surfaced(mut self, surfaced: SurfacedStore) -> Self {
         self.surfaced = surfaced;
+        self
+    }
+
+    /// Override the goal store used for the session-goal gate and context
+    /// injection (tests point it at a temp dir).
+    pub fn with_goal_store(mut self, goal_store: GoalStore) -> Self {
+        self.goal_store = goal_store;
         self
     }
 
@@ -182,48 +192,32 @@ impl ContextEngine for LegacyContextEngine {
         use futures::SinkExt;
         use futures::channel::mpsc::channel;
 
-        let tool_registry = self.tool_registry.clone();
-        let memory_backend = self.memory_backend.clone();
-        let compactor = self.compactor.clone();
-        let config = self.config.clone();
-        let plugin_skills = self.plugin_skills.clone();
-        let auto_extractor = self.auto_extractor.clone();
-        let commitment_extractor = self.commitment_extractor.clone();
-        let recall_config = self.recall_config.clone();
-        let selector = self.selector.clone();
-        let surfaced = self.surfaced.clone();
-        let spawner = self.spawner.clone();
-        let messenger = self.messenger.clone();
-        let swarm = self.swarm.clone();
-        let todo_gate = self.todo_gate.clone();
-        let telemetry = self.telemetry.clone();
+        let ctx = crate::run_loop::RunContext {
+            provider_router,
+            tool_registry: self.tool_registry.clone(),
+            memory_backend: self.memory_backend.clone(),
+            compactor: self.compactor.clone(),
+            config: self.config.clone(),
+            request,
+            max_iterations,
+            plugin_skills: self.plugin_skills.clone(),
+            auto_extractor: self.auto_extractor.clone(),
+            commitment_extractor: self.commitment_extractor.clone(),
+            recall_config: self.recall_config.clone(),
+            selector: self.selector.clone(),
+            surfaced: self.surfaced.clone(),
+            spawner: self.spawner.clone(),
+            messenger: self.messenger.clone(),
+            swarm: self.swarm.clone(),
+            todo_gate: self.todo_gate.clone(),
+            goal_store: self.goal_store.clone(),
+            telemetry: self.telemetry.clone(),
+        };
 
         let (mut tx, rx) = channel::<crate::types::RunEvent>(128);
 
         tokio::spawn(async move {
-            if let Err(err) = crate::agent_loop::run_loop(
-                provider_router,
-                tool_registry,
-                memory_backend,
-                compactor,
-                config,
-                request,
-                max_iterations,
-                plugin_skills,
-                auto_extractor,
-                commitment_extractor,
-                recall_config,
-                selector,
-                surfaced,
-                spawner,
-                messenger,
-                swarm,
-                todo_gate,
-                telemetry,
-                &mut tx,
-            )
-            .await
-            {
+            if let Err(err) = crate::run_loop::run_loop(ctx, &mut tx).await {
                 let _ = tx
                     .send(crate::types::RunEvent::Lifecycle {
                         phase: crate::types::LifecyclePhase::Error,

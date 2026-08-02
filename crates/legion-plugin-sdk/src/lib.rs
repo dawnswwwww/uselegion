@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod session_key;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -529,6 +530,7 @@ mod tests {
                 thread: false,
                 reactions: false,
                 typing: false,
+                buttons: false,
             }
         }
 

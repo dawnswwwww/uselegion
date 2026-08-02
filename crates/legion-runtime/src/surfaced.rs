@@ -16,10 +16,9 @@ pub struct SurfacedStore {
 
 impl Default for SurfacedStore {
     fn default() -> Self {
-        let base_dir = std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".legion"))
-            .unwrap_or_else(|_| PathBuf::from(".legion"));
-        Self { base_dir }
+        Self {
+            base_dir: legion_core::fs::legion_home(),
+        }
     }
 }
 
@@ -80,14 +79,8 @@ impl SurfacedStore {
     }
 
     async fn atomic_write(&self, path: &Path, json: &str) {
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = tokio::fs::write(&tmp, json.as_bytes()).await {
+        if let Err(e) = legion_core::fs::atomic_write_async(path, json.as_bytes()).await {
             tracing::warn!(error = %e, "surfaced store: write failed");
-            return;
-        }
-        if let Err(e) = tokio::fs::rename(&tmp, path).await {
-            tracing::warn!(error = %e, "surfaced store: rename failed");
-            let _ = tokio::fs::remove_file(&tmp).await;
         }
     }
 }

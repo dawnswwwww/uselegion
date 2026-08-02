@@ -6,7 +6,6 @@
 //! picks the most relevant skills from the keyword candidates.
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use legion_provider::router::ProviderRouter;
 use legion_provider::types::{ChatMessage, ChatRequest};
 use legion_skills::Skill;
@@ -132,53 +131,20 @@ impl SkillSelector for LlmSkillSelector {
             vec![ChatMessage::system(system), ChatMessage::user(user)],
         );
 
-        let result =
-            tokio::time::timeout(self.timeout, self.router.chat(&self.model_ref, req)).await;
-
-        match result {
-            Ok(Ok(mut stream)) => {
-                let mut text = String::new();
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(c) => text.push_str(&c.delta),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "skill selector stream error");
-                            return Vec::new();
-                        }
-                    }
-                }
-                parse_llm_selection(&text, candidates, limit)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "skill selector LLM call failed");
-                Vec::new()
-            }
-            Err(_) => {
-                tracing::warn!("skill selector LLM call timed out");
-                Vec::new()
-            }
-        }
+        let Some(text) =
+            crate::llm::chat_text_with_timeout(&self.router, &self.model_ref, req, self.timeout)
+                .await
+        else {
+            return Vec::new();
+        };
+        parse_llm_selection(&text, candidates, limit)
     }
 }
 
 fn parse_llm_selection(text: &str, candidates: &[&Skill], limit: usize) -> Vec<usize> {
-    let trimmed = text.trim();
-    let start = trimmed.find('[');
-    let end = trimmed.rfind(']');
-    let json_str = match (start, end) {
-        (Some(s), Some(e)) if s < e => &trimmed[s..=e],
-        _ => {
-            tracing::warn!(text = %text, "skill selector response did not contain a JSON array");
-            return Vec::new();
-        }
-    };
-
-    let names: Vec<String> = match serde_json::from_str(json_str) {
-        Ok(names) => names,
-        Err(e) => {
-            tracing::warn!(error = %e, text = %text, "failed to parse skill selector JSON");
-            return Vec::new();
-        }
+    let Some(names) = crate::llm::extract_json_array::<String>(text) else {
+        tracing::warn!(text = %text, "skill selector response did not contain a JSON array");
+        return Vec::new();
     };
 
     let mut selected = Vec::new();

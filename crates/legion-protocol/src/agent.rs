@@ -31,6 +31,11 @@ pub struct AgentParams {
     /// layer (tools/bootstrap/skills); the memory backend is unaffected.
     #[serde(default, rename = "workspace", skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
+    /// Sender identifier (e.g. the channel user id) used for `allow_from`
+    /// policy checks and approval routing. Only the gateway's channel inbound
+    /// path sets this; WS clients never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

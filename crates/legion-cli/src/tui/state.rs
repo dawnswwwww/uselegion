@@ -89,6 +89,15 @@ impl ChatMessage {
     }
 }
 
+/// A locally-produced system notice delivered from a background task to the
+/// TUI loop (e.g. the result of an async `/mcp` query). Slash-command
+/// handlers are synchronous, so async work reports back through this
+/// channel instead of touching `AppState` directly.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalNotice {
+    pub text: String,
+}
+
 /// A command from the TUI loop to the background sender task: a user
 /// message to run as a turn (`Message`), a run cancellation (`Cancel`, sent
 /// on Esc), a local shell escape (`ShellCommand`), or a resolution for a
@@ -117,8 +126,10 @@ pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     /// Rich multi-line input editor.
     pub(crate) composer: Composer,
-    /// User inputs sent in this TUI session, recalled with ↑/↓.
-    pub(crate) input_history: Vec<String>,
+    /// User inputs recalled with ↑/↓. Persistent and shared across all
+    /// sessions in the same workspace when loaded with a file path; an
+    /// in-memory list otherwise (tests / `AppState::default()`).
+    pub(crate) input_history: crate::tui::input_history::InputHistoryStore,
     /// Index into `input_history` when browsing history. `None` means the
     /// current draft is being edited.
     pub(crate) history_index: Option<usize>,
@@ -140,6 +151,8 @@ pub struct AppState {
     pub(crate) session_peer: String,
     /// Which `(message_index, think_index)` blocks are expanded.
     pub(crate) expanded_thinks: HashSet<(usize, usize)>,
+    /// Which tool-card messages (by `message_index`) are expanded.
+    pub(crate) expanded_tools: HashSet<usize>,
     /// Cached input area width (inner) for dynamic input height calculations.
     pub(crate) input_area_width: u16,
     /// Cached viewport height for scroll clamping.
@@ -163,8 +176,17 @@ pub struct AppState {
     /// User messages typed while a run is active, sent (in order) when the
     /// run finishes. The bool marks whether the text should appear in the
     /// chat as a user message when it is finally sent (false for
-    /// agent-directed slash-command payloads).
-    pub(crate) queued_messages: std::collections::VecDeque<(String, bool)>,
+    /// agent-directed slash-command payloads). A `Vec` (not `VecDeque`)
+    /// because the queue panel supports indexed edit/remove/reorder, which
+    /// `Vec::insert`/`remove` cover natively; queue depth is tiny so the
+    /// O(n) `remove(0)` drain is irrelevant.
+    pub(crate) queued_messages: Vec<(String, bool)>,
+    /// Selected index in the queue panel, if any. Drives all keyboard
+    /// operations (edit/steer/remove/reorder) when the queue is non-empty.
+    pub(crate) queue_selected: Option<usize>,
+    /// When set, the composer is editing the queued item at this index:
+    /// Enter commits (re-inserts at the same position), Esc abandons.
+    pub(crate) queue_edit: Option<usize>,
     /// A tool-approval prompt awaiting the user's y/n answer:
     /// `(prompt_id, tool)`. While set, key input is intercepted by the
     /// approval handler instead of reaching the input box.
@@ -174,6 +196,9 @@ pub struct AppState {
     pub(crate) pending_question: Option<PendingQuestion>,
     /// Screen rectangles of thinking hint lines for mouse clicks.
     pub(crate) think_hitboxes: Vec<(ratatui::layout::Rect, usize, usize)>,
+    /// Screen rectangles of tool-card title rows for mouse clicks, as
+    /// `(rect, message_index)`. Mirrors `think_hitboxes` (one fewer id).
+    pub(crate) tool_hitboxes: Vec<(ratatui::layout::Rect, usize)>,
     /// Screen rectangles of each visible message body, refreshed each draw, as
     /// `(msg_idx, rect, first_line)`. `first_line` is the index into the
     /// message's rendered lines of the row at `rect.y` (nonzero when the
@@ -219,10 +244,10 @@ pub struct AppState {
     /// Config file path used to persist `/theme` and `/mode`. `None` in
     /// tests, where persistence must not touch the real config file.
     pub(crate) config_path: Option<std::path::PathBuf>,
-    /// In inline mode, index of the last message already emitted to the native
-    /// scrollback. Messages finalized after this index are flushed on the next
-    /// frame.
-    pub last_emitted_scrollback_index: usize,
+    /// Sender half of the local-notice channel, cloned by slash-command
+    /// handlers that spawn async work (`/mcp status`, ...). `None` in
+    /// tests, where the channel does not exist.
+    pub(crate) local_tx: Option<tokio::sync::mpsc::UnboundedSender<LocalNotice>>,
 }
 
 /// UI state for an in-flight `ask_user` prompt.
@@ -324,7 +349,13 @@ impl AppState {
         use crate::tui::widgets::{left_bar_span, message_lines, role_background};
         self.render_cache.truncate(self.messages.len());
         for idx in 0..self.messages.len() {
-            let key = render_key(&self.messages[idx], idx, &self.expanded_thinks, width);
+            let key = render_key(
+                &self.messages[idx],
+                idx,
+                &self.expanded_thinks,
+                &self.expanded_tools,
+                width,
+            );
             let fresh = self
                 .render_cache
                 .get(idx)
@@ -345,11 +376,12 @@ impl AppState {
                 &self.messages[idx],
                 idx,
                 &self.expanded_thinks,
+                &self.expanded_tools,
                 content_width,
                 &self.theme,
                 &self.highlighter,
             );
-            let (mut lines, think_hints) = wrap_and_remap(rendered, content_width);
+            let (mut lines, think_hints, tool_hint) = wrap_and_remap(rendered, content_width);
             if role != MessageRole::Tool {
                 let bar = left_bar_span(role, &self.theme);
                 let bg = role_background(role, &self.theme);
@@ -371,6 +403,7 @@ impl AppState {
                 key,
                 lines,
                 think_hints,
+                tool_hint,
             });
         }
     }
@@ -452,6 +485,9 @@ pub(crate) struct RenderedMessage {
     /// Hint line numbers index the *unwrapped* `lines`; `wrap_and_remap`
     /// translates them into wrapped-line space for the cache.
     pub(crate) think_hints: Vec<ThinkHint>,
+    /// For tool messages: the title row that a click toggles. Empty for
+    /// non-tool messages. Same wrapped-line remap as `think_hints` applies.
+    pub(crate) tool_hint: Option<ToolHint>,
 }
 
 #[derive(Clone)]
@@ -459,6 +495,13 @@ pub(crate) struct ThinkHint {
     pub(crate) block_index: usize,
     pub(crate) start_line: usize,
     pub(crate) line_count: usize,
+}
+
+/// Clickable title row of a tool card. `line_count` is always 1; it mirrors
+/// [`ThinkHint`] so both flow through the same hitbox/cache plumbing.
+#[derive(Clone, Copy)]
+pub(crate) struct ToolHint {
+    pub(crate) start_line: usize,
 }
 
 /// Fingerprint of everything a message's rendered output depends on.
@@ -478,4 +521,5 @@ pub(crate) struct CachedRender {
     pub(crate) key: RenderKey,
     pub(crate) lines: Vec<Line<'static>>,
     pub(crate) think_hints: Vec<ThinkHint>,
+    pub(crate) tool_hint: Option<ToolHint>,
 }

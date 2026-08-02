@@ -144,6 +144,10 @@ async fn spawn_server_with_config_and_store(
     if let Some(store) = store {
         gateway = gateway.with_session_store(store);
     }
+    // router() only carries automation components after start_automation();
+    // production paths call it after bind, tests that serve router() directly
+    // call it here.
+    gateway.start_automation().await.unwrap();
     let router = gateway.router();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -611,7 +615,8 @@ async fn sessions_history_returns_stored_transcript() {
                 ChatMessage::assistant("first answer"),
             ],
         )
-        .await;
+        .await
+        .unwrap();
 
     let (addr, handle) = spawn_server_with_config_and_store(test_config(), None, Some(store)).await;
     let mut ws = connect_ws(addr).await;

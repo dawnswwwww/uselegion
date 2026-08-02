@@ -8,12 +8,14 @@
 
 pub mod repair;
 
-use crate::session_tools::is_safe_peer_id;
+use legion_plugin_sdk::session_key::{is_safe_segment, parse_session_key};
 use legion_provider::types::{ChatMessage, ChatRole};
 use legion_runtime::types::BoundaryMark;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::{error, warn};
@@ -22,15 +24,19 @@ use tracing::{error, warn};
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     base_dir: PathBuf,
+    /// Per-session write lock. A `std::sync::Mutex` guards the map itself;
+    /// each session has its own `tokio::sync::Mutex` so concurrent writes to
+    /// different sessions do not block one another.
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Default for SessionStore {
     fn default() -> Self {
-        Self {
-            base_dir: dirs::home_dir()
+        Self::new(
+            dirs::home_dir()
                 .map(|h| h.join(".legion"))
                 .unwrap_or_else(|| PathBuf::from(".legion")),
-        }
+        )
     }
 }
 
@@ -39,7 +45,16 @@ impl SessionStore {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn session_lock(&self, session_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        locks
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Load all messages for a session key.
@@ -92,24 +107,31 @@ impl SessionStore {
     }
 
     /// Append messages to a session transcript.
-    pub async fn append(&self, session_key: &str, messages: &[ChatMessage]) {
+    ///
+    /// Returns an error if the session key is invalid, the directory cannot be
+    /// created, or the file cannot be written. Callers that depend on durable
+    /// transcripts should propagate this error instead of silently continuing.
+    pub async fn append(&self, session_key: &str, messages: &[ChatMessage]) -> io::Result<()> {
         if messages.is_empty() {
-            return;
+            return Ok(());
         }
 
         let path = match self.session_path(session_key) {
             Some(p) => p,
             None => {
                 warn!(session_key, "invalid session key; cannot append transcript");
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid session key",
+                ));
             }
         };
 
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent).await {
-                error!(path = %parent.display(), error = %err, "failed to create session directory");
-                return;
-            }
+            fs::create_dir_all(parent).await?;
         }
 
         let now = unix_seconds();
@@ -120,22 +142,18 @@ impl SessionStore {
                 boundary: None,
                 timestamp: now,
             };
-            match serde_json::to_string(&entry) {
-                Ok(json) => {
-                    lines.push_str(&json);
-                    lines.push('\n');
-                }
-                Err(err) => {
-                    error!(error = %err, "failed to serialize transcript entry");
-                }
-            }
+            let json = serde_json::to_string(&entry).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("JSON error: {e}"))
+            })?;
+            lines.push_str(&json);
+            lines.push('\n');
         }
 
         if lines.is_empty() {
-            return;
+            return Ok(());
         }
 
-        Self::write_lines(&path, &lines).await;
+        Self::write_lines(&path, &lines).await
     }
 
     /// Append a compaction boundary marker to a session transcript.
@@ -143,20 +161,27 @@ impl SessionStore {
     /// The marker is written as a boundary-only JSONL entry. The `entry_index`
     /// field is updated to reflect the line number at which the boundary is
     /// written so that session-resume can locate compacted regions.
-    pub async fn append_boundary(&self, session_key: &str, boundary: &BoundaryMark) {
+    pub async fn append_boundary(
+        &self,
+        session_key: &str,
+        boundary: &BoundaryMark,
+    ) -> io::Result<()> {
         let path = match self.session_path(session_key) {
             Some(p) => p,
             None => {
                 warn!(session_key, "invalid session key; cannot append boundary");
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid session key",
+                ));
             }
         };
 
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent).await {
-                error!(path = %parent.display(), error = %err, "failed to create session directory");
-                return;
-            }
+            fs::create_dir_all(parent).await?;
         }
 
         let entry_index = count_existing_lines(&path).await;
@@ -168,35 +193,20 @@ impl SessionStore {
             timestamp: unix_seconds(),
         };
 
-        match serde_json::to_string(&entry) {
-            Ok(mut json) => {
-                json.push('\n');
-                Self::write_lines(&path, &json).await;
-            }
-            Err(err) => {
-                error!(error = %err, "failed to serialize boundary entry");
-            }
-        }
+        let mut json = serde_json::to_string(&entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("JSON error: {e}")))?;
+        json.push('\n');
+        Self::write_lines(&path, &json).await
     }
 
-    async fn write_lines(path: &Path, lines: &str) {
-        match fs::OpenOptions::new()
+    async fn write_lines(path: &Path, lines: &str) -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-            .await
-        {
-            Ok(mut file) => {
-                if let Err(err) =
-                    tokio::io::AsyncWriteExt::write_all(&mut file, lines.as_bytes()).await
-                {
-                    error!(path = %path.display(), error = %err, "failed to append to session transcript");
-                }
-            }
-            Err(err) => {
-                error!(path = %path.display(), error = %err, "failed to open session transcript");
-            }
-        }
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, lines.as_bytes()).await?;
+        Ok(())
     }
 
     /// List peer ids that have stored sessions for an agent.
@@ -409,22 +419,17 @@ impl SessionStore {
     /// Both the agent id and the peer id land directly on the filesystem
     /// (`agents/<agent>/sessions/<peer>.jsonl`), so keys carrying path
     /// separators or other special characters are rejected outright.
-    fn session_path(&self, session_key: &str) -> Option<PathBuf> {
-        let parts: Vec<&str> = session_key.split(':').collect();
-        if parts.len() != 7 || parts[0] != "agent" {
-            return None;
-        }
-        let agent_id = parts[1];
-        let peer_id = parts[6];
-        if !is_safe_peer_id(agent_id) || !is_safe_peer_id(peer_id) {
+    pub fn session_path(&self, session_key: &str) -> Option<PathBuf> {
+        let parts = parse_session_key(session_key)?;
+        if !is_safe_segment(&parts.agent_id) || !is_safe_segment(&parts.peer_id) {
             return None;
         }
         Some(
             self.base_dir
                 .join("agents")
-                .join(agent_id)
+                .join(&parts.agent_id)
                 .join("sessions")
-                .join(format!("{}.jsonl", peer_id)),
+                .join(format!("{}.jsonl", parts.peer_id)),
         )
     }
 }
@@ -536,7 +541,9 @@ mod tests {
     }
 
     fn session_key(agent_id: &str, peer_id: &str) -> String {
-        format!("agent:{}:dm:webchat:default:direct:{}", agent_id, peer_id)
+        legion_plugin_sdk::session_key::direct_session_key(
+            agent_id, "dm", "webchat", "default", peer_id,
+        )
     }
 
     #[tokio::test]
@@ -592,7 +599,8 @@ mod tests {
                 &key,
                 &[ChatMessage::user("hi"), ChatMessage::assistant("hello")],
             )
-            .await;
+            .await
+            .unwrap();
 
         let msgs = store.load(&key).await;
         assert_eq!(msgs.len(), 2);
@@ -606,10 +614,14 @@ mod tests {
     async fn append_is_append_only() {
         let (store, _dir) = store();
         let key = session_key("main", "user1");
-        store.append(&key, &[ChatMessage::user("first")]).await;
+        store
+            .append(&key, &[ChatMessage::user("first")])
+            .await
+            .unwrap();
         store
             .append(&key, &[ChatMessage::assistant("second")])
-            .await;
+            .await
+            .unwrap();
 
         let msgs = store.load(&key).await;
         assert_eq!(msgs.len(), 2);
@@ -630,7 +642,7 @@ mod tests {
                 arguments: r#"{"path":"x"}"#.into(),
             },
         }]);
-        store.append(&key, &[msg]).await;
+        store.append(&key, &[msg]).await.unwrap();
 
         let msgs = store.load(&key).await;
         assert_eq!(msgs.len(), 1);
@@ -657,10 +669,12 @@ mod tests {
         let (store, _dir) = store();
         store
             .append(&session_key("main", "alice"), &[ChatMessage::user("hi")])
-            .await;
+            .await
+            .unwrap();
         store
             .append(&session_key("main", "bob"), &[ChatMessage::user("hi")])
-            .await;
+            .await
+            .unwrap();
 
         let peers = store.list_sessions("main").await;
         assert_eq!(peers.len(), 2);
@@ -672,15 +686,21 @@ mod tests {
     async fn append_boundary_persists_marker_and_keeps_messages_loadable() {
         let (store, _dir) = store();
         let key = session_key("main", "user1");
-        store.append(&key, &[ChatMessage::user("hi")]).await;
+        store
+            .append(&key, &[ChatMessage::user("hi")])
+            .await
+            .unwrap();
 
         let boundary = BoundaryMark {
             entry_index: 0,
             timestamp_iso: "2026-07-09T12:00:00.000Z".to_string(),
             tokens_compacted: 123,
         };
-        store.append_boundary(&key, &boundary).await;
-        store.append(&key, &[ChatMessage::assistant("hello")]).await;
+        store.append_boundary(&key, &boundary).await.unwrap();
+        store
+            .append(&key, &[ChatMessage::assistant("hello")])
+            .await
+            .unwrap();
 
         // Messages on either side of the boundary remain loadable.
         let msgs = store.load(&key).await;
@@ -714,8 +734,9 @@ mod tests {
         let key = session_key("main", "user1");
         store
             .append(&key, &[ChatMessage::user("old question")])
-            .await;
-        store.append_boundary(&key, &boundary_mark()).await;
+            .await
+            .unwrap();
+        store.append_boundary(&key, &boundary_mark()).await.unwrap();
         // The gateway persists the compacted head right after the boundary.
         store
             .append(
@@ -726,7 +747,8 @@ mod tests {
                     ChatMessage::assistant("new answer"),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
 
         let resumed = store.load_for_resume(&key).await;
         assert_eq!(resumed.len(), 3);
@@ -748,7 +770,8 @@ mod tests {
                 &key,
                 &[ChatMessage::user("hi"), ChatMessage::assistant("hello")],
             )
-            .await;
+            .await
+            .unwrap();
 
         let resumed = store.load_for_resume(&key).await;
         assert_eq!(resumed.len(), 2);
@@ -759,12 +782,16 @@ mod tests {
     async fn load_for_resume_uses_last_boundary() {
         let (store, _dir) = store();
         let key = session_key("main", "user1");
-        store.append(&key, &[ChatMessage::user("first")]).await;
-        store.append_boundary(&key, &boundary_mark()).await;
+        store
+            .append(&key, &[ChatMessage::user("first")])
+            .await
+            .unwrap();
+        store.append_boundary(&key, &boundary_mark()).await.unwrap();
         store
             .append(&key, &[ChatMessage::system("summary one")])
-            .await;
-        store.append_boundary(&key, &boundary_mark()).await;
+            .await
+            .unwrap();
+        store.append_boundary(&key, &boundary_mark()).await.unwrap();
         store
             .append(
                 &key,
@@ -773,7 +800,8 @@ mod tests {
                     ChatMessage::user("after second"),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
 
         let resumed = store.load_for_resume(&key).await;
         assert_eq!(resumed.len(), 2);
@@ -785,8 +813,11 @@ mod tests {
     async fn load_for_resume_skips_corrupt_lines_around_boundary() {
         let (store, _dir) = store();
         let key = session_key("main", "user1");
-        store.append(&key, &[ChatMessage::user("hi")]).await;
-        store.append_boundary(&key, &boundary_mark()).await;
+        store
+            .append(&key, &[ChatMessage::user("hi")])
+            .await
+            .unwrap();
+        store.append_boundary(&key, &boundary_mark()).await.unwrap();
         let path = store.session_path(&key).unwrap();
         let mut file = fs::OpenOptions::new()
             .append(true)
@@ -796,7 +827,10 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         file.write_all(b"{corrupt\n").await.unwrap();
         drop(file);
-        store.append(&key, &[ChatMessage::assistant("kept")]).await;
+        store
+            .append(&key, &[ChatMessage::assistant("kept")])
+            .await
+            .unwrap();
 
         let resumed = store.load_for_resume(&key).await;
         assert_eq!(resumed.len(), 1);
@@ -816,7 +850,8 @@ mod tests {
                     ChatMessage::user("second prompt"),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
 
         let summary = store.lite_read("main", "user1", 65_536).await.unwrap();
         assert_eq!(summary.peer_id, "user1");
@@ -836,7 +871,8 @@ mod tests {
                     ChatMessage::assistant("y".repeat(500)),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
 
         // Buffer covers the first JSONL line but not the whole file.
         let summary = store.lite_read("main", "user1", 600).await.unwrap();
@@ -853,10 +889,12 @@ mod tests {
                 &session_key("main", "alice"),
                 &[ChatMessage::user("hi alice")],
             )
-            .await;
+            .await
+            .unwrap();
         store
             .append(&session_key("main", "bob"), &[ChatMessage::user("hi bob")])
-            .await;
+            .await
+            .unwrap();
 
         let summaries = store.list_session_summaries("main", 65_536).await;
         assert_eq!(summaries.len(), 2);
@@ -879,8 +917,12 @@ mod tests {
         let new_key = session_key("main", "new-peer");
         store
             .append(&old_key, &[ChatMessage::user("ancient")])
-            .await;
-        store.append(&new_key, &[ChatMessage::user("fresh")]).await;
+            .await
+            .unwrap();
+        store
+            .append(&new_key, &[ChatMessage::user("fresh")])
+            .await
+            .unwrap();
 
         // Backdate the old transcript's entry timestamp to 10 days ago.
         let old_path = store.session_path(&old_key).unwrap();
@@ -927,7 +969,10 @@ mod tests {
     async fn archive_expired_zero_ttl_is_noop() {
         let (store, dir) = store();
         let key = session_key("main", "user1");
-        store.append(&key, &[ChatMessage::user("hi")]).await;
+        store
+            .append(&key, &[ChatMessage::user("hi")])
+            .await
+            .unwrap();
         let archived = store.archive_expired(0, &dir.path().join("archive")).await;
         assert!(archived.is_empty());
         assert!(
@@ -935,5 +980,34 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_to_same_session_do_not_corrupt_lines() {
+        let (store, _dir) = store();
+        let key = session_key("main", "user1");
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let store = store.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .append(&key, &[ChatMessage::user(format!("msg-{i}"))])
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let path = store.session_path(&key).unwrap();
+        let text = fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 50);
+        // Every line must be a valid JSON object.
+        for line in &lines {
+            assert!(serde_json::from_str::<TranscriptEntry>(line).is_ok());
+        }
     }
 }

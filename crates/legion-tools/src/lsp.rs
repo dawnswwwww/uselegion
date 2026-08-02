@@ -6,9 +6,10 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
+use legion_core::jsonrpc;
 use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -67,6 +68,15 @@ pub enum LspError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<jsonrpc::RpcError> for LspError {
+    fn from(err: jsonrpc::RpcError) -> Self {
+        LspError::Rpc {
+            code: err.code,
+            message: err.message,
+        }
+    }
 }
 
 /// Abstract LSP backend. The default implementation spawns a subprocess; tests
@@ -148,7 +158,7 @@ impl StdioLspBackend {
     }
 
     fn next_id(state: &StdioLspState) -> u64 {
-        state.next_id.fetch_add(1, Ordering::Relaxed)
+        jsonrpc::next_id(&state.next_id)
     }
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<(), LspError> {
@@ -156,11 +166,7 @@ impl StdioLspBackend {
         let state = guard
             .as_mut()
             .ok_or_else(|| LspError::Io(std::io::Error::other("LSP client not connected")))?;
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
+        let msg = jsonrpc::build_notification(method, params);
         let line =
             serde_json::to_string(&msg).map_err(|e| LspError::InvalidResponse(e.to_string()))?;
         state.stdin.write_all(line.as_bytes()).await?;
@@ -175,12 +181,7 @@ impl StdioLspBackend {
             .as_mut()
             .ok_or_else(|| LspError::Io(std::io::Error::other("LSP client not connected")))?;
         let id = Self::next_id(state);
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
+        let msg = jsonrpc::build_request(id, method, params);
         let line =
             serde_json::to_string(&msg).map_err(|e| LspError::InvalidResponse(e.to_string()))?;
         state.stdin.write_all(line.as_bytes()).await?;
@@ -201,16 +202,7 @@ impl StdioLspBackend {
             let value: Value = serde_json::from_str(trimmed)
                 .map_err(|e| LspError::InvalidResponse(e.to_string()))?;
             if value.get("id").and_then(Value::as_u64) == Some(id) {
-                if let Some(err) = value.get("error") {
-                    let code = err.get("code").and_then(Value::as_i64).unwrap_or(-1);
-                    let message = err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                        .to_string();
-                    return Err(LspError::Rpc { code, message });
-                }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                return jsonrpc::parse_result(&value).map_err(LspError::from);
             }
         }
     }

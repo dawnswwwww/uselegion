@@ -81,6 +81,7 @@ impl ChannelProvider for WebChatProvider {
             thread: false,
             reactions: false,
             typing: false,
+            buttons: false,
         }
     }
 

@@ -32,7 +32,7 @@ use crate::tools::{
     SwarmSpawnTool, SwarmStatusTool, WebFetchTool, WebSearchTool, WriteTool,
 };
 use crate::video_generate::VideoGenerateTool;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn build_exec_tool(
     exec_config: &HashMap<String, legion_core::config::ToolConfig>,
@@ -146,6 +146,45 @@ impl CoreToolRegistry {
         mcp_tools: Option<&[McpToolAdapter]>,
         router: Option<std::sync::Arc<legion_provider::router::ProviderRouter>>,
     ) -> Self {
+        Self::new_with_mcp_and_router_and_cron_store_path(config, mcp_tools, router, None)
+    }
+
+    /// Construct the registry from the global configuration with an explicit
+    /// cron store path for the scheduler tools. `None` keeps the default
+    /// `~/.legion/automation/cron.jsonl`.
+    pub fn new_with_cron_store_path(config: &Config, cron_store_path: Option<PathBuf>) -> Self {
+        Self::new_with_mcp_and_router_and_cron_store_path(config, None, None, cron_store_path)
+    }
+
+    /// Construct the registry with optional MCP tools and an explicit cron
+    /// store path.
+    pub fn new_with_mcp_and_cron_store_path(
+        config: &Config,
+        mcp_tools: Option<&[McpToolAdapter]>,
+        cron_store_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_mcp_and_router_and_cron_store_path(config, mcp_tools, None, cron_store_path)
+    }
+
+    /// Construct the registry with an optional provider router and an explicit
+    /// cron store path.
+    pub fn new_with_router_and_cron_store_path(
+        config: &Config,
+        router: Option<std::sync::Arc<legion_provider::router::ProviderRouter>>,
+        cron_store_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_mcp_and_router_and_cron_store_path(config, None, router, cron_store_path)
+    }
+
+    /// Construct the registry from the global configuration, optionally merging
+    /// in MCP tools, a provider router, and an explicit cron store path for the
+    /// scheduler tools.
+    pub fn new_with_mcp_and_router_and_cron_store_path(
+        config: &Config,
+        mcp_tools: Option<&[McpToolAdapter]>,
+        router: Option<std::sync::Arc<legion_provider::router::ProviderRouter>>,
+        cron_store_path: Option<PathBuf>,
+    ) -> Self {
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
 
         let read_policy = Policy::from_config(config.tools.get("read"), Approval::Off);
@@ -162,13 +201,27 @@ impl CoreToolRegistry {
 
         tools.insert("ask_user".to_string(), Arc::new(AskUserTool::new()));
 
-        let write_policy = Policy::from_config(config.tools.get("write"), Approval::Off);
+        // Write-class tools default to workspace-only for safety. Users may
+        // still opt out via `tools.<name>.workspace_only: false`.
+        let write_policy = Policy::from_config_with_workspace_default(
+            config.tools.get("write"),
+            Approval::Off,
+            true,
+        );
         tools.insert("write".to_string(), Arc::new(WriteTool::new(write_policy)));
 
-        let edit_policy = Policy::from_config(config.tools.get("edit"), Approval::Off);
+        let edit_policy = Policy::from_config_with_workspace_default(
+            config.tools.get("edit"),
+            Approval::Off,
+            true,
+        );
         tools.insert("edit".to_string(), Arc::new(EditTool::new(edit_policy)));
 
-        let patch_policy = Policy::from_config(config.tools.get("apply_patch"), Approval::Off);
+        let patch_policy = Policy::from_config_with_workspace_default(
+            config.tools.get("apply_patch"),
+            Approval::Off,
+            true,
+        );
         tools.insert(
             "apply_patch".to_string(),
             Arc::new(ApplyPatchTool::new(patch_policy)),
@@ -193,10 +246,11 @@ impl CoreToolRegistry {
             Arc::new(WebFetchTool::new(web_fetch_policy)),
         );
 
-        let web_search_policy = Policy::from_config(config.tools.get("web_search"), Approval::Off);
+        let web_search_cfg = config.tools.get("web_search");
+        let web_search_policy = Policy::from_config(web_search_cfg, Approval::Off);
         tools.insert(
             "web_search".to_string(),
-            Arc::new(WebSearchTool::new(web_search_policy)),
+            Arc::new(WebSearchTool::new(web_search_policy, web_search_cfg)),
         );
 
         tools.insert(
@@ -248,18 +302,35 @@ impl CoreToolRegistry {
 
         // Scheduler tools (automation Phase A). Creating and deleting jobs
         // mutate persisted automation state, so they default to Prompt; listing
-        // is read-only and defaults to Off.
+        // is read-only and defaults to Off. When a host is built with a scoped
+        // cron store (e.g. a local TUI session), the tools operate on that
+        // store instead of the global gateway store.
         tools.insert(
             "scheduler_create".to_string(),
-            Arc::new(SchedulerCreateTool::new()),
+            Arc::new(
+                cron_store_path
+                    .as_ref()
+                    .map(SchedulerCreateTool::with_path)
+                    .unwrap_or_default(),
+            ),
         );
         tools.insert(
             "scheduler_delete".to_string(),
-            Arc::new(SchedulerDeleteTool::new()),
+            Arc::new(
+                cron_store_path
+                    .as_ref()
+                    .map(SchedulerDeleteTool::with_path)
+                    .unwrap_or_default(),
+            ),
         );
         tools.insert(
             "scheduler_list".to_string(),
-            Arc::new(SchedulerListTool::new()),
+            Arc::new(
+                cron_store_path
+                    .as_ref()
+                    .map(SchedulerListTool::with_path)
+                    .unwrap_or_default(),
+            ),
         );
 
         // browser (tools-p1p2 Phase C). Defaults to Approval::Required: it
@@ -445,6 +516,31 @@ mod tests {
         for def in &defs {
             assert!(registry.get(&def.name).is_some());
         }
+    }
+
+    /// Two `spawn_subagent` calls emitted in the same turn must land in a
+    /// single concurrent batch so the children run in parallel; the model
+    /// decides per turn whether to parallelize.
+    #[test]
+    fn same_turn_spawn_subagent_calls_run_concurrently() {
+        let config = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#).unwrap();
+        let registry = CoreToolRegistry::new(&config);
+        let calls = vec![
+            legion_runtime::ToolCall {
+                id: "c1".to_string(),
+                name: "spawn_subagent".to_string(),
+                arguments: r#"{"prompt":"a"}"#.to_string(),
+            },
+            legion_runtime::ToolCall {
+                id: "c2".to_string(),
+                name: "spawn_subagent".to_string(),
+                arguments: r#"{"prompt":"b"}"#.to_string(),
+            },
+        ];
+        let batches = legion_runtime::tool_pipeline::partition_tool_calls(&registry, &calls);
+        assert_eq!(batches.len(), 1, "expected one batch, got {batches:?}");
+        assert!(batches[0].concurrent);
+        assert_eq!(batches[0].calls.len(), 2);
     }
 
     #[test]
@@ -644,6 +740,7 @@ mod tests {
                 Ok(McpToolResult {
                     content: Value::Null,
                     is_error: false,
+                    structured_content: None,
                 })
             }
             async fn close(&self) -> Result<(), McpError> {
@@ -654,6 +751,8 @@ mod tests {
             name: tool.to_string(),
             description: "dummy".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+            output_schema: None,
         };
         McpToolAdapter::new(server.to_string(), desc, Arc::new(Dummy), false)
     }
@@ -795,5 +894,41 @@ mod tests {
         let after = registry.get("read").unwrap();
         assert_eq!(after.description(), before, "built-in tool must win");
         assert_ne!(after.description(), "dummy tool");
+    }
+
+    #[test]
+    fn write_tools_default_to_workspace_only() {
+        let config = Config::from_json(r#"{ "gateway": { "auth": { "token": "x" } } }"#).unwrap();
+        let registry = CoreToolRegistry::new(&config);
+        for name in ["write", "edit", "apply_patch"] {
+            let tool = registry.get(name).expect(name);
+            assert!(
+                tool.policy().workspace_only,
+                "{name} should default to workspace_only"
+            );
+        }
+    }
+
+    #[test]
+    fn write_tools_can_opt_out_of_workspace_only_via_config() {
+        let config = Config::from_json(
+            r#"{
+                "gateway": { "auth": { "token": "x" } },
+                "tools": {
+                    "write": { "workspaceOnly": false },
+                    "edit": { "workspaceOnly": false },
+                    "apply_patch": { "workspaceOnly": false }
+                }
+            }"#,
+        )
+        .unwrap();
+        let registry = CoreToolRegistry::new(&config);
+        for name in ["write", "edit", "apply_patch"] {
+            let tool = registry.get(name).expect(name);
+            assert!(
+                !tool.policy().workspace_only,
+                "{name} should honor explicit workspaceOnly: false"
+            );
+        }
     }
 }

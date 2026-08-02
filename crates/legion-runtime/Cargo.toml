@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 legion-core = { path = "../legion-core" }
@@ -12,7 +19,7 @@ legion-provider = { path = "../legion-provider" }
 legion-plugin-sdk = { path = "../legion-plugin-sdk" }
 legion-skills = { path = "../legion-skills" }
 legion-telemetry = { path = "../legion-telemetry" }
-async-trait = "0.1"
+async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,9 +29,11 @@ regex = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
-tokio-test = "0.4"
+tokio-test = { workspace = true }

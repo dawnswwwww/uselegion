@@ -1,3 +1,6 @@
+use crate::util::{
+    Lifecycle, StopPolicy, cfg_required, cfg_str_or, ensure_success, send_json, ws_reconnect_loop,
+};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use legion_plugin_sdk::channel::{
@@ -27,11 +30,8 @@ const INTENTS: u64 = 1 + 512 + 4096 + 32768;
 /// real Discord API in this environment.
 #[derive(Debug)]
 pub struct DiscordProvider {
-    http: reqwest::Client,
-    config: Mutex<Option<DiscordConfig>>,
-    running: Arc<AtomicBool>,
+    lifecycle: Lifecycle<DiscordConfig>,
     bot_user_id: Arc<Mutex<Option<String>>>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,11 +44,8 @@ struct DiscordConfig {
 impl DiscordProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
-            config: Mutex::new(None),
-            running: Arc::new(AtomicBool::new(false)),
+            lifecycle: Lifecycle::new(),
             bot_user_id: Arc::new(Mutex::new(None)),
-            task: Mutex::new(None),
         }
     }
 }
@@ -73,6 +70,7 @@ impl ChannelProvider for DiscordProvider {
             thread: false,
             reactions: true,
             typing: true,
+            buttons: false,
         }
     }
 
@@ -82,90 +80,88 @@ impl ChannelProvider for DiscordProvider {
         inbound_tx: mpsc::Sender<InboundMessage>,
     ) -> Result<(), ChannelError> {
         let cfg = parse_config(config)?;
-        *self.config.lock().await = Some(cfg.clone());
-        self.running.store(true, Ordering::SeqCst);
 
-        let running = self.running.clone();
-        let http = self.http.clone();
+        let running = self.lifecycle.running.clone();
+        let http = self.lifecycle.http.clone();
         let bot_user_id = self.bot_user_id.clone();
         let account_id = cfg.account_id.clone();
+        let task_cfg = cfg.clone();
 
-        let handle = tokio::spawn(async move {
-            gateway_loop(&http, &cfg, inbound_tx, running, bot_user_id).await;
-        });
+        self.lifecycle
+            .begin(cfg, async move {
+                let mut state = ();
+                let open_http = http.clone();
+                let open_cfg = task_cfg.clone();
+                let serve_cfg = task_cfg.clone();
+                let serve_running = running.clone();
+                ws_reconnect_loop(
+                    "discord",
+                    &running,
+                    &mut state,
+                    move || {
+                        let http = open_http.clone();
+                        let task_cfg = open_cfg.clone();
+                        Box::pin(async move { fetch_gateway_url(&http, &task_cfg).await })
+                    },
+                    move |_state: &mut (), url: String| {
+                        let task_cfg = serve_cfg.clone();
+                        let inbound_tx = inbound_tx.clone();
+                        let running = serve_running.clone();
+                        let bot_user_id = bot_user_id.clone();
+                        Box::pin(async move {
+                            run_gateway(&url, &task_cfg, &inbound_tx, &running, &bot_user_id).await
+                        })
+                    },
+                )
+                .await;
+            })
+            .await;
 
-        *self.task.lock().await = Some(handle);
         tracing::info!(channel = "discord", account = %account_id, "Discord channel started");
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), ChannelError> {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.task.lock().await.take() {
-            handle.abort();
-        }
-        *self.config.lock().await = None;
+        self.lifecycle.stop(StopPolicy::Abort).await;
         *self.bot_user_id.lock().await = None;
         tracing::info!(channel = "discord", "Discord channel stopped");
         Ok(())
     }
 
     async fn send(&self, message: OutboundMessage) -> Result<(), ChannelError> {
-        let cfg = self
-            .config
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChannelError::NotStarted)?;
+        let cfg = self.lifecycle.config().await?;
 
         let url = format!("{}/channels/{}/messages", cfg.base_url, message.peer.id);
         let payload = json!({ "content": message.text.unwrap_or_default() });
 
-        let response = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bot {}", cfg.bot_token))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".into());
-            return Err(ChannelError::SendFailed(format!(
-                "discord send message failed: {status} {body}"
-            )));
-        }
+        let response = send_json(
+            self.lifecycle
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bot {}", cfg.bot_token)),
+            &payload,
+        )
+        .await?;
+        ensure_success(response, "discord send message").await?;
 
         Ok(())
     }
 }
 
 fn parse_config(config: Value) -> Result<DiscordConfig, ChannelError> {
-    let bot_token = config
-        .get("botToken")
-        .or_else(|| config.get("bot_token"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChannelError::InvalidConfig("discord botToken is required".into()))?
-        .to_string();
+    let bot_token = cfg_required(
+        &config,
+        &["botToken", "bot_token"],
+        "discord botToken is required",
+    )?;
 
-    let base_url = config
-        .get("baseUrl")
-        .or_else(|| config.get("base_url"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://discord.com/api/v10")
-        .to_string();
+    let base_url = cfg_str_or(
+        &config,
+        &["baseUrl", "base_url"],
+        "https://discord.com/api/v10",
+    );
 
-    let account_id = config
-        .get("accountId")
-        .or_else(|| config.get("account_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+    let account_id = cfg_str_or(&config, &["accountId", "account_id"], "default");
 
     Ok(DiscordConfig {
         bot_token,
@@ -308,34 +304,6 @@ async fn fetch_gateway_url(http: &reqwest::Client, cfg: &DiscordConfig) -> Resul
         .and_then(|v| v.as_str())
         .map(|base| format!("{base}/?v=10&encoding=json"))
         .ok_or_else(|| "gateway/bot response missing url".to_string())
-}
-
-/// Outer reconnect loop.
-async fn gateway_loop(
-    http: &reqwest::Client,
-    cfg: &DiscordConfig,
-    inbound_tx: mpsc::Sender<InboundMessage>,
-    running: Arc<AtomicBool>,
-    bot_user_id: Arc<Mutex<Option<String>>>,
-) {
-    while running.load(Ordering::SeqCst) {
-        match fetch_gateway_url(http, cfg).await {
-            Ok(url) => {
-                if let Err(err) = run_gateway(&url, cfg, &inbound_tx, &running, &bot_user_id).await
-                {
-                    tracing::warn!(error = %err, "discord gateway connection ended");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to fetch discord gateway url");
-            }
-        }
-
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    }
 }
 
 /// One Gateway connection: HELLO → IDENTIFY → dispatch loop with heartbeats.

@@ -4,8 +4,8 @@ mod ansi;
 mod composer;
 mod events;
 mod history_search;
-mod inline;
 mod input;
+mod input_history;
 mod links;
 mod markdown;
 mod question;
@@ -18,6 +18,7 @@ mod tool_card;
 mod widgets;
 mod writer;
 
+pub(crate) use state::LocalNotice;
 pub use state::{AppState, ChatMessage, MessageRole, MessageState, ScreenMode};
 
 use crate::driver::{
@@ -28,12 +29,9 @@ use crate::{CliError, GatewayClient, load_config};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use inline::{INLINE_HEIGHT, reset_emitted_index};
 use legion_core::util::lock_recover;
 use legion_skills::SkillRegistry;
 use ratatui::Terminal;
-use ratatui::TerminalOptions;
-use ratatui::Viewport;
 use ratatui::backend::CrosstermBackend;
 use serde_json::json;
 use std::io;
@@ -88,6 +86,7 @@ pub async fn run_tui(
     let config = load_config()?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (local_tx, mut local_rx) = mpsc::unbounded_channel::<state::LocalNotice>();
     let goal_store = crate::goal::GoalStore::default();
     let mut state_inner = state::AppState {
         todo_auto_hide_seconds: config.todos.auto_hide_seconds,
@@ -117,6 +116,19 @@ pub async fn run_tui(
         tracing::warn!(mode = %config.tui.screen_mode, "unknown TUI screen mode in config; using fullscreen");
     }
     state_inner.config_path = crate::default_config_path();
+    state_inner.local_tx = Some(local_tx);
+
+    // Load the shared, per-workspace input history so ↑/↓ and Ctrl+R recall
+    // inputs from previous sessions in the same project. `None` (no
+    // `--workspace`) means "the current directory", mirroring
+    // `resolve_workspace_override`.
+    let workspace = workspace_override
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(ws) = workspace {
+        let (path, canon) = input_history::workspace_history_path(&ws);
+        state_inner.input_history = input_history::InputHistoryStore::load(path, canon);
+    }
 
     // Load the persisted goal for this session, if any.
     match goal_store.load(&session_key).await {
@@ -289,7 +301,7 @@ pub async fn run_tui(
                     let mut s = lock_recover(&state);
                     for msg in &resumed {
                         if msg.role == state::MessageRole::User {
-                            s.input_history.push(msg.content.clone());
+                            s.input_history.record(&msg.content);
                         }
                     }
                     s.messages.extend(resumed);
@@ -384,7 +396,7 @@ pub async fn run_tui(
         }
     });
 
-    let result = run_terminal(state.clone(), send_tx, &mut event_rx).await;
+    let result = run_terminal(state.clone(), send_tx, &mut event_rx, &mut local_rx).await;
 
     // Print the resume hint after the alternate screen has been restored so
     // it lands right above the shell prompt — TUI peer ids are generated per
@@ -407,64 +419,45 @@ async fn run_terminal(
     state: Arc<Mutex<state::AppState>>,
     send_tx: mpsc::UnboundedSender<state::OutboundControl>,
     event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    local_rx: &mut mpsc::UnboundedReceiver<state::LocalNotice>,
 ) -> Result<(), CliError> {
-    let mut current_mode = lock_recover(&state).screen_mode;
-
     loop {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
 
-        if current_mode == ScreenMode::Fullscreen {
-            // Enable mouse capture so the scroll wheel works. Terminal
-            // emulators follow a universal convention: holding Shift
-            // bypasses the app's mouse capture and falls back to native
-            // text selection. This is how tmux, htop, less, and all
-            // ratatui/crossterm apps reconcile "scroll wheel works" with
-            // "user can still select text".
-            crossterm::execute!(
-                &mut stdout,
-                crossterm::terminal::EnterAlternateScreen,
-                crossterm::event::EnableMouseCapture,
-                EnableBracketedPaste
-            )?;
-        }
+        // Both screen modes render into a single alternate-screen buffer.
+        // This is the same model jcode/grok-build use to prevent overlap:
+        // every region is painted by one writer (ratatui), so there is no
+        // boundary with a second scrollback writer to desynchronize on
+        // resize or cursor motion. Mouse capture is enabled in both modes
+        // (Shift bypasses it for native text selection, like tmux/less).
+        crossterm::execute!(
+            &mut stdout,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
 
-        let (term_writer, scrollback_tx, writer) = WriterThread::spawn(stdout);
+        let (term_writer, writer) = WriterThread::spawn(stdout);
         let backend = CrosstermBackend::new(term_writer);
-        let mut terminal = match current_mode {
-            ScreenMode::Fullscreen => Terminal::new(backend)?,
-            ScreenMode::Inline => {
-                // In inline mode the live viewport lives at the bottom of the
-                // normal scrollback. Reset the scrollback emission cursor so
-                // we do not dump pre-existing history onto the current line.
-                reset_emitted_index(&mut lock_recover(&state));
-                Terminal::with_options(
-                    backend,
-                    TerminalOptions {
-                        viewport: Viewport::Inline(INLINE_HEIGHT),
-                    },
-                )?
-            }
-        };
+        let mut terminal = Terminal::new(backend)?;
 
         let outcome = tui_loop(
             &mut terminal,
             state.clone(),
             send_tx.clone(),
             event_rx,
-            scrollback_tx,
+            local_rx,
         )
         .await;
 
-        // Reverse fullscreen terminal setup before dropping the terminal.
-        if current_mode == ScreenMode::Fullscreen {
-            crossterm::execute!(
-                terminal.backend_mut(),
-                crossterm::terminal::LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture,
-                DisableBracketedPaste
-            )?;
-        }
+        // Reverse the terminal setup before dropping the terminal.
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
+            DisableBracketedPaste
+        )?;
 
         // Drop the terminal (which flushes its backend) and wait for the
         // writer thread to drain the last bytes before returning.
@@ -473,10 +466,10 @@ async fn run_terminal(
         disable_raw_mode()?;
 
         match outcome {
-            Ok(LoopOutcome::ModeSwitch) => {
-                current_mode = lock_recover(&state).screen_mode;
-                continue;
-            }
+            // `/mode` requests a clean re-init of the terminal even though
+            // both modes now share one render path, so the alternate screen
+            // is torn down and rebuilt from scratch.
+            Ok(LoopOutcome::ModeSwitch) => continue,
             Ok(LoopOutcome::Quit) => return Ok(()),
             Err(e) => return Err(e),
         }
@@ -488,7 +481,7 @@ async fn tui_loop(
     state: Arc<Mutex<state::AppState>>,
     send_tx: mpsc::UnboundedSender<state::OutboundControl>,
     event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
-    scrollback_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    local_rx: &mut mpsc::UnboundedReceiver<state::LocalNotice>,
 ) -> Result<LoopOutcome, CliError> {
     let mut last_tick = tokio::time::Instant::now();
     let tick_rate = Duration::from_millis(100);
@@ -535,15 +528,8 @@ async fn tui_loop(
             had_events = true;
         }
 
-        // In inline mode, flush finalized messages to the native scrollback.
-        {
-            let mut s = lock_recover(&state);
-            inline::emit_finalized_messages(&mut s, |bytes| {
-                scrollback_tx
-                    .send(bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread gone"))
-            })?;
-        }
+        // Drain locally-produced notices (async `/mcp` query results, ...).
+        had_events |= drain_local_notices(&state, local_rx);
 
         // Poll terminal events with a timeout.
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -615,6 +601,22 @@ async fn tui_loop(
     Ok(LoopOutcome::Quit)
 }
 
+/// Drain locally-produced notices into the chat history as system messages.
+/// Returns true when at least one notice was drained, so the caller marks
+/// the frame dirty. Slash-command handlers are synchronous; async results
+/// (e.g. `/mcp status`) come back through this channel instead.
+fn drain_local_notices(
+    state: &Arc<Mutex<state::AppState>>,
+    local_rx: &mut mpsc::UnboundedReceiver<state::LocalNotice>,
+) -> bool {
+    let mut drained = false;
+    while let Ok(notice) = local_rx.try_recv() {
+        lock_recover(state).push_message(MessageRole::System, notice.text);
+        drained = true;
+    }
+    drained
+}
+
 /// Generate a random RFC 4122 version-4 UUID (e.g.
 /// `3f6a1c2e-9b4d-4e8f-a012-9c7b5d3e6f10`) for TUI session and request ids.
 ///
@@ -682,10 +684,112 @@ mod tests {
     }
 
     #[test]
+    fn drain_local_notices_appends_system_messages() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::LocalNotice>();
+        tx.send(state::LocalNotice {
+            text: "first".to_string(),
+        })
+        .unwrap();
+        tx.send(state::LocalNotice {
+            text: "second".to_string(),
+        })
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(AppState::default()));
+        assert!(drain_local_notices(&state, &mut rx));
+        // Channel empty now: a second drain reports nothing.
+        assert!(!drain_local_notices(&state, &mut rx));
+
+        let state = lock_recover(&state);
+        let messages = state.messages();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m.role == MessageRole::System));
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].content, "second");
+    }
+
+    #[test]
+    fn long_input_soft_wraps_and_grows_box() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 150 chars at width 40 (38 inner) wraps to 4 visual lines, so the
+        // input box must grow to 6 rows and every char must be visible
+        // (tui-textarea itself would scroll horizontally and hide them).
+        let long = "x".repeat(150);
+        let mut state = AppState {
+            composer: composer_with(&long),
+            ..AppState::default()
+        };
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render::draw_ui(f, &mut state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        let x_count = text.matches('x').count();
+        assert_eq!(
+            x_count, 150,
+            "all 150 chars must be visible via soft wrap; buffer:\n{}",
+            text
+        );
+        // The input box grew: the "Input" title row plus 4 content rows plus
+        // a bottom border must exist, i.e. the status bar sits at the bottom
+        // two rows only.
+        let rows: Vec<String> = (0..20)
+            .map(|y| {
+                (0..40)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let input_top = rows
+            .iter()
+            .position(|r| r.contains("Input"))
+            .expect("input title visible");
+        assert_eq!(
+            input_top, 12,
+            "input box should occupy rows 12..18 (6 rows)"
+        );
+        assert!(rows[17].contains("└"), "input bottom border at row 17");
+    }
+
+    #[test]
+    fn multiline_input_grows_box_per_logical_line() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Three logical lines: the box must be 5 rows (3 content + 2 border).
+        // Regression: the height calc used to treat '\n' as a width-1 char
+        // and undercount multi-line input.
+        let mut state = AppState {
+            composer: composer_with("aaa\nbbb\nccc"),
+            ..AppState::default()
+        };
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render::draw_ui(f, &mut state)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("aaa") && text.contains("bbb") && text.contains("ccc"));
+        let plan = render::plan_layout(20, 3, 0, 10, 0);
+        assert_eq!(plan.input, 5, "3 logical lines -> 5 input rows");
+    }
+
+    #[test]
     fn message_lines_include_prefix() {
         let theme = theme();
         let msg = ChatMessage::new(MessageRole::User, "hello");
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
+        let rendered = widgets::message_lines(
+            &msg,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            80,
+            &theme,
+            highlighter(),
+        );
         let text = rendered.lines[0].to_string();
         assert!(text.contains("You:"));
         assert!(text.contains("hello"));
@@ -696,7 +800,15 @@ mod tests {
         let theme = theme();
         let mut msg = ChatMessage::new(MessageRole::Assistant, "hello");
         msg.state = MessageState::Loading;
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
+        let rendered = widgets::message_lines(
+            &msg,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            80,
+            &theme,
+            highlighter(),
+        );
         let text = rendered.lines[0].to_string();
         assert!(text.contains("Legion:"));
         assert!(text.contains("◐"));
@@ -709,7 +821,15 @@ mod tests {
             MessageRole::Assistant,
             "<think>secret</think>answer".to_string(),
         );
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
+        let rendered = widgets::message_lines(
+            &msg,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            80,
+            &theme,
+            highlighter(),
+        );
         let all_text: String = rendered
             .lines
             .iter()
@@ -735,7 +855,15 @@ mod tests {
         );
         let mut expanded = HashSet::new();
         expanded.insert((0, 0));
-        let rendered = widgets::message_lines(&msg, 0, &expanded, 80, &theme, highlighter());
+        let rendered = widgets::message_lines(
+            &msg,
+            0,
+            &expanded,
+            &HashSet::new(),
+            80,
+            &theme,
+            highlighter(),
+        );
         let all_text: String = rendered
             .lines
             .iter()
@@ -920,9 +1048,9 @@ mod tests {
     #[test]
     fn render_tool_card_uses_state_color() {
         let theme = theme();
-        let done_lines = tool_card::render_tool_card("[tool:done] read_file", &theme);
-        let error_lines = tool_card::render_tool_card("[tool:error] read_file", &theme);
-        let start_lines = tool_card::render_tool_card("[tool:start] read_file", &theme);
+        let done_lines = tool_card::render_tool_card("[tool:done] read_file", &theme, true).lines;
+        let error_lines = tool_card::render_tool_card("[tool:error] read_file", &theme, true).lines;
+        let start_lines = tool_card::render_tool_card("[tool:start] read_file", &theme, true).lines;
         assert!(done_lines[0].to_string().contains("done"));
         assert!(error_lines[0].to_string().contains("error"));
         assert!(start_lines[0].to_string().contains("running"));
@@ -974,7 +1102,15 @@ mod tests {
             content: "**bold**".to_string(),
             state: MessageState::Streaming,
         };
-        let rendered = widgets::message_lines(&msg, 0, &HashSet::new(), 80, &theme, highlighter());
+        let rendered = widgets::message_lines(
+            &msg,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            80,
+            &theme,
+            highlighter(),
+        );
         let text: String = rendered
             .lines
             .iter()
@@ -988,7 +1124,15 @@ mod tests {
             state: MessageState::Done,
             ..msg
         };
-        let rendered = widgets::message_lines(&done, 0, &HashSet::new(), 80, &theme, highlighter());
+        let rendered = widgets::message_lines(
+            &done,
+            0,
+            &HashSet::new(),
+            &HashSet::new(),
+            80,
+            &theme,
+            highlighter(),
+        );
         let text: String = rendered
             .lines
             .iter()
@@ -1008,7 +1152,7 @@ mod tests {
             .join("\n");
         let result = json!({ "exit_code": 0, "stdout": stdout, "stderr": "" }).to_string();
         let content = tool_card::tool_card_json("done", "exec", None, Some(&result));
-        let lines = tool_card::render_tool_card(&content, &theme);
+        let lines = tool_card::render_tool_card(&content, &theme, true).lines;
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1025,13 +1169,104 @@ mod tests {
         let theme = theme();
         let args = "x".repeat(1000);
         let content = tool_card::tool_card_json("start", "write", Some(&args), None);
-        let text: String = tool_card::render_tool_card(&content, &theme)
+        let text: String = tool_card::render_tool_card(&content, &theme, true)
+            .lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains('…'));
         assert!(text.len() < 800);
+    }
+
+    #[test]
+    fn tool_card_collapsed_hides_args_and_result() {
+        let theme = theme();
+        let result = json!({ "exit_code": 0, "stdout": "secret-output", "stderr": "" }).to_string();
+        let content =
+            tool_card::tool_card_json("done", "exec", Some(r#"{"command":"ls"}"#), Some(&result));
+        // Collapsed (default): only the title row, args/result tucked away.
+        let collapsed = tool_card::render_tool_card(&content, &theme, false).lines;
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "collapsed card is a single title line; got {collapsed:?}"
+        );
+        let title = collapsed[0].to_string();
+        assert!(title.contains("exec"));
+        assert!(title.contains("done"));
+        assert!(title.contains("▶"), "collapsed title shows the expand hint");
+        assert!(
+            !title.contains("secret-output"),
+            "result must not leak into the collapsed title"
+        );
+        let collapsed_text = title.clone();
+        assert!(
+            !collapsed_text.contains("args:"),
+            "args line must be hidden when collapsed"
+        );
+    }
+
+    #[test]
+    fn tool_card_expanded_reveals_args_and_result() {
+        let theme = theme();
+        let result = json!({ "exit_code": 0, "stdout": "file.txt", "stderr": "" }).to_string();
+        let content =
+            tool_card::tool_card_json("done", "exec", Some(r#"{"command":"ls"}"#), Some(&result));
+        let expanded = tool_card::render_tool_card(&content, &theme, true).lines;
+        let text: String = expanded
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("args:"), "args line visible when expanded");
+        assert!(
+            text.contains("file.txt"),
+            "result body visible when expanded"
+        );
+        assert!(text.contains("▼"), "expanded title shows the collapse hint");
+    }
+
+    #[test]
+    fn toggle_nearest_tool_flips_expand_state() {
+        let mut state = AppState::default();
+        state.messages.push(ChatMessage {
+            role: MessageRole::Tool,
+            content: tool_card::tool_card_json("done", "exec", None, Some("ok")),
+            state: MessageState::Done,
+        });
+        assert!(state.expanded_tools.is_empty());
+        events::toggle_nearest_tool(&mut state);
+        assert!(state.expanded_tools.contains(&0));
+        events::toggle_nearest_tool(&mut state);
+        assert!(!state.expanded_tools.contains(&0));
+    }
+
+    #[test]
+    fn tool_card_expand_state_invalidates_render_cache() {
+        let mut state = AppState::default();
+        state.messages.push(ChatMessage {
+            role: MessageRole::Tool,
+            content: tool_card::tool_card_json("done", "exec", Some("a"), Some("b")),
+            state: MessageState::Done,
+        });
+        state.ensure_render_cache(80);
+        let collapsed_key = state.render_cache[0].as_ref().unwrap().key;
+        let collapsed_lines = state.render_cache[0].as_ref().unwrap().lines.len();
+        assert_eq!(collapsed_lines, 1, "precondition: collapsed to title line");
+
+        state.expanded_tools.insert(0);
+        state.ensure_render_cache(80);
+        let expanded_key = state.render_cache[0].as_ref().unwrap().key;
+        let expanded_lines = state.render_cache[0].as_ref().unwrap().lines.len();
+        assert_ne!(
+            expanded_key, collapsed_key,
+            "cache key must change when expand state flips"
+        );
+        assert!(
+            expanded_lines > collapsed_lines,
+            "expanded card must render more lines"
+        );
     }
 
     #[test]
@@ -1044,11 +1279,13 @@ mod tests {
                 start_line: 1,
                 line_count: 1,
             }],
+            tool_hint: None,
         };
-        let (lines, hints) = render::wrap_and_remap(rendered, 10);
+        let (lines, hints, tool_hint) = render::wrap_and_remap(rendered, 10);
         assert_eq!(lines.len(), 4);
         assert_eq!(hints[0].start_line, 3);
         assert_eq!(hints[0].line_count, 1);
+        assert!(tool_hint.is_none());
     }
 
     #[test]
@@ -1139,7 +1376,8 @@ mod tests {
         assert_eq!(state.messages[0].state, MessageState::Done);
         assert_eq!(state.messages[1].role, MessageRole::Tool);
         assert_eq!(state.messages[1].state, MessageState::Loading);
-        let text: String = tool_card::render_tool_card(&state.messages[1].content, &theme)
+        let text: String = tool_card::render_tool_card(&state.messages[1].content, &theme, true)
+            .lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -1177,7 +1415,8 @@ mod tests {
 
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].state, MessageState::Done);
-        let text: String = tool_card::render_tool_card(&state.messages[0].content, &theme)
+        let text: String = tool_card::render_tool_card(&state.messages[0].content, &theme, true)
+            .lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -1290,7 +1529,7 @@ mod tests {
         };
         state
             .queued_messages
-            .push_back(("next question".to_string(), true));
+            .push(("next question".to_string(), true));
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let end = serde_json::json!({
             "type": "event",
@@ -1320,7 +1559,7 @@ mod tests {
         };
         state
             .queued_messages
-            .push_back(("next question".to_string(), true));
+            .push(("next question".to_string(), true));
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let error = serde_json::json!({
             "type": "event",
@@ -1345,10 +1584,8 @@ mod tests {
             pending_request: true,
             ..AppState::default()
         };
-        state.queued_messages.push_back(("first".to_string(), true));
-        state
-            .queued_messages
-            .push_back(("second".to_string(), true));
+        state.queued_messages.push(("first".to_string(), true));
+        state.queued_messages.push(("second".to_string(), true));
 
         events::fail_pending_send(&mut state, "boom");
 
@@ -1372,6 +1609,185 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("2 queued message(s) discarded")),
             "the discard note must report how many queued messages were dropped"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_steers_by_promoting_selected_and_cancelling() {
+        // Two queued messages; selection defaults to the first item, so steer
+        // must promote the second (selected) one to the front and emit Cancel.
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        state.queued_messages.push(("first".to_string(), true));
+        state.queued_messages.push(("steer me".to_string(), true));
+        state.queue_selected = Some(1);
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Char('s'), event::KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(
+            state.queued_messages[0].0, "steer me",
+            "selected item must be promoted to the front of the queue"
+        );
+        assert_eq!(
+            rx.try_recv().expect("steer must cancel the in-flight run"),
+            state::OutboundControl::Cancel
+        );
+        assert_eq!(state.queue_selected, Some(0));
+        assert!(
+            state
+                .messages()
+                .iter()
+                .any(|m| m.content.contains("steering")),
+            "a steering notice must be pushed to the chat"
+        );
+        // The promoted item is now at the front: a lifecycle error must drain
+        // exactly it (not the original head), starting a fresh turn.
+        let error = serde_json::json!({
+            "type": "event",
+            "event": "agent",
+            "payload": { "stream": "lifecycle", "phase": "error" }
+        });
+        events::handle_ws_event(&mut state, error, &tx);
+        // rx already yielded Cancel above; the next item is the drained Message.
+        let drained = rx.try_recv().expect("steered message must be drained");
+        assert_eq!(
+            drained,
+            state::OutboundControl::Message("steer me".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_on_empty_composer_edits_selected_queued_message() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        state.queued_messages.push(("original".to_string(), true));
+        state.queue_selected = Some(0);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        // Composer is empty → Enter enters edit mode.
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.queue_edit, Some(0), "must enter edit mode");
+        assert!(
+            state.queued_messages.is_empty(),
+            "the edited item is removed from the queue while editing"
+        );
+        assert_eq!(state.composer.join(), "original", "composer is prefilled");
+        // Type a replacement and commit.
+        state.composer.set_text("");
+        state.composer.insert_str("edited");
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(state.queue_edit, None, "edit mode exits on commit");
+        assert_eq!(state.queued_messages.len(), 1);
+        assert_eq!(state.queued_messages[0].0, "edited");
+        assert_eq!(state.composer.join(), "");
+    }
+
+    #[test]
+    fn ctrl_d_removes_selected_queued_message() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        for text in ["alpha", "beta", "gamma"] {
+            state.queued_messages.push((text.to_string(), true));
+        }
+        state.queue_selected = Some(1);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Char('d'), event::KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(state.queued_messages.len(), 2);
+        assert!(
+            !state.queued_messages.iter().any(|(t, _)| t == "beta"),
+            "selected item must be removed"
+        );
+        assert_eq!(state.queue_selected, Some(1), "selection clamps forward");
+    }
+
+    #[test]
+    fn ctrl_k_clears_the_whole_queue() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        state.queued_messages.push(("a".to_string(), true));
+        state.queued_messages.push(("b".to_string(), true));
+        state.queue_selected = Some(0);
+        let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Char('k'), event::KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(state.queued_messages.is_empty());
+        assert_eq!(state.queue_selected, None);
+        assert!(
+            rx.try_recv().is_err(),
+            "clear must not cancel the in-flight run"
+        );
+    }
+
+    #[test]
+    fn alt_j_alt_k_reorder_queued_messages() {
+        let mut state = AppState {
+            pending_request: true,
+            ..AppState::default()
+        };
+        for text in ["first", "second", "third"] {
+            state.queued_messages.push((text.to_string(), true));
+        }
+        state.queue_selected = Some(0);
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        // Move the selected item down (Alt+K).
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Char('k'), event::KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(state.queued_messages[0].0, "second");
+        assert_eq!(state.queued_messages[1].0, "first");
+        assert_eq!(state.queue_selected, Some(1));
+        // Move it back up (Alt+J).
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::ALT),
+            &tx,
+        );
+        assert_eq!(state.queued_messages[0].0, "first");
+        assert_eq!(state.queue_selected, Some(0));
+    }
+
+    #[test]
+    fn empty_queue_falls_back_to_input_history_browse() {
+        // With no queued messages, ↑ must drive input history, not the queue.
+        let mut state = AppState::default();
+        state.input_history.record("past message");
+        let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
+        events::handle_key_event(
+            &mut state,
+            event::KeyEvent::new(event::KeyCode::Up, event::KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            state.composer.join(),
+            "past message",
+            "↑ must recall history when the queue is empty"
         );
     }
 
@@ -1613,7 +2029,7 @@ mod tests {
             ..AppState::default()
         };
         input::commit_and_clear_input(&mut state, "hello");
-        assert_eq!(state.input_history, vec!["hello".to_string()]);
+        assert_eq!(state.input_history.entries(), &["hello"]);
         assert!(state.composer.is_empty());
         assert!(state.draft_input.is_none());
         assert!(state.history_index.is_none());
@@ -1623,7 +2039,10 @@ mod tests {
     fn handle_key_event_up_down_recalls_input_history() {
         let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let mut state = AppState {
-            input_history: vec!["first".to_string(), "second".to_string()],
+            input_history: crate::tui::input_history::InputHistoryStore::from_entries(vec![
+                "first".to_string(),
+                "second".to_string(),
+            ]),
             input_area_width: 80,
             ..AppState::default()
         };
@@ -1651,7 +2070,9 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<state::OutboundControl>();
         let mut state = AppState {
             composer: composer_with("draft"),
-            input_history: vec!["previous".to_string()],
+            input_history: crate::tui::input_history::InputHistoryStore::from_entries(vec![
+                "previous".to_string(),
+            ]),
             input_area_width: 80,
             ..AppState::default()
         };
@@ -2345,6 +2766,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn input_box_not_covered_by_status_bar() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Regression: the status bar was rendered into the input area chunk,
+        // painting its opaque background over the composer. The composer text
+        // and border title must survive a full draw, including when the queue
+        // panel is shown (which shifts the layout chunks).
+        for queued in [vec![], vec![("queued message".to_string(), false)]] {
+            let mut state = AppState {
+                composer: composer_with("hello input"),
+                queued_messages: queued,
+                ..AppState::default()
+            };
+            let backend = TestBackend::new(40, 15);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render::draw_ui(f, &mut state)).unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(
+                text.contains("hello input"),
+                "composer content must not be covered by the status bar; buffer:\n{}",
+                text
+            );
+            assert!(
+                text.contains("Input"),
+                "composer border title must be visible; buffer:\n{}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn input_box_visible_on_tiny_terminals() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The input box keeps its 3 rows even when the terminal is too short
+        // for the status bar or any chat history.
+        for height in [3u16, 4, 5, 8] {
+            let mut state = AppState {
+                composer: composer_with("still here"),
+                ..AppState::default()
+            };
+            let backend = TestBackend::new(30, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render::draw_ui(f, &mut state)).unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(
+                text.contains("still here"),
+                "input box must stay visible at height {}; buffer:\n{}",
+                height,
+                text
+            );
+        }
+    }
+
     fn sample_pending_question(multi_select: bool) -> state::PendingQuestion {
         state::PendingQuestion {
             prompt_id: "prompt-1".to_string(),
@@ -2471,7 +2953,8 @@ mod tests {
         state.pending_question = Some(sample_pending_question(false));
         let (tx, mut rx) = mpsc::unbounded_channel::<state::OutboundControl>();
 
-        // Select Red on the Color question.
+        // Select Red on the Color question. A single-select choice answers
+        // the question and auto-advances to the next tab (Size).
         events::handle_question_key(&mut state, event::KeyEvent::from(KeyCode::Enter), &tx);
         {
             let pq = state.pending_question.as_ref().unwrap();
@@ -2485,8 +2968,8 @@ mod tests {
             );
         }
 
-        // Switch to Size question and select Large.
-        events::handle_question_key(&mut state, event::KeyEvent::from(KeyCode::Right), &tx);
+        // Already on the Size tab: move to Large and select it, which
+        // auto-advances to the Submit tab.
         events::handle_question_key(&mut state, event::KeyEvent::from(KeyCode::Down), &tx);
         events::handle_question_key(&mut state, event::KeyEvent::from(KeyCode::Enter), &tx);
         {
@@ -2495,11 +2978,10 @@ mod tests {
                 pq.is_selected("Which size?", "Large"),
                 "Large should be selected"
             );
+            assert!(pq.is_submit_tab(), "should land on the Submit tab");
         }
 
-        // Move to Submit tab and confirm.
-        events::handle_question_key(&mut state, event::KeyEvent::from(KeyCode::Right), &tx);
-        assert!(state.pending_question.as_ref().unwrap().is_submit_tab());
+        // Confirm on the Submit tab.
         events::handle_question_key(&mut state, event::KeyEvent::from(KeyCode::Enter), &tx);
 
         assert!(
@@ -2823,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_block_shows_scroll_and_queue_indicators() {
+    fn chat_block_shows_scroll_and_queue_panel() {
         let mut state = AppState::default();
         for i in 0..50 {
             state.push_message(MessageRole::Assistant, format!("line {i}"));
@@ -2832,7 +3314,7 @@ mod tests {
         // `apply_scroll` from snapping back to the bottom on the next draw.
         state.max_scroll = 1;
         state.scroll = 0;
-        state.queued_messages.push_back(("later".to_string(), true));
+        state.queued_messages.push(("later".to_string(), true));
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal
@@ -2845,8 +3327,12 @@ mod tests {
             "scroll indicator missing: {content}"
         );
         assert!(
-            content.contains("1 queued"),
-            "queue indicator missing: {content}"
+            content.contains("Queued"),
+            "queue panel title missing: {content}"
+        );
+        assert!(
+            content.contains("later"),
+            "queued message preview missing: {content}"
         );
     }
 

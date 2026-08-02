@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use legion_provider::router::ProviderRouter;
 use legion_provider::types::{ChatMessage, ChatRequest, ChatRole};
 use legion_runtime::CommitmentExtractor;
@@ -120,30 +119,15 @@ impl Worker {
             ],
         );
 
-        let text = match tokio::time::timeout(self.timeout, self.router.chat(&self.model_ref, req))
-            .await
-        {
-            Ok(Ok(mut stream)) => {
-                let mut buf = String::new();
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(c) => buf.push_str(&c.delta),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "commitments stream error");
-                            return;
-                        }
-                    }
-                }
-                buf
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "commitments LLM call failed");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!("commitments LLM call timed out");
-                return;
-            }
+        let Some(text) = legion_runtime::llm::chat_text_with_timeout(
+            &self.router,
+            &self.model_ref,
+            req,
+            self.timeout,
+        )
+        .await
+        else {
+            return;
         };
 
         for commitment in parse_commitments(&text, self.max_per_turn) {
@@ -236,16 +220,7 @@ fn build_prompt(messages: &[ChatMessage], max_messages: usize) -> String {
 /// output. Malformed entries, past due times, and empty descriptions are
 /// skipped; at most `limit` commitments survive.
 fn parse_commitments(text: &str, limit: usize) -> Vec<Commitment> {
-    let start = text.find('[');
-    let end = text.rfind(']');
-    let (Some(s), Some(e)) = (start, end) else {
-        return Vec::new();
-    };
-    if e < s {
-        return Vec::new();
-    }
-    let slice = &text[s..=e];
-    let parsed: Vec<RawCommitment> = serde_json::from_str(slice).unwrap_or_default();
+    let parsed = legion_runtime::llm::extract_json_array::<RawCommitment>(text).unwrap_or_default();
     let now = Utc::now();
     parsed
         .into_iter()

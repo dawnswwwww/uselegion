@@ -90,7 +90,14 @@ pub(crate) fn push_result_lines(
 }
 
 /// Render a tool call as a compact card.
-pub(crate) fn render_tool_card(content: &str, theme: &Theme) -> Vec<Line<'static>> {
+///
+/// Collapsed by default: only the title line is shown (`▸ name · state ▶`),
+/// keeping agentic turns — which can chain dozens of tool calls — readable.
+/// Clicking the card (or `Ctrl+o`) toggles `expanded` to reveal args/result.
+/// Error cards collapse too: the red title is the only failure signal, so a
+/// failed call's stderr stays tucked until the user opts in. This trades a bit
+/// of debug discoverability for a calm scrollback; the toggle is one keystroke.
+pub(crate) fn render_tool_card(content: &str, theme: &Theme, expanded: bool) -> ToolCardRender {
     let (state, name, arguments, result) = parse_tool_card(content);
 
     let card_color = match state.as_str() {
@@ -105,13 +112,24 @@ pub(crate) fn render_tool_card(content: &str, theme: &Theme) -> Vec<Line<'static
         _ => &state,
     };
 
+    let hint = if expanded { "▼" } else { "▶" };
     let mut lines = vec![Line::from(vec![
         Span::styled("▸ ", Style::default().fg(card_color)),
         Span::styled(
             format!("{} · {}", name, state_label),
             Style::default().fg(card_color).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!(" {hint}"), Style::default().fg(theme.tool_bar)),
     ])];
+
+    // Collapsed: nothing beyond the title. args/result stay tucked until the
+    // user expands the card.
+    if !expanded {
+        return ToolCardRender {
+            lines,
+            header_line: 0,
+        };
+    }
 
     if let Some(args) = arguments {
         lines.push(Line::from(Span::styled(
@@ -177,7 +195,19 @@ pub(crate) fn render_tool_card(content: &str, theme: &Theme) -> Vec<Line<'static
         }
     }
 
-    lines
+    ToolCardRender {
+        lines,
+        header_line: 0,
+    }
+}
+
+/// Output of [`render_tool_card`]: the rendered lines plus the line index of
+/// the clickable title. Mirrors the `ThinkHint` idea so tool cards can join the
+/// same hitbox-driven toggle flow as thinking blocks.
+pub(crate) struct ToolCardRender {
+    pub(crate) lines: Vec<Line<'static>>,
+    /// Index (into `lines`) of the title row that a click should toggle.
+    pub(crate) header_line: usize,
 }
 
 pub(crate) fn parse_tool_card(content: &str) -> (String, String, Option<String>, Option<String>) {

@@ -3,7 +3,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use legion_provider::router::ProviderRouter;
 use legion_provider::types::{ChatMessage, ChatRequest, ChatRole};
 
@@ -88,30 +87,11 @@ impl AutoExtractor {
             ],
         );
 
-        let text = match tokio::time::timeout(self.timeout, self.router.chat(&self.model_ref, req))
-            .await
-        {
-            Ok(Ok(mut stream)) => {
-                let mut buf = String::new();
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(c) => buf.push_str(&c.delta),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "auto_extract stream error");
-                            return;
-                        }
-                    }
-                }
-                buf
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "auto_extract LLM call failed");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!("auto_extract LLM call timed out");
-                return;
-            }
+        let Some(text) =
+            crate::llm::chat_text_with_timeout(&self.router, &self.model_ref, req, self.timeout)
+                .await
+        else {
+            return;
         };
 
         let facts = parse_facts(&text, self.max_facts_per_turn);
@@ -173,17 +153,8 @@ fn build_prompt(messages: &[ChatMessage], max_messages: usize) -> String {
 
 /// Extract the first JSON array of strings from the model output.
 fn parse_facts(text: &str, limit: usize) -> Vec<String> {
-    let start = text.find('[');
-    let end = text.rfind(']');
-    let (Some(s), Some(e)) = (start, end) else {
-        return Vec::new();
-    };
-    if e < s {
-        return Vec::new();
-    }
-    let slice = &text[s..=e];
-    let parsed: Vec<String> = serde_json::from_str(slice).unwrap_or_default();
-    parsed
+    crate::llm::extract_json_array::<String>(text)
+        .unwrap_or_default()
         .into_iter()
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty())

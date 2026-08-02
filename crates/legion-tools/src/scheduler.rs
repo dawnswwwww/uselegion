@@ -5,13 +5,10 @@
 //! are picked up by the scheduler loop automatically.
 
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use chrono::Utc;
-use legion_automation::cron::{CronJob, CronJobStore, JsonlCronJobStore};
+use legion_automation::cron::{AddJobRequest, CronJobStore, JsonlCronJobStore, create_job};
 use legion_runtime::{Tool, ToolContext, ToolError, ToolKind, ToolNamespace, ToolResult};
 use serde_json::json;
 
@@ -30,9 +27,9 @@ macro_rules! legion_tool_taxonomy {
 
 /// Default path to the shared cron job store.
 fn default_cron_store_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".legion").join("automation").join("cron.jsonl"))
-        .unwrap_or_else(|| PathBuf::from(".legion/automation/cron.jsonl"))
+    legion_core::fs::legion_home()
+        .join("automation")
+        .join("cron.jsonl")
 }
 
 /// Open the cron store at the configured or default path.
@@ -42,38 +39,6 @@ async fn open_cron_store(path: Option<&PathBuf>) -> Result<Arc<dyn CronJobStore>
         .await
         .map_err(|e| ToolError::Execution(format!("failed to open cron store: {e}")))?;
     Ok(Arc::new(store))
-}
-
-/// Generate a unique job id in the same shape as the cron scheduler.
-fn generate_job_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "cron-{}-{}",
-        Utc::now().timestamp_nanos_opt().unwrap_or(0),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-/// Accept 5-field cron expressions (minute hour dom month dow) and 6-field
-/// expressions (with seconds), normalizing the former to run at second 0.
-fn normalize_cron_expression(expression: &str) -> Result<String, ToolError> {
-    let trimmed = expression.trim();
-    let field_count = trimmed.split_whitespace().count();
-    match field_count {
-        5 => Ok(format!("0 {}", trimmed)),
-        6 => Ok(trimmed.to_string()),
-        _ => Err(ToolError::InvalidParams(format!(
-            "cron expression must have 5 or 6 fields, got {field_count}"
-        ))),
-    }
-}
-
-/// Validate that `expression` is a parseable cron schedule.
-fn validate_cron(expression: &str) -> Result<(), ToolError> {
-    let normalized = normalize_cron_expression(expression)?;
-    cron::Schedule::from_str(&normalized)
-        .map(|_| ())
-        .map_err(|e| ToolError::InvalidParams(format!("invalid cron expression: {e}")))
 }
 
 fn scheduler_policy(approval: Approval) -> Policy {
@@ -120,7 +85,7 @@ impl Tool for SchedulerCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new recurring cron job with a name, schedule, and prompt."
+        "Create a cron job: recurring (cron expression, local time) or one-shot (at a specific time, auto-removed after firing)."
     }
 
     fn policy(&self) -> &Policy {
@@ -133,12 +98,13 @@ impl Tool for SchedulerCreateTool {
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "human-readable job name" },
-                "cron": { "type": "string", "description": "cron expression (5 or 6 fields)" },
+                "cron": { "type": "string", "description": "cron expression (5 or 6 fields), interpreted in LOCAL time; required unless 'at' is set" },
+                "at": { "type": "string", "description": "one-shot run time (local 'YYYY-MM-DD HH:MM:SS' or RFC3339); creates a job that fires once and is removed afterwards" },
                 "prompt": { "type": "string", "description": "prompt passed to the agent on each run" },
                 "agent_type": { "type": "string", "description": "agent type to run (defaults to the calling agent)" },
                 "enabled": { "type": "boolean", "description": "whether the job is enabled (defaults to true)" }
             },
-            "required": ["name", "cron", "prompt"]
+            "required": ["name", "prompt"]
         })
     }
 
@@ -160,9 +126,6 @@ impl Tool for SchedulerCreateTool {
         let name = params["name"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidParams("missing 'name' parameter".to_string()))?;
-        let cron_expr = params["cron"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidParams("missing 'cron' parameter".to_string()))?;
         let prompt = params["prompt"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidParams("missing 'prompt' parameter".to_string()))?;
@@ -172,30 +135,42 @@ impl Tool for SchedulerCreateTool {
             .to_string();
         let enabled = params["enabled"].as_bool().unwrap_or(true);
 
-        validate_cron(cron_expr)?;
+        // One-shot jobs use the internal "__at__" schedule with an explicit
+        // run time; recurring jobs use a cron expression interpreted in local
+        // time. Exactly one of the two forms must be supplied.
+        let (schedule, at) = match params["at"].as_str() {
+            Some(at_raw) => {
+                let at = legion_automation::cron::parse_at(at_raw)
+                    .map_err(|e| ToolError::InvalidParams(format!("invalid 'at': {e}")))?;
+                ("__at__".to_string(), Some(at))
+            }
+            None => {
+                let cron_expr = params["cron"].as_str().ok_or_else(|| {
+                    ToolError::InvalidParams(
+                        "missing 'cron' parameter (required unless 'at' is set)".to_string(),
+                    )
+                })?;
+                (cron_expr.to_string(), None)
+            }
+        };
 
         let store = open_cron_store(self.store_path.as_ref()).await?;
-        let mut job = CronJob {
-            id: generate_job_id(),
-            agent_id: agent_type,
-            message: prompt.to_string(),
-            name: name.to_string(),
-            schedule: cron_expr.to_string(),
-            at: None,
-            enabled,
-            created_at: Utc::now(),
-            next_run: None,
-            last_run: None,
-            webhook_secret: None,
-        };
-        job.refresh_next_run();
-        let id = job.id.clone();
-        store
-            .create(job)
-            .await
-            .map_err(|e| ToolError::Execution(format!("failed to create cron job: {e}")))?;
+        let job = create_job(
+            &*store,
+            AddJobRequest {
+                schedule,
+                agent_id: agent_type,
+                message: prompt.to_string(),
+                at,
+                name: name.to_string(),
+                enabled,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| ToolError::Execution(format!("failed to create cron job: {e}")))?;
 
-        Ok(ToolResult::ok(json!({ "id": id }).to_string()))
+        Ok(ToolResult::ok(json!({ "id": job.id }).to_string()))
     }
 }
 
@@ -375,6 +350,7 @@ impl Tool for SchedulerListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use legion_runtime::ToolContext;
     use std::collections::HashSet;
     use tempfile::TempDir;
@@ -454,6 +430,50 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("cron expression"));
+    }
+
+    #[tokio::test]
+    async fn create_one_shot_job_with_at() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cron.jsonl");
+
+        let tool = SchedulerCreateTool::with_path(&path);
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let res = tool
+            .execute(
+                json!({
+                    "name": "one shot",
+                    "at": future.to_rfc3339(),
+                    "prompt": "fire once"
+                }),
+                test_ctx(),
+            )
+            .await
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&res.content).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let store = JsonlCronJobStore::open(&path).await.unwrap();
+        let job = store.get(&id).await.unwrap().expect("job persisted");
+        assert_eq!(job.schedule, "__at__");
+        assert!(job.is_one_shot());
+        assert_eq!(job.at, Some(future));
+        assert_eq!(job.next_run, Some(future));
+    }
+
+    #[tokio::test]
+    async fn create_requires_cron_or_at() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cron.jsonl");
+
+        let tool = SchedulerCreateTool::with_path(&path);
+        let err = tool
+            .execute(json!({ "name": "bad", "prompt": "x" }), test_ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cron"));
     }
 
     #[tokio::test]

@@ -132,7 +132,7 @@ Legion `RunEvent`：
 | **用户交互** | `ask_user_question` | `ask_user` | 相当 |
 | **Todo** | `todo_write` | `todo_write` | 相当 |
 | **Plan mode** | `enter_plan_mode`、`exit_plan_mode` | 无 | 缺失 |
-| **Goal** | `update_goal` | 无 | 缺失 |
+| **Goal** | `update_goal` | `get_goal`/`create_goal`/`update_goal` + `GoalGate` 自动续轮 | 基础 goal mode 已落地（2026-07-17）；planner/strategist 编排层仍缺 |
 | **子 agent** | `task`/`spawn_subagent` | `spawn_subagent`、`run_coordinator`、`swarm_spawn/send/status` | Legion 多 agent 编排更强 |
 | **Scheduler** | `scheduler_create`/`delete`/`list` | 无 | 缺失 |
 | **图片/视频** | `image_gen`、`image_edit`、`image_to_video`、`reference_to_video`、`video_gen` | `image_generate` | Legion 缺编辑、视频 |
@@ -255,6 +255,8 @@ pub struct TwoPassCompactor {
 - `CompactNote`：NOTE₁/NOTE₂ 封装
 
 ### 5.4 Goal 编排层（P2）
+
+> 现状（2026-07-17）：基础 goal mode 已落地——`legion-runtime/src/goal.rs`（模型/持久化）、`goal_gate.rs`（turn-end 自动续轮 + 预算）、`legion-host/src/goal_tools.rs`（`get_goal`/`create_goal`/`update_goal`）。本节余下的未实施部分是下面的 orchestrator 层。
 
 新增 `legion-runtime/src/goal/` 模块：
 

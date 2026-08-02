@@ -1,0 +1,19 @@
+{
+  "name": "@uselegion/cli-darwin-x64",
+  "version": "0.0.0",
+  "description": "Prebuilt `legion` binary for macOS x86_64 (Intel). Installed via @uselegion/cli.",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dawnswwwww/uselegion"
+  },
+  "files": [
+    "bin/"
+  ]
+}

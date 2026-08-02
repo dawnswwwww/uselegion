@@ -48,6 +48,7 @@ E2E tests in `crates/legion-gateway/tests/e2e_minimax*.rs` and `crates/legion-pr
 - Keep logic in the canonical layer and reuse existing helpers rather than introducing bespoke one-offs.
 - Prefer direct, boring, maintainable code over hacky or magical indirection.
 - Question unnecessary optionality or cast-heavy boundaries when a clearer typed contract could exist.
+- Prefer subtraction over layering — collapse parallel models into a single source of truth and delete code rather than adding indirection; do not over-engineer.
 
 ## Where to make changes
 
@@ -56,6 +57,7 @@ E2E tests in `crates/legion-gateway/tests/e2e_minimax*.rs` and `crates/legion-pr
 - **Tools:** register in `crates/legion-tools/src/registry.rs`, add tests in `crates/legion-tools/src/tools.rs`
 - **MCP transports:** extend `McpTransport` in `crates/legion-core/src/config.rs`, add client logic in `crates/legion-mcp/src/client.rs`
 - **Providers:** `crates/legion-provider/src/router.rs`
+- **Session goals:** model/store/turn-end gate in `crates/legion-runtime/src/goal.rs` / `goal_gate.rs`, model-facing tools in `crates/legion-host/src/goal_tools.rs`, `/goal` command in `crates/legion-cli/src/slash_commands.rs`
 - **CLI / Gateway distribution:** `crates/legion-cli/src/gateway_manager.rs`, `crates/legion-cli/src/lib.rs`, `crates/legion-cli/src/main.rs`, and `crates/legion-protocol/src/compatibility.rs` / `manifest.rs`
 - Keep `cargo tree -p legion-cli` free of `legion-gateway`.
 

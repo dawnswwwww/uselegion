@@ -1,5 +1,6 @@
 //! In-memory registry of connected and paired nodes.
 
+use legion_core::util::lock_recover;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -71,29 +72,22 @@ impl NodeRegistry {
     }
 
     pub fn register(&self, node: Node) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         state.nodes.insert(node.id.clone(), node);
     }
 
     pub fn unregister(&self, id: &str) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         state.nodes.remove(id);
     }
 
     pub fn get(&self, id: &str) -> Option<Node> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state.nodes.get(id).cloned()
     }
 
     pub fn list(&self) -> Vec<Node> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state.nodes.values().cloned().collect()
-    }
-
-    pub fn mark_paired(&self, id: &str, paired: bool) {
-        let mut state = self.inner.lock().unwrap();
-        if let Some(node) = state.nodes.get_mut(id) {
-            node.paired = paired;
-        }
     }
 }

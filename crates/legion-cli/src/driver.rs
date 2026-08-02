@@ -54,20 +54,24 @@ pub enum CliMode {
 
 /// Resolve the `--local` / `--gateway` flags into a [`CliMode`].
 ///
-/// With no flags the default is **embedded** ([`CliMode::Local`]): a local
-/// `legion` invocation runs the runtime in-process, so cwd, tools, and
-/// approval all stay local with zero network hop. The gateway is a service
-/// for remote channels (Telegram/Slack/cron) — connect to it explicitly with
-/// `--gateway` when you want a shared long-running runtime. `--local` is a
-/// no-op alias for the default (kept for clarity / scripting). `Auto`
-/// (probe-and-fallback) is reachable programmatically but is no longer the
-/// user-facing default.
-pub fn resolve_cli_mode(_local: bool, gateway: bool) -> CliMode {
+/// With no flags the default is **auto** ([`CliMode::Auto`]): a local
+/// `legion` invocation briefly probes for a running gateway and uses it when
+/// reachable, so the TUI can be discovered and continued from other clients.
+/// When the gateway is unreachable it falls back to an in-process runtime,
+/// keeping cwd, tools, and approval fully local with zero network hop.
+///
+/// `--local` is the explicit escape hatch from the probe: it forces the
+/// embedded runtime and never touches the gateway. `--gateway` inverts this —
+/// it requires the gateway (starting one if needed) and never runs embedded.
+/// Clap makes the two flags conflict; when both are set anyway, `--gateway`
+/// wins (explicit opt-in beats the `--local` opt-out).
+pub fn resolve_cli_mode(local: bool, gateway: bool) -> CliMode {
     if gateway {
         CliMode::Gateway
-    } else {
-        // `--local` and the default (no flag) both run embedded.
+    } else if local {
         CliMode::Local
+    } else {
+        CliMode::Auto
     }
 }
 
@@ -726,19 +730,19 @@ mod tests {
     // ---- mode resolution ----
 
     #[test]
-    fn resolve_cli_mode_defaults_to_local() {
-        // No flags = embedded (the new default). The CLI runs the runtime
-        // in-process; the gateway is opt-in via --gateway.
-        assert_eq!(resolve_cli_mode(false, false), CliMode::Local);
+    fn resolve_cli_mode_defaults_to_auto() {
+        // No flags = auto (the default): probe for a gateway and fall back to
+        // embedded when none is reachable.
+        assert_eq!(resolve_cli_mode(false, false), CliMode::Auto);
     }
 
     #[test]
-    fn resolve_cli_mode_gateway_flag_wins_and_local_is_default() {
-        // --local is an explicit no-op alias for the embedded default.
+    fn resolve_cli_mode_local_and_gateway_flags() {
+        // --local forces the embedded runtime, skipping the gateway probe.
         assert_eq!(resolve_cli_mode(true, false), CliMode::Local);
         assert_eq!(resolve_cli_mode(false, true), CliMode::Gateway);
         // Clap makes the flags conflict; if both are set anyway, gateway wins
-        // (explicit opt-in to the gateway beats the implicit local default).
+        // (explicit opt-in to the gateway beats the --local opt-out).
         assert_eq!(resolve_cli_mode(true, true), CliMode::Gateway);
     }
 

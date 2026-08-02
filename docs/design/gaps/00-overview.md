@@ -15,7 +15,7 @@ legion 是一个 Rust 多通道 AI agent gateway,当前处于 **Phase 0 MVP 中�
 - **对照 Claude Code 泄露源码**(`claude-code-analysis/`):Claude Code 在 agent 执行**内核深度**上沉淀了大量工程防线(approval 回路、compact 熔断、sandbox 逃逸防护、session orphan 修复、四层 memory),legion 在这些"防线"上普遍缺失或骨架化。
 - **对照 legion 自身 PRD**(`docs/design/agent-harness-prd.md`)与参考架构 OpenClaw(`docs/openclaw_raw/`):PRD 规划的扩展面(7 类插件、Skill、多通道、P1/P2 工具、原生客户端)完成度仅约 55%,OpenClaw 的连接面广度(27+ channel、60+ provider)legion 仅覆盖极小一部分。
 
-本目录把这两类差距统一编码为 **14 个 gap**,分三大类目,每个 gap 独立成文并附设计方案。
+本目录把这两类差距统一编码为 **15 个 gap**,分三大类目,每个 gap 独立成文并附设计方案。
 
 **重要**:所有"现状"陈述以 **legion 源码为准**,不轻信 `AGENTS.md` 声明。涉及"借鉴 Claude Code"处,均指向 `claude-code-analysis/analysis/*.md` 的具体章节作为依据。
 
@@ -26,12 +26,12 @@ legion 是一个 Rust 多通道 AI agent gateway,当前处于 **Phase 0 MVP 中�
 | 类目 | 含义 | gap 数 | 严重度 |
 |---|---|---|---|
 | [`02-missing`](./02-missing/_index.md) | **完全缺失的子系统**:Claude Code 已深度实现,legion 零实现或仅有配置占位 | 4 | 最高 |
-| [`03-shallow`](./03-shallow/_index.md) | **内核浅化**:legion 有基础实现,但缺 Claude Code 的工程化深度防线 | 6 | 高 |
+| [`03-shallow`](./03-shallow/_index.md) | **内核浅化**:legion 有基础实现,但缺 Claude Code 的工程化深度防线 | 7 | 高 |
 | [`04-breadth`](./04-breadth/_index.md) | **生态广度不足**:对照 OpenClaw/PRD 的连接面、工具、自动化数量差距 | 4 | 中 |
 
 ### 2.1 完全缺失(`02-missing/`)
 - [skills](./02-missing/skills.md) — ✅ 已完成:新增 `legion-skills` crate、frontmatter 解析、摘要注入、paths 条件触发、按需召回(关键词 + 可选轻量 LLM 选择器)、`legion skills list/reload`、plugin skill 来源(通过 `legion-plugin-sdk` 的 `PluginHandles`/`ManifestPlugin` 注入 runtime)。
-- [mcp](./02-missing/mcp.md) — ✅ 已完成:`legion-mcp` crate 四种传输(stdio/http/sse/ws),`mcp__<server>__<tool>` 命名空间适配进 `CoreToolRegistry`,默认 `Approval::Required`,认证雪崩缓存 + 描述截断 + 并发限流 + session 过期重连 + OAuth step-up 检测,Prometheus 指标 `mcp_calls_total{server,tool}` / `mcp_errors_total{server,tool}` 暴露在 `/metrics`,`legion mcp list/tools/reload` CLI。
+- [mcp](./02-missing/mcp.md) — ✅ 已完成(**协议升级 2026-07-31**):`legion-mcp` crate 四种传输(stdio/http-streamable/sse/ws),协议版本协商链 2026-07-28→2024-11-05(含 2026-07-28 stateless 模式 + `server/discover` 回退 + `protocolVersion` pin),列表分页(cursor/nextCursor,100 页上限),resources/prompts 内省 API + `server_status()` 快照,`structuredContent`/`annotations`/`outputSchema` 透传,新配置 `protocolVersion`/`toolTimeoutMs`;`mcp__<server>__<tool>` 命名空间 + 默认 `Approval::Required` + 认证雪崩缓存 + 描述截断 + 并发限流 + session 重连 + Prometheus 指标沿用;CLI 扩为 `legion mcp add/remove/get/status/list/tools/reload`,新增 TUI `/mcp` slash 命令;剩余差距:OAuth flow、MRTR/elicitation、tools/list_changed 实时刷新、ttlMs/cacheScope、Tasks extension、配置热加载。
 - [multi-agent](./02-missing/multi-agent.md) — ✅ **已完成(2026-07-11)**:`spawn_subagent`(Typed 独立上下文 / Fork 快照继承)+ `run_coordinator`(多阶段计划:同 phase 并行、phase 间按 `dependsOn` 串行、`{{results}}` 汇总注入)+ sidechain transcript + 权限收敛 + 深度/迭代/超时/并发防护 + 子 agent 审批默认拒绝;阶段 D Swarm 以 in-process 因地制宜形态落地(`SwarmManager`:命名 teammate + per-teammate mailbox + 跨轮历史续接,`swarm_spawn`/`swarm_send`/`swarm_status` 工具)
 - [plugin-facade](./02-missing/plugin-facade.md) — 7 类插件仅 channel 可用,4 个 system plugin 是 stub
 
@@ -42,6 +42,7 @@ legion 是一个 Rust 多通道 AI agent gateway,当前处于 **Phase 0 MVP 中�
 - [sandbox-isolation](./03-shallow/sandbox-isolation.md) — local backend 零隔离,无 namespace/seccomp
 - [session-resume](./03-shallow/session-resume.md) — **Phase A+B+C 已落地(2026-07-11)**:`RunEvent::Compaction` 携带 `resume_head` + `load_for_resume` boundary 感知恢复(A);`transcript_repair.rs` orphan 修复 + 一致性检查(`sessions.orphanPolicy`)(B);`lite_read`/`list_session_summaries` 头读摘要 + TTL 归档(`sessions.ttlDays`/`archiveDir`,移动可恢复,gateway 启动执行)(C);sidechain(Phase D)随 multi-agent
 - [prompt-management](./03-shallow/prompt-management.md) — **✅ 已落地(2026-07-11,Phase A+B+C)**:`SystemPromptBuilder` section 化 + bootstrap 补 `IDENTITY.md`/`HEARTBEAT.md`(A);`resolve_sections` override 优先级链(Override>Coordinator>Agent>Custom>Default,Append 挂末尾)+ per-agent `customSystemPrompt`/`appendSystemPrompt`/`outputStyle`/`language`(B);`promptDump.enabled`/`--dump-prompts` 落 JSONL(0600)+ `legion context <session>` 按段 token 表 + `cache_prefix_len`(C;provider cache breakpoint 接线留后续)
+- [session-loop](./03-shallow/session-loop.md) — **Phase A 已实施(2026-07-16)**:local TUI 模式 `/loop` 不再强制依赖 gateway;`LocalDriver` 内嵌 `CronScheduler`,使用 session 私有 store(`<peer>.cron.jsonl`/`<peer>.tasks.jsonl`),job id 加 `session-cron-` 前缀,与 global gateway loop 分层管理
 
 ### 2.3 生态广度(`04-breadth/`)
 - [channels](./04-breadth/channels.md) — **✅ 已完成(2026-07-11)**:Phase A=访问控制引擎真执行(`access.rs`,默认最小权限)+ BotLoopGuard;Phase B=Slack(Socket Mode)+ Discord(Gateway WS);Phase C=Lark(飞书长连接,手写 pbbp2 protobuf 帧编解码)+ Matrix(sync 长轮询,m.direct 判定 DM);收尾切片=`ChannelProvider` 加默认 no-op `send_typing`/`add_reaction`,Telegram 实现 sendChatAction/setMessageReaction,`route_inbound_to_runtime` 按 capabilities 门控 typing 循环(watch 停止)/👀 reaction,无能力的 channel 零开销不崩。WebChat media_send 复核为本就 pass-through。四个新 channel 均以 system plugin 包装注册,legion-channel lib 60 测试全过,**live 路径均无凭据未 E2E**;Phase D 桥接型(WhatsApp/iMessage)暂不承诺
@@ -67,12 +68,13 @@ legion 是一个 Rust 多通道 AI agent gateway,当前处于 **Phase 0 MVP 中�
 | [multi-agent](./02-missing/multi-agent.md) | missing | P1 | L | — | §8 T3 |
 | [prompt-management](./03-shallow/prompt-management.md) | shallow | P1 | M | skills | §6 R3 |
 | [session-resume](./03-shallow/session-resume.md) | shallow | P2 | M | compaction | §15 D2 |
+| [session-loop](./03-shallow/session-loop.md) | shallow | P2 | S-M | automation-advanced | §9 A3/A4 |
 | [channels](./04-breadth/channels.md) | breadth | P2 | L | plugin-facade | §5 C4-C8 |
 | [providers](./04-breadth/providers.md) | breadth | P2 | M | — | §6.5 P2/P6 |
 | [tools-p1p2](./04-breadth/tools-p1p2.md) | breadth | P2 | L | plugin-facade | §8 T3 |
 | [automation-advanced](./04-breadth/automation-advanced.md) | breadth | P2 | M | — | §9 A4/A5/A7 |
 
-**优先级分布**:P0 × 4(安全地基 + 架构地基),P1 × 5(内核深度 + 扩展杠杆),P2 × 5(生态广度 + 健壮性)。
+**优先级分布**:P0 × 4(安全地基 + 架构地基),P1 × 5(内核深度 + 扩展杠杆),P2 × 6(生态广度 + 健壮性 + UX 深度)。
 
 **关键依赖链**:
 ```
@@ -80,6 +82,7 @@ plugin-facade ─┬─→ skills ─→ prompt-management
                ├─→ mcp
                └─→ tools-p1p2 / channels
 compaction ─→ session-resume
+automation-advanced ─→ session-loop
 ```
 `plugin-facade` 是架构地基,解锁 skills/mcp/channels/tools-p1p2 的低成本落地,故列 P0。
 
@@ -116,6 +119,7 @@ compaction ─→ session-resume
 3. **tools-p1p2**:browser / canvas / image_generate / tts / agent_to_agent。
 4. **automation-advanced**:Standing Orders / Inferred Commitments / Task Flow DAG。
 5. **session-resume**:compact boundary 恢复 + orphan tool_result 修复。
+6. **session-loop**:local TUI 进程级 `/loop`,与 gateway global loop 分层。
 
 **Phase C 出口标准**:覆盖至少 5 个 channel、5 个 provider;多步任务可 DAG 编排;resume 能正确恢复 compact 后的会话。
 
@@ -198,6 +202,10 @@ AGENTS.md                          ← 声明:"实现了什么"(须与源码同�
 
 | 日期 | 变更 | 作者 |
 |---|---|---|
+| 2026-07-31 | MCP 协议升级:`legion-mcp` 新增 `version.rs` 协议协商链(`SUPPORTED_VERSIONS` = 2026-07-28/2025-11-25/2025-06-18/2025-03-26/2024-11-05,新→旧 `initialize` 回退,server 版本宽松采纳 + capabilities 存储,`protocolVersion` pin 跳链);2026-07-28 stateless 模式(无 `notifications/initialized`、`_meta` clientInfo+能力、`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` 头、-32601 → `server/discover` 回退);http 传输升级 Streamable HTTP(SSE 帧解析、`Mcp-Session-Id` 捕获重发仅限 2025-xx);tools/resources/prompts list 分页(100 页上限);内省 API `list_resources`/`read_resource`/`list_prompts`/`get_prompt` + `McpManager::server_status()`(UI 用,非 agent 工具);`McpToolDesc` 带 annotations/outputSchema,结果带 structuredContent;配置新增 `protocolVersion`/`toolTimeoutMs`(默认 60s);CLI 扩为 `legion mcp add/remove/get/status/list`(claude-code 对齐 flag)+ 新增 TUI `/mcp` slash 命令(配置编辑持久化 legion.json,重启生效);剩余差距(OAuth flow/MRTR/tools/list_changed/ttlMs/Tasks/热加载)记入 mcp gap §2;更新 mcp gap、overview、DEVLOG | agent |
+| 2026-07-17 | subagent 预算护栏重构:`defaultMaxIterations` 默认 5 → `None`(字段改 `Option<usize>`)+ `defaultTimeoutMs` 默认 120s → 600s。对齐 Claude Code(内置 agent 均不设 maxTurns,仅 fork=200 保险丝)与 grok(`resolve_subagent_max_turns`:子声明优先、否则继承父,父默认 None);legion 主 agent `agents.defaults.maxIterations` 本就默认 None;`run_child` 仅在 `Some` 时调 `with_max_iterations`,None 时回落 runtime 自身上限,600s 墙钟超时成为唯一预算护栏;实测动机:46 个子 agent 中 14 个(30%)死于 5 次迭代上限(读设定+写4文件恰卡线),此前两轮亦全部撞 120s 超时;spawn schema/coordinator(Option 本就兼容)/swarm(None 传入)无需改动;配置测试与 multi-agent §6.5 更新 | agent |
+| 2026-07-17 | subagent 可观测性三修:(1) `ProviderRouter::validate_model_ref`(别名解析 + provider 已注册校验),`RuntimeSubagentSpawner` 对显式 `model` 覆盖预检,非法值(如模型幻觉的 "default"/"")立即 Failed 并提示省略参数继承默认,不再白跑一轮子 agent;(2) `TelemetryClient::log_session_event` 写入时统一注入 RFC 3339 `ts` 字段,事件间隔/重叠可从 session-metrics.jsonl 直接重建;(3) 超时子 agent 改为逐事件 deadline(`collect` 内 `timeout_at`),保留截止前已收集事件流写 sidechain,不再丢成 0 字节;配套 `AgentRuntime::router_for`(`run()` 复用);新增测试 `validate_model_ref_checks_alias_and_provider`/`spawn_invalid_model_override_fails_fast`/`timed_out_child_keeps_partial_event_stream` + telemetry ts 断言 | agent |
+| 2026-07-17 | `spawn_subagent` 放开并行:`SpawnSubagentTool::is_concurrency_safe` 翻为 true(原为 false 强制串行批次),同一轮内多个 spawn 调用进入同一并发批次并行执行,受 `subagents.maxConcurrent` 信号量限流,permit 等待以子 agent 超时为上界(防嵌套派生占满许可死锁);是否并行由模型按任务独立性自行决定;工具 description 增补"同轮多次调用即并行"说明;新增 registry 层测试 `same_turn_spawn_subagent_calls_run_concurrently` 验证分桶与 spawner 层测试 `spawn_permit_wait_times_out_as_concurrency_error`;更新 multi-agent gap §4.2 与 overview | agent |
 | 2026-07-11 | multi-agent 阶段 D 落地(gap ✅ 收官,路线图 14/14 全绿):新建 `legion-runtime/src/swarm.rs`(`SwarmManager`:命名 teammate 上限 8 + per-teammate mailbox 容量 16;`supervise` 循环同锁 drain+Idle 判定无丢消息;跨轮历史续接截断 40 条;每轮经 `RuntimeSubagentSpawner` 驱动复用信号量/超时/sidechain);`run_child` 去 `inherit_history` 门控(Typed 也支持 history);`swarm_spawn`/`swarm_send`(默认 Prompt)/`swarm_status`(默认 Off)三工具 + `ToolContext.swarm` 照 messenger 链透传;gateway `set_swarm` 接线;18 新测试全绿,全量 27 suite 全绿;更新 multi-agent gap、overview、DEVLOG 与 AGENTS.md | agent |
 | 2026-07-11 | automation-advanced Phase C 落地(gap ✅ 收官):`legion-core` 加 `TaskFlow`/`FlowStep`/`FlowFailurePolicy` + 顶层 `flows` 声明式配置;新建 `legion-automation/src/flow.rs`(`FlowRunner` 预校验 + 按层 `FuturesUnordered` 并发 + abort/continue 失败策略 + 循环检测,`FlowReport` 序列化);cron 加 `webhook_secret` + `__webhook__` sentinel + `verify_webhook_signature`(HMAC-SHA256 常量时间比较)+ `get_job`;Gateway `POST /webhook/{id}`(404 不泄露存在性/401/200 触发)+ `flows.list/run` RPC;CLI `legion flows list|run`、`cron add --webhook-secret`;19 新测试(含 webhook 200 路径真实 Gateway 集成),全量 27 suite 全绿;更新 automation-advanced gap、overview、DEVLOG 与 AGENTS.md | agent |
 | 2026-07-11 | automation-advanced Phase B 落地:新建 `legion-runtime/src/commitments.rs`(`CommitmentExtractor` trait fire-and-forget,照 AgentMessenger 模式)+ `legion-automation/src/commitments.rs`(`LlmCommitmentExtractor`:轻量 LLM 抽取 `{description, due RFC3339}` → 一次性 `__at__` CronJob,id 前缀 `commitment:`,SecretScanner 过滤 + cooldown + 失败全吞);顶层 `commitments` 配置(默认 disabled);gateway cron store 创建提前,extractor 与 scheduler 共享实例;`legion commitments list` CLI;automation 加 legion-provider 依赖(无环);8 新测试全绿,全量 26 suite 全绿;live LLM 未 E2E;更新 automation-advanced gap、overview、DEVLOG 与 AGENTS.md | agent |

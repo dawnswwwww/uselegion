@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 legion-core = { path = "../legion-core" }
@@ -21,7 +28,7 @@ legion-acp = { path = "../legion-acp" }
 legion-automation = { path = "../legion-automation" }
 legion-mcp = { path = "../legion-mcp" }
 
-async-trait = "0.1"
+async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }
@@ -35,7 +42,7 @@ tracing-subscriber = "0.3"
 
 [dev-dependencies]
 reqwest = { workspace = true }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { workspace = true }
 serial_test = "3.2"
 tempfile = { workspace = true }
 temp-env = { workspace = true }

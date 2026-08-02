@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::types::RunEvent;
@@ -53,11 +52,6 @@ impl TodoList {
     /// Returns true when there are no items at all.
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
-    }
-
-    /// Returns true when at least one item is not completed.
-    pub fn has_incomplete(&self) -> bool {
-        self.items.iter().any(|t| t.status != TodoStatus::Completed)
     }
 
     /// Count of completed items.
@@ -147,25 +141,8 @@ impl JsonTodoStore {
     }
 
     async fn write_atomically(path: &Path, list: &TodoList) -> Result<(), TodoStoreError> {
-        let tmp = tmp_path_for(path);
-        let written = async {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            let payload = serde_json::to_vec_pretty(list)?;
-            file.write_all(&payload).await?;
-            file.flush().await?;
-            Ok::<(), TodoStoreError>(())
-        }
-        .await;
-
-        if let Err(err) = written {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err);
-        }
-
-        if let Err(err) = tokio::fs::rename(&tmp, path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err.into());
-        }
+        let payload = serde_json::to_vec_pretty(list)?;
+        legion_core::fs::atomic_write_async(path, &payload).await?;
         Ok(())
     }
 }
@@ -203,19 +180,6 @@ fn sanitize_path_component(input: &str) -> String {
             }
         })
         .collect()
-}
-
-/// Unique temp path next to `path` for atomic write-then-rename persistence.
-fn tmp_path_for(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "store".to_string());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    path.with_file_name(format!("{file_name}.tmp-{}-{nanos}", std::process::id()))
 }
 
 #[cfg(test)]

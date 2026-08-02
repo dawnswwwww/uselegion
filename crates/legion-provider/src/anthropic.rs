@@ -1,12 +1,12 @@
 use crate::auth::AuthProfile;
+use crate::http;
 use crate::provider::Provider;
 use crate::types::{
     ChatChunk, ChatRequest, ChatRole, ChatStream, EmbedRequest, Embedding, FinishReason,
-    FunctionCall, ModelInfo, ProviderError, ToolCall,
+    FunctionCall, ModelInfo, PartialToolCall, ProviderError, ToolCall, parse_tool_arguments,
+    tool_run_end,
 };
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -37,23 +37,13 @@ impl AnthropicProvider {
             .to_string();
 
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            reqwest::header::HeaderValue::from_str(&key)
-                .map_err(|e| ProviderError::InvalidAuth(e.to_string()))?,
-        );
+        headers.insert("x-api-key", http::header_value(&key)?);
         headers.insert(
             "anthropic-version",
             reqwest::header::HeaderValue::from_static(ANTHROPIC_VERSION),
         );
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
-        );
 
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?;
+        let client = http::json_client(headers)?;
 
         Ok(Self {
             id: id.into(),
@@ -126,7 +116,8 @@ impl AnthropicProvider {
             i += 1;
 
             // Collapse following tool messages into the same user message.
-            while i < req.messages.len() && req.messages[i].role == ChatRole::Tool {
+            let end = tool_run_end(&req.messages, i);
+            while i < end {
                 let tool = &req.messages[i];
                 let tool_use_id = tool.tool_call_id.clone().unwrap_or_default();
                 content_blocks.push(serde_json::json!({
@@ -177,9 +168,7 @@ impl AnthropicProvider {
                 .collect();
             body["tools"] = serde_json::Value::Array(tool_specs);
         }
-        for (k, v) in &req.extra {
-            body[k] = v.clone();
-        }
+        req.apply_extra_to(&mut body);
 
         body
     }
@@ -195,8 +184,7 @@ impl AnthropicProvider {
                     }));
                 }
                 for call in calls {
-                    let input: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let input = parse_tool_arguments(&call.function.arguments);
                     blocks.push(serde_json::json!({
                         "type": "tool_use",
                         "id": call.id,
@@ -215,22 +203,6 @@ impl AnthropicProvider {
             }),
         }
     }
-
-    fn build_request(&self, url: &str, body: serde_json::Value) -> reqwest::RequestBuilder {
-        let mut builder = self.client.post(url).json(&body);
-        for (k, v) in &self.extra_headers {
-            builder = builder.header(k, v);
-        }
-        builder
-    }
-}
-
-fn is_prompt_too_long(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("prompt is too long")
-        || lower.contains("context_overflow")
-        || lower.contains("context length")
-        || lower.contains("max tokens")
 }
 
 #[async_trait]
@@ -245,44 +217,27 @@ impl Provider for AnthropicProvider {
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
         let body = self.build_body(&req);
-        let response = self
-            .build_request(&self.messages_url(), body)
+        let response = http::check_status(
+            http::post_json(
+                &self.client,
+                &self.messages_url(),
+                body,
+                &self.extra_headers,
+            )
             .send()
-            .await?;
+            .await?,
+            true,
+        )
+        .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            if is_prompt_too_long(&text) {
-                return Err(ProviderError::PromptTooLong);
-            }
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
-
-        let stream = response
-            .bytes_stream()
-            .eventsource()
-            .scan(AnthropicStreamState::default(), |state, event| {
-                let result = match event {
-                    Ok(event) => {
-                        let parsed: Result<AnthropicEventData, _> =
-                            serde_json::from_str(&event.data);
-                        match parsed {
-                            Ok(data) => data.into_chat_chunk(state),
-                            Err(err) => Some(Err(ProviderError::JsonParse(err))),
-                        }
-                    }
-                    Err(err) => Some(Err(ProviderError::SseParse(err.to_string()))),
-                };
-                // scan terminates the stream on None, so always yield Some(result)
-                // and let filter_map drop the inner None values.
-                futures::future::ready(Some(result))
-            })
-            .filter_map(futures::future::ready);
-
-        Ok(Box::pin(stream))
+        Ok(http::sse_stream(
+            response,
+            AnthropicStreamState::default(),
+            |state, data| match http::parse_sse_json::<AnthropicEventData>(data) {
+                Ok(parsed) => parsed.into_chat_chunk(state),
+                Err(err) => Some(Err(err)),
+            },
+        ))
     }
 
     async fn embed(&self, _req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
@@ -293,15 +248,8 @@ impl Provider for AnthropicProvider {
 /// Accumulator for Anthropic streaming events.
 #[derive(Debug, Default)]
 struct AnthropicStreamState {
-    current_tool: Option<PartialToolUse>,
+    current_tool: Option<PartialToolCall>,
     completed_tools: Vec<ToolCall>,
-}
-
-#[derive(Debug, Default)]
-struct PartialToolUse {
-    id: String,
-    name: String,
-    input_parts: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -345,10 +293,11 @@ impl AnthropicEventData {
             "content_block_start" => {
                 if let Some(block) = self.content_block {
                     if block.block_type == "tool_use" {
-                        state.current_tool = Some(PartialToolUse {
+                        state.current_tool = Some(PartialToolCall {
                             id: block.id.unwrap_or_default(),
+                            kind: "function".to_string(),
                             name: block.name.unwrap_or_default(),
-                            input_parts: String::new(),
+                            arguments: String::new(),
                         });
                     }
                 }
@@ -367,7 +316,7 @@ impl AnthropicEventData {
                     if delta.delta_type.as_deref() == Some("input_json_delta") {
                         if let Some(parts) = delta.partial_json {
                             if let Some(tool) = &mut state.current_tool {
-                                tool.input_parts.push_str(&parts);
+                                tool.arguments.push_str(&parts);
                             }
                         }
                     }
@@ -376,8 +325,7 @@ impl AnthropicEventData {
             }
             "content_block_stop" => {
                 if let Some(tool) = state.current_tool.take() {
-                    let input: serde_json::Value = serde_json::from_str(&tool.input_parts)
-                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let input = parse_tool_arguments(&tool.arguments);
                     state.completed_tools.push(ToolCall {
                         id: tool.id,
                         kind: "function".to_string(),
@@ -435,17 +383,6 @@ mod tests {
     use crate::ChatMessage;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[test]
-    fn detects_prompt_too_long_from_error_body() {
-        assert!(is_prompt_too_long(
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#
-        ));
-        assert!(is_prompt_too_long(
-            r#"{"type":"error","error":{"type":"context_overflow","message":"..."}}"#
-        ));
-        assert!(!is_prompt_too_long("invalid_api_key"));
-    }
 
     #[test]
     fn build_body_adds_cache_control_to_breakpoint_system_messages() {

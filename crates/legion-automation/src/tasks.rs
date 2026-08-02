@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
 
 /// The kind of background work represented by a task.
@@ -198,44 +198,15 @@ impl JsonlTaskStore {
     }
 
     async fn save(&self, tasks: &[Task]) -> Result<(), TaskStoreError> {
-        // Crash-safe write: serialize into a uniquely-named temp file in the
-        // same directory, then rename over the target so a crash mid-write
-        // never leaves a truncated store behind.
-        let tmp = tmp_path_for(&self.path);
-        let written = async {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            for task in tasks {
-                let line = serde_json::to_string(task)?;
-                file.write_all(line.as_bytes()).await?;
-                file.write_all(b"\n").await?;
-            }
-            file.flush().await?;
-            Ok::<(), TaskStoreError>(())
+        let mut buf = Vec::new();
+        for task in tasks {
+            let line = serde_json::to_string(task)?;
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
         }
-        .await;
-        if let Err(err) = written {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err);
-        }
-        if let Err(err) = tokio::fs::rename(&tmp, &self.path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err.into());
-        }
+        legion_core::fs::atomic_write_async(&self.path, &buf).await?;
         Ok(())
     }
-}
-
-/// Unique temp path next to `path` for atomic write-then-rename persistence.
-fn tmp_path_for(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "store".to_string());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    path.with_file_name(format!("{file_name}.tmp-{}-{nanos}", std::process::id()))
 }
 
 #[async_trait::async_trait]

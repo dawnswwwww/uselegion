@@ -16,7 +16,7 @@ mod ops;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::Signature;
 use fs2::FileExt;
-use legion_protocol::ProtocolCompatibility;
+use legion_protocol::{ProtocolCompatibility, STABLE_RELEASE_PUBLIC_KEY};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -193,6 +193,9 @@ pub struct GatewayManager {
     #[allow(dead_code)]
     daemon_lock: PathBuf,
     migration_file: PathBuf,
+    /// Ed25519 public key used to verify release manifests. Defaults to the
+    /// production stable-channel key; overridable in tests.
+    release_public_key: [u8; 32],
 }
 
 impl GatewayManager {
@@ -208,6 +211,7 @@ impl GatewayManager {
             daemon_lock: home.join("locks").join("gateway-daemon.lock"),
             migration_file: home.join("migration.jsonl"),
             home,
+            release_public_key: STABLE_RELEASE_PUBLIC_KEY,
         }
     }
 
@@ -526,6 +530,17 @@ mod tests {
     pub(crate) fn test_manager() -> (GatewayManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         (GatewayManager::new(tmp.path()), tmp)
+    }
+
+    /// Like [`test_manager`] but overrides the release public key, so signature
+    /// tests can sign with an ephemeral keypair instead of the production key.
+    pub(crate) fn test_manager_with_key(
+        public_key: [u8; 32],
+    ) -> (GatewayManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = GatewayManager::new(tmp.path());
+        mgr.release_public_key = public_key;
+        (mgr, tmp)
     }
 
     #[test]

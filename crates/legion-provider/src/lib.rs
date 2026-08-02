@@ -3,6 +3,7 @@ pub mod auth;
 pub mod bedrock;
 mod eventstream;
 pub mod gemini;
+mod http;
 pub mod model_ref;
 pub mod ollama;
 pub mod openai;

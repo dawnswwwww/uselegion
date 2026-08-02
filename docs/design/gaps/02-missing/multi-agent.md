@@ -108,8 +108,8 @@ pub struct SubagentRequest {
     pub allowed_tools: Vec<String>,            // 必须是父工具集子集(权限收敛)
     pub parent_session: SessionKey,
     pub parent_context_summary: Option<String>,// Fork 时注入的父上下文摘要
-    pub max_iterations: usize,                 // 防失控(默认 5)
-    pub timeout: std::time::Duration,          // 默认 120s
+    pub max_iterations: usize,                 // 防失控(默认 None 不限,墙钟超时兜底)
+    pub timeout: std::time::Duration,          // 默认 600s
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +146,10 @@ pub struct SpawnSubagentTool { spawner: Arc<dyn SubagentSpawner> }
 #[async_trait]
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str { "spawn_subagent" }
-    fn is_concurrency_safe(&self) -> bool { false }   // 阻塞型,串行
+    // 并发安全:同一轮内多次调用进入同一并发批次并行执行(受
+    // subagents.max_concurrent 信号量约束,permit 等待以子 agent
+    // 超时为上界,杜绝嵌套派生死锁),由模型自行决定是否并行。
+    fn is_concurrency_safe(&self) -> bool { true }
     async fn call(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let req: SubagentRequest = serde_json::from_value(input)?;
         // 权限收敛校验:allowed_tools 必须是当前 agent 工具集子集
@@ -215,7 +218,7 @@ Fork 继承父上下文可能很大。**缓解**:Fork 时注入"父上下文摘�
 Claude Code 用 `AsyncLocalStorage`(TS);legion 用 `tokio::spawn` + `oneshot` channel + `Arc` 共享 router,天然异步隔离,无需额外上下文传播机制。
 
 ### 6.5 失控防护
-子 agent 有独立 `max_iterations`(默认 5,远小于主循环 10)+ `timeout`(默认 120s),防止子 agent 无限循环拖垮 Gateway。超时 → `SubagentStatus::TimedOut` 回流。
+子 agent 默认**不限迭代轮数**(`max_iterations` 默认 None,对齐 Claude Code 内置 agent 不设 maxTurns、grok 继承父默认 None;配置或 per-call 可设保险丝),预算护栏是墙钟 `timeout`(默认 600s)。超时 → `SubagentStatus::TimedOut` 回流,且 sidechain 保留截止前事件流可溯源。
 
 ### 6.6 Swarm Teammates 的落地形态(2026-07-11 更新)
 Claude Code 的 Swarm 依赖 tmux/iTerm2 多进程 + mailbox 文件通信。legion 是单 Gateway 进程,**阶段 D 以 in-process 形态落地**:命名 teammate = 进程内后台 agent(由 `RuntimeSubagentSpawner` 驱动每轮),mailbox = per-teammate 内存队列(`SwarmManager`),跨轮历史续接(截断 40 条)。多进程 teammate 形态若未来出现(如移动端 node),可在 `SwarmManager` 外加进程适配层,mailbox 语义不变。

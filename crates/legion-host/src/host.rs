@@ -55,7 +55,16 @@ impl AgentHost {
     /// plugins, connect MCP servers, build provider routers, memory, tools,
     /// and the harness registry.
     pub async fn new(config: Config) -> Result<Self, HostError> {
-        crate::assembly::assemble_agent_host(config).await
+        crate::assembly::assemble_agent_host(config, None).await
+    }
+
+    /// Assemble the runtime side with an explicit cron store path for the
+    /// scheduler tools. `None` keeps the default `~/.legion/automation/cron.jsonl`.
+    pub async fn new_with_cron_store_path(
+        config: Config,
+        cron_store_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, HostError> {
+        crate::assembly::assemble_agent_host(config, cron_store_path).await
     }
 
     /// Resolve the session key, load + repair resumable history, and start an
@@ -130,7 +139,8 @@ mod tests {
         let before = host.session_store.load_for_resume(key).await.len();
         host.session_store
             .append(key, &[ProviderChatMessage::user("hello".to_string())])
-            .await;
+            .await
+            .unwrap();
         let history = host.session_store.load_for_resume(key).await;
         assert_eq!(history.len(), before + 1);
         assert_eq!(history.last().map(|m| m.content.as_str()), Some("hello"));

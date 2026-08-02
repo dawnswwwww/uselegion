@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 legion-core = { path = "../legion-core" }
@@ -13,7 +20,7 @@ legion-runtime = { path = "../legion-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-async-trait = "0.1"
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
@@ -22,6 +29,6 @@ tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
-tokio-test = "0.4"
+tokio-test = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

@@ -1,0 +1,27 @@
+{
+  "name": "@uselegion/cli",
+  "version": "0.0.0",
+  "description": "Self-hosted, multi-channel AI agent gateway and CLI — installer wrapper that resolves the prebuilt `legion` binary for your platform.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dawnswwwww/uselegion"
+  },
+  "homepage": "https://github.com/dawnswwwww/uselegion#readme",
+  "bin": {
+    "legion": "run.js"
+  },
+  "files": [
+    "run.js"
+  ],
+  "optionalDependencies": {
+    "@uselegion/cli-darwin-arm64": "0.0.0",
+    "@uselegion/cli-darwin-x64": "0.0.0",
+    "@uselegion/cli-linux-arm64-musl": "0.0.0",
+    "@uselegion/cli-linux-x64-musl": "0.0.0",
+    "@uselegion/cli-win32-x64-msvc": "0.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

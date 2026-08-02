@@ -137,6 +137,10 @@ pub struct ChannelCapabilities {
     pub thread: bool,
     pub reactions: bool,
     pub typing: bool,
+    /// Whether the provider can send interactive approval cards with
+    /// 批准/拒绝 buttons (see [`ChannelProvider::send_approval_card`]).
+    #[serde(default)]
+    pub buttons: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -185,6 +189,30 @@ pub trait ChannelProvider: Send + Sync {
         _emoji: &str,
     ) -> Result<(), ChannelError> {
         Ok(())
+    }
+
+    /// Remove a previously added reaction. Default: no-op.
+    async fn remove_reaction(
+        &self,
+        _peer: &Peer,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> Result<(), ChannelError> {
+        Ok(())
+    }
+
+    /// Send an interactive tool-approval card with 批准/拒绝 buttons.
+    ///
+    /// Returns `Ok(true)` when the card was sent, `Ok(false)` when the
+    /// provider does not support cards and the caller should fall back to a
+    /// plain text message. Default: unsupported.
+    async fn send_approval_card(
+        &self,
+        _peer: &Peer,
+        _tool: &str,
+        _prompt_id: &str,
+    ) -> Result<bool, ChannelError> {
+        Ok(false)
     }
 }
 

@@ -1,2 +1,9 @@
 /target
 /grok-build
+
+# Release signing key — NEVER commit. The private Ed25519 seed used to sign
+# release manifests is stored as the LEGION_RELEASE_SIGNING_KEY CI secret.
+*.legion-release-key.seed
+/manifest.json
+/manifest.json.sig
+

@@ -1,0 +1,490 @@
+name: release
+
+# Triggered by a pushed `v*.*.*` tag. Builds the `legion` + `legion-gateway`
+# binaries for 5 targets, publishes a GitHub Release, signs a release manifest
+# (consumed by `legion gateway install`), and publishes to crates.io, Homebrew,
+# and npm.
+#
+# Required repository secrets:
+#   CARGO_REGISTRY_TOKEN       — crates.io publish token
+#   NPM_TOKEN                  — npm automation token (org: uselegion)
+#   LEGION_RELEASE_SIGNING_KEY — 64-hex-char Ed25519 seed for manifest signing
+#   HOMEBREW_TAP_TOKEN         — PAT with repo scope on dawnswwwww/homebrew-tap
+#
+# External prerequisites (one-time setup, see docs/release-signing-key.md):
+#   - npm org `uselegion` created
+#   - GitHub repo `dawnswwwww/homebrew-tap` created (with Formula/ skeleton)
+#   - GitHub repo branch `releases/stable` created (manifest host)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # upload release assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────
+  # 1. Verify the tag matches the Cargo workspace version.
+  # ──────────────────────────────────────────────────────────────────────
+  version-check:
+    name: version check
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag to Cargo.toml version
+        id: check
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"            # strip leading 'v'
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "tag (stripped): $TAG"
+          echo "Cargo.toml version: $CARGO_VERSION"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag '$TAG' does not match Cargo.toml version '$CARGO_VERSION'"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 2. Build matrix: one job per target triple.
+  # ──────────────────────────────────────────────────────────────────────
+  build:
+    name: build (${{ matrix.target }})
+    needs: version-check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config build-essential
+
+      # For musl targets, use cargo-zigbuild: Zig bundles a complete musl +
+      # cross C toolchain, sidestepping the Docker/cross toolchain issues that
+      # break bundled-sqlite/sqlite-vec builds. (cargo-dist and many Rust
+      # projects use this for musl.)
+      - name: Install Zig + cargo-zigbuild (musl targets)
+        if: startsWith(matrix.target, 'unknown-linux-musl')
+        run: |
+          pipx install ziglang
+          cargo install --locked cargo-zigbuild
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build legion-cli
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ "${{ startsWith(matrix.target, 'unknown-linux-musl') }}" = "true" ]; then
+            # Capture build log to an artifact on failure so we can diagnose
+            # musl cross-compile errors without authenticated log access.
+            if ! cargo zigbuild --release --target ${{ matrix.target }} -p legion-cli 2>&1 | tee build-cli.log; then
+              echo "::warning::musl build failed; see build-cli.log artifact"
+              exit 1
+            fi
+          else
+            cargo build --release --target ${{ matrix.target }} -p legion-cli
+          fi
+
+      - name: Upload build log on failure (musl diagnostics)
+        if: failure() && startsWith(matrix.target, 'unknown-linux-musl')
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ matrix.target }}
+          path: build-cli.log
+          retention-days: 7
+
+      - name: Build legion-gateway
+        shell: bash
+        run: |
+          if [ "${{ startsWith(matrix.target, 'unknown-linux-musl') }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }} -p legion-gateway
+          else
+            cargo build --release --target ${{ matrix.target }} -p legion-gateway
+          fi
+
+      - name: Stage binaries + docs
+        shell: bash
+        run: |
+          VERSION="${{ needs.version-check.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="legion-${VERSION}-${TARGET}"
+          mkdir -p "$STAGE"
+          BUILDDIR="target/${TARGET}/release"
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            cp "$BUILDDIR/legion.exe" "$STAGE/"
+            cp "$BUILDDIR/legion-gateway.exe" "$STAGE/"
+          else
+            cp "$BUILDDIR/legion" "$STAGE/"
+            cp "$BUILDDIR/legion-gateway" "$STAGE/"
+          fi
+          cp LICENSE "$STAGE/"
+          cp README.md "$STAGE/"
+          echo "$STAGE"
+
+      - name: Verify static linking (Linux musl)
+        if: startsWith(matrix.target, 'x86_64-unknown-linux-musl')
+        run: |
+          file target/${{ matrix.target }}/release/legion
+          ldd target/${{ matrix.target }}/release/legion 2>&1 || true
+
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ needs.version-check.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="legion-${VERSION}-${TARGET}"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          # Portable sha256: macOS lacks coreutils sha256sum, so use shasum.
+          shasum -a 256 "${STAGE}.tar.gz" | awk '{print $1}' > "${STAGE}.tar.gz.sha256"
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $env:VERSION = "${{ needs.version-check.outputs.version }}"
+          $env:TARGET = "${{ matrix.target }}"
+          $stage = "legion-$env:VERSION-$env:TARGET"
+          Compress-Archive -Path "$stage" -DestinationPath "$stage.zip"
+          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -NoNewline "$stage.zip.sha256" $hash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            legion-*.tar.gz
+            legion-*.tar.gz.sha256
+            legion-*.zip
+            legion-*.zip.sha256
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 3. Create the GitHub Release and upload all assets.
+  # ──────────────────────────────────────────────────────────────────────
+  github-release:
+    name: github release
+    needs: [version-check, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: legion ${{ needs.version-check.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # Mark as prerelease if the version contains a hyphen (e.g. 0.0.1-rc.1).
+          prerelease: ${{ contains(needs.version-check.outputs.version, '-') }}
+          files: |
+            dist/legion-*.tar.gz
+            dist/legion-*.tar.gz.sha256
+            dist/legion-*.zip
+            dist/legion-*.zip.sha256
+          body: |
+            ## Install
+
+            **macOS** (Apple Silicon / Intel):
+            ```bash
+            brew install dawnswwwww/tap/legion
+            ```
+
+            **npm** (any platform):
+            ```bash
+            npm install -g @uselegion/cli
+            ```
+
+            **Cargo**:
+            ```bash
+            cargo install legion-cli
+            ```
+
+            **Direct download**: grab the archive for your platform below,
+            extract, and put `legion` on your `PATH`.
+
+            See the full release notes below.
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 4. Build + sign the release manifest (for `legion gateway install`).
+  # ──────────────────────────────────────────────────────────────────────
+  manifest-sign:
+    name: sign manifest
+    needs: [version-check, github-release]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build manifest JSON
+        run: |
+          VERSION="${{ needs.version-check.outputs.version }}"
+          node scripts/build-manifest.mjs "$VERSION" dist > manifest.json
+          echo "--- manifest.json ---"
+          cat manifest.json
+
+      - name: Sign manifest
+        run: |
+          node scripts/sign-manifest.mjs manifest.json manifest.json.sig
+          echo "--- signature ---"
+          cat manifest.json.sig | xxd -p -c 64
+
+      - name: Upload manifest + sig to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            manifest.json
+            manifest.json.sig
+
+      - name: Publish manifest to stable channel branch
+        # Pushes manifest.json + .sig to the `releases/stable` branch, which is
+        # the well-known host the CLI fetches (STABLE_MANIFEST_URL in lib.rs).
+        # Uses an isolated shallow clone so the tag checkout above is untouched.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          rm -rf manifest-host
+          git clone --depth=1 -b releases/stable \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            manifest-host 2>/dev/null || {
+              # Branch doesn't exist yet — create it as an orphan.
+              mkdir -p manifest-host
+              git init -q manifest-host
+              (cd manifest-host && git checkout -q --orphan releases/stable)
+            }
+          cp manifest.json manifest-host/
+          cp manifest.json.sig manifest-host/
+          cd manifest-host
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json manifest.json.sig
+          git commit -m "chore: publish stable manifest for v${VERSION}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:releases/stable
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 5. Publish all crates to crates.io (topological order).
+  # ──────────────────────────────────────────────────────────────────────
+  publish-crates:
+    name: crates.io
+    needs: [version-check, github-release]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-crates
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Publish leaves-first so dependents resolve. A crate already at this
+          # version reports "already exists" (exit 0) which we tolerate.
+          publish() {
+            echo "::group::cargo publish -p $1"
+            cargo publish -p "$1" --token "$CARGO_REGISTRY_TOKEN" || echo "  (already published or skipped: $1)"
+            echo "::endgroup::"
+          }
+          publish legion-core
+          publish legion-plugin-sdk
+          publish legion-protocol
+          publish legion-provider
+          publish legion-runtime
+          publish legion-memory
+          publish legion-tools
+          publish legion-channel
+          publish legion-automation
+          publish legion-skills
+          publish legion-mcp
+          publish legion-web
+          publish legion-telemetry
+          publish legion-acp
+          publish legion-gateway
+          publish legion-cli   # last: depends on all of the above
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 6. Update the Homebrew tap formula.
+  # ──────────────────────────────────────────────────────────────────────
+  publish-homebrew:
+    name: homebrew tap
+    needs: [version-check, github-release]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download darwin artifacts (for sha256)
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: dist-*-apple-darwin
+
+      - name: Render + push formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          ARM64_SHA=$(cat dist/legion-*-aarch64-apple-darwin.tar.gz.sha256)
+          X64_SHA=$(cat dist/legion-*-x86_64-apple-darwin.tar.gz.sha256 || echo "placeholder")
+          echo "arm64 sha: $ARM64_SHA"
+          echo "x64 sha: $X64_SHA"
+
+          # Render the formula from the template committed in this repo.
+          mkdir -p out
+          sed \
+            -e "s|@@VERSION@@|${VERSION}|g" \
+            -e "s|@@ARM64_SHA@@|${ARM64_SHA}|g" \
+            -e "s|@@X64_SHA@@|${X64_SHA}|g" \
+            Formula/legion.rb.tpl > out/legion.rb
+
+          # Clone the tap, copy the formula, commit, push.
+          rm -rf homebrew-tap
+          gh repo clone dawnswwwww/homebrew-tap homebrew-tap \
+            -- --depth=1 || git clone "https://x-access-token:${GH_TOKEN}@github.com/dawnswwwww/homebrew-tap.git" homebrew-tap
+          cd homebrew-tap
+          mkdir -p Formula
+          cp ../out/legion.rb Formula/legion.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/legion.rb
+          git commit -m "legion ${VERSION}"
+          git push https://x-access-token:${GH_TOKEN}@github.com/dawnswwwww/homebrew-tap.git HEAD:main
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 7. Publish npm packages (main + 5 platform packages).
+  # ──────────────────────────────────────────────────────────────────────
+  publish-npm:
+    name: npm
+    needs: [version-check, github-release]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Stage platform binaries into npm packages
+        env:
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Map each target triple to its npm platform package directory.
+          declare -A MAP=(
+            [aarch64-apple-darwin]=npm/platform-darwin-arm64
+            [x86_64-apple-darwin]=npm/platform-darwin-x64
+            [aarch64-unknown-linux-musl]=npm/platform-linux-arm64-musl
+            [x86_64-unknown-linux-musl]=npm/platform-linux-x64-musl
+            [x86_64-pc-windows-msvc]=npm/platform-win32-x64-msvc
+          )
+          for target in "${!MAP[@]}"; do
+            pkg="${MAP[$target]}"
+            mkdir -p "$pkg/bin"
+            src_glob="dist/legion-${VERSION}-${target}.*"
+            # Pick the archive (tar.gz or zip), not the .sha256.
+            archive=$(ls ${src_glob} | grep -v sha256 | head -1)
+            # Extract the raw binaries into bin/ — no postinstall extraction
+            # needed at install time (matches the esbuild/biome approach).
+            extract_dir="/tmp/extract-${target}"
+            rm -rf "$extract_dir"
+            mkdir -p "$extract_dir"
+            case "$archive" in
+              *.tar.gz|*.tgz)
+                tar -xzf "$archive" -C "$extract_dir"
+                mv "$extract_dir"/legion-*/legion "$pkg/bin/"
+                mv "$extract_dir"/legion-*/legion-gateway "$pkg/bin/"
+                ;;
+              *.zip)
+                # Windows archive: unzip, keep .exe suffix.
+                7z x -o"$extract_dir" "$archive"
+                mv "$extract_dir"/legion-*/legion.exe "$pkg/bin/"
+                mv "$extract_dir"/legion-*/legion-gateway.exe "$pkg/bin/"
+                ;;
+            esac
+          done
+          # Stamp version into every package.json.
+          for pj in npm/*/package.json; do
+            python3 - "$pj" "$VERSION" <<'PY'
+          import json, sys
+          f, ver = sys.argv[1], sys.argv[2]
+          d = json.load(open(f))
+          d["version"] = ver
+          json.dump(d, open(f, "w"), indent=2)
+          print(f"stamped {f} -> {ver}")
+          PY
+          done
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in npm/platform-*/; do
+            echo "::group::npm publish $pkg"
+            (cd "$pkg" && npm publish --access public || echo "  (already published)")
+            echo "::endgroup::"
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          (cd npm/cli && npm publish --access public || echo "  (already published)")

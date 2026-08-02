@@ -62,7 +62,9 @@ fn test_config() -> Config {
 /// Spawn the gateway on an ephemeral loopback port; returns its base URL and
 /// the server task handle (abort it at the end of the test).
 async fn spawn_test_gateway() -> (String, tokio::task::JoinHandle<()>) {
-    let gateway = Gateway::new(test_config()).await.unwrap();
+    let mut gateway = Gateway::new(test_config()).await.unwrap();
+    // router() only carries the cron scheduler after start_automation().
+    gateway.start_automation().await.unwrap();
     let router = gateway.router();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -83,7 +85,9 @@ fn webhook_endpoint_authorizes_and_triggers_jobs() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let gateway = Gateway::new(test_config()).await.unwrap();
+            let mut gateway = Gateway::new(test_config()).await.unwrap();
+            // router() only carries the cron scheduler after start_automation().
+            gateway.start_automation().await.unwrap();
             let router = gateway.router();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -136,8 +140,8 @@ fn webhook_endpoint_authorizes_and_triggers_jobs() {
                 .unwrap();
             assert_eq!(resp.status(), 401);
 
-            // Valid signature -> 200 with a task id (the task itself fails:
-            // the test config has no real provider, but the trigger succeeds).
+            // Valid signature -> 202 Accepted with a task id. The task is
+            // enqueued for the background runner; it is not executed inline.
             let body = br#"{"ref":"main"}"#;
             let resp = client
                 .post(format!("{base}/webhook/wh-test"))
@@ -146,10 +150,14 @@ fn webhook_endpoint_authorizes_and_triggers_jobs() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 200);
+            assert_eq!(resp.status(), 202);
             let payload: serde_json::Value = resp.json().await.unwrap();
             let task_id = payload.get("task_id").and_then(|v| v.as_str());
-            assert!(task_id.is_some_and(|id| id.starts_with("task-cron-")));
+            assert!(task_id.is_some_and(|id| id.starts_with("task-")));
+            assert_eq!(
+                payload.get("status").and_then(|v| v.as_str()),
+                Some("enqueued")
+            );
 
             server.abort();
         });

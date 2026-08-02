@@ -749,6 +749,8 @@ legion cron add "0 9 * * *" --agent main --message "send daily report"
 
 ### 9.4 Hooks
 
+> **实现状态(2026-07):** 进程级生命周期 `HookRunner`(`~/.legion/hooks/*.sh`、6 事件)已**废弃删除**——其事件出口能力被独立的版本化 `/events` 事件总线取代,外部工具/GUI 通过 `AttachSession` 订阅 session 事件流(见 [`docs/design/events-bus.md`](./events-bus.md))。本节作为历史设计意图保留。
+
 - 目录：`~/.legion/hooks/` 或插件注册。
 - 事件：`agent:bootstrap`、命令事件、生命周期事件。
 

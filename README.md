@@ -134,9 +134,13 @@ cargo run -p legion-cli -- setup --non-interactive --add-provider \
 
 ### Run the Gateway
 
-The gateway is optional for local use — the TUI and `legion agent` run
-embedded (in-process) when it is not running. You only need it for chat
-channels, cron/heartbeat automation, and remote WebSocket access:
+The gateway is optional for local use. By default the TUI and `legion agent`
+**probe for a running gateway and use it when reachable**, so the session can
+be discovered and continued from other clients (other TUI windows, channel
+peers, remote WebSocket). When no gateway is reachable they fall back to an
+embedded (in-process) runtime with zero network hop — `--local` forces this
+fallback and skips the probe. You only need the gateway for chat channels,
+cron/heartbeat automation, and remote WebSocket access:
 
 ```bash
 # foreground
@@ -156,8 +160,8 @@ Default bind address: `127.0.0.1:18789`. Open the dashboard at
 cargo run -p legion-cli -- agent "hello"
 
 # force a mode
-cargo run -p legion-cli -- agent --local "hello"     # never touches the gateway
-cargo run -p legion-cli -- agent --gateway "hello"   # requires the gateway
+cargo run -p legion-cli -- agent --local "hello"     # skip the probe, stay embedded
+cargo run -p legion-cli -- agent --gateway "hello"   # require the gateway
 ```
 
 ---
@@ -166,10 +170,10 @@ cargo run -p legion-cli -- agent --gateway "hello"   # requires the gateway
 
 | Command | What it does |
 |---|---|
-| `legion [--local\|--gateway]` | Launch the interactive TUI (gateway or embedded mode) |
+| `legion [--local\|--gateway]` | Launch the interactive TUI (auto-detects gateway; `--local` forces embedded) |
 | `legion setup` | First-time setup wizard |
 | `legion gateway start [--foreground] / stop / status / logs` | Gateway lifecycle (channels, cron, remote WS) |
-| `legion agent [--local\|--gateway] "<prompt>"` | Send a single agent turn (auto-detects gateway) |
+| `legion agent [--local\|--gateway] "<prompt>"` | Send a single agent turn (auto-detects gateway; `--local` forces embedded) |
 | `legion config get <key>` / `set <key> <value>` / `validate` | Config inspection |
 | `legion channels list / status` | Channel providers |
 | `legion memory search <query>` | Memory search from CLI |
@@ -196,7 +200,7 @@ legion/
 │   ├── legion-channel        # WebChat + Telegram providers
 │   ├── legion-memory         # SQLite + sqlite-vec + FTS5 backend
 │   ├── legion-tools          # Core tool registry + sandbox backends
-│   ├── legion-automation     # Cron, heartbeat, hooks, task ledger
+│   ├── legion-automation     # Cron, heartbeat, task ledger
 │   ├── legion-acp            # Agent Connect Protocol harness + mock
 │   ├── legion-skills         # SKILL.md parsing + registry + prompt injection
 │   ├── legion-cli            # `legion` binary + TUI
@@ -230,9 +234,9 @@ The project tracks **14 capability gaps** against Claude Code + the PRD in
 
 | Status | Count | Gaps |
 |---|---|---|
-| ✅ Completed | 5 | `approval-loop`, `sandbox-isolation`, `plugin-facade`, `compaction`, `skills` (Phase A+B) |
+| ✅ Completed | 6 | `approval-loop`, `sandbox-isolation`, `plugin-facade`, `compaction`, `skills` (Phase A+B), `mcp` (incl. 2026-07-31 protocol upgrade) |
 | 🚧 In progress | 1 | `skills` (Phase C) |
-| ⬜ Not started | 9 | `mcp`, `memory-layers`, `multi-agent`, `prompt-management`, `session-resume`, `channels`, `providers`, `tools-p1p2`, `automation-advanced` |
+| ⬜ Not started | 8 | `memory-layers`, `multi-agent`, `prompt-management`, `session-resume`, `channels`, `providers`, `tools-p1p2`, `automation-advanced` |
 
 For details on any gap (current state, design, acceptance criteria) see the
 matching `docs/design/gaps/<category>/<gap>.md` file.

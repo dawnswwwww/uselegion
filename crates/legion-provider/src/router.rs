@@ -1,4 +1,5 @@
 use crate::auth::AuthProfile;
+use crate::http;
 use crate::model_ref::{parse_model_ref, resolve_model_ref};
 use crate::openai::OpenAiProvider;
 use crate::ops::{
@@ -169,6 +170,90 @@ impl ProviderRouter {
         Ok(router)
     }
 
+    /// Run one candidate's call under the provider's retry policy and
+    /// configured timeout, logging each attempt. Returns the final error
+    /// when retries are exhausted or the error is non-retryable.
+    async fn call_with_retry<T, F, Fut>(
+        &self,
+        candidate: &ResolvedModelRef,
+        model: &str,
+        success_message: &'static str,
+        mut call: F,
+    ) -> Result<T, ProviderError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ProviderError>>,
+    {
+        let policy = self.retry.get(&candidate.provider_id).cloned();
+        let max_attempts = policy.as_ref().map_or(1, |p| u32::from(p.max_attempts));
+        let timeout = self.timeouts.get(&candidate.provider_id).copied();
+
+        let mut attempt = 1u32;
+        loop {
+            let started = Instant::now();
+            let result = match timeout {
+                Some(limit) => match tokio::time::timeout(limit, call()).await {
+                    Ok(result) => result,
+                    Err(_) => Err(ProviderError::Timeout(format!(
+                        "provider '{}' exceeded timeout of {}ms",
+                        candidate.provider_id,
+                        limit.as_millis()
+                    ))),
+                },
+                None => call().await,
+            };
+            let latency_ms = started.elapsed().as_millis() as u64;
+
+            match result {
+                Ok(value) => {
+                    tracing::info!(
+                        provider = %candidate.provider_id,
+                        model = %model,
+                        attempt,
+                        latency_ms,
+                        "{}",
+                        success_message
+                    );
+                    return Ok(value);
+                }
+                Err(err) => {
+                    if attempt < max_attempts && is_retryable(&err) {
+                        let delay = policy
+                            .as_ref()
+                            .map_or(Duration::ZERO, |p| p.backoff_delay(attempt));
+                        tracing::warn!(
+                            provider = %candidate.provider_id,
+                            model = %model,
+                            attempt,
+                            latency_ms,
+                            backoff_ms = delay.as_millis() as u64,
+                            error = %err,
+                            "retryable provider error, retrying"
+                        );
+                        attempt += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    let reason = if is_retryable(&err) {
+                        "retry exhausted, falling back"
+                    } else {
+                        "non-retryable, falling back"
+                    };
+                    tracing::warn!(
+                        provider = %candidate.provider_id,
+                        model = %model,
+                        attempt,
+                        latency_ms,
+                        error = %err,
+                        reason,
+                        "provider failed"
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Start a streaming chat completion, routing through aliases and fallbacks.
     pub async fn chat(
         &self,
@@ -207,80 +292,26 @@ impl ProviderRouter {
                 continue;
             }
 
-            let policy = self.retry.get(&candidate.provider_id).cloned();
-            let max_attempts = policy.as_ref().map_or(1, |p| u32::from(p.max_attempts));
-            let timeout = self.timeouts.get(&candidate.provider_id).copied();
-
-            let mut attempt = 1u32;
-            loop {
-                let started = Instant::now();
-                let result = match timeout {
-                    Some(limit) => {
-                        match tokio::time::timeout(limit, provider.chat(req.clone())).await {
-                            Ok(result) => result,
-                            Err(_) => Err(ProviderError::Timeout(format!(
-                                "provider '{}' exceeded timeout of {}ms",
-                                candidate.provider_id,
-                                limit.as_millis()
-                            ))),
-                        }
-                    }
-                    None => provider.chat(req.clone()).await,
-                };
-                let latency_ms = started.elapsed().as_millis() as u64;
-
-                match result {
-                    Ok(stream) => {
-                        tracing::info!(
-                            provider = %candidate.provider_id,
-                            model = %req.model,
-                            attempt,
-                            latency_ms,
-                            "provider chat started"
-                        );
-                        return Ok(track_chat_cost(
-                            stream,
-                            self.cost.clone(),
-                            model_key,
-                            input_tokens,
-                        ));
-                    }
-                    Err(err) => {
-                        if attempt < max_attempts && is_retryable(&err) {
-                            let delay = policy
-                                .as_ref()
-                                .map_or(Duration::ZERO, |p| p.backoff_delay(attempt));
-                            tracing::warn!(
-                                provider = %candidate.provider_id,
-                                model = %req.model,
-                                attempt,
-                                latency_ms,
-                                backoff_ms = delay.as_millis() as u64,
-                                error = %err,
-                                "retryable provider error, retrying"
-                            );
-                            attempt += 1;
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        let reason = if is_retryable(&err) {
-                            "retry exhausted, falling back"
-                        } else {
-                            "non-retryable, falling back"
-                        };
-                        tracing::warn!(
-                            provider = %candidate.provider_id,
-                            model = %req.model,
-                            attempt,
-                            latency_ms,
-                            error = %err,
-                            reason,
-                            "provider failed"
-                        );
-                        last_error = Some(err);
-                        break;
-                    }
+            match self
+                .call_with_retry(&candidate, &req.model, "provider chat started", || {
+                    provider.chat(req.clone())
+                })
+                .await
+            {
+                Ok(stream) => {
+                    // The per-request timeout in `call_with_retry` only covers
+                    // stream establishment, so apply the same budget as a
+                    // per-chunk idle timeout to bound mid-stream stalls.
+                    let timeout = self.timeouts.get(&candidate.provider_id).copied();
+                    let stream = http::with_idle_timeout(stream, timeout, &candidate.provider_id);
+                    return Ok(track_chat_cost(
+                        stream,
+                        self.cost.clone(),
+                        model_key,
+                        input_tokens,
+                    ));
                 }
+                Err(err) => last_error = Some(err),
             }
         }
 
@@ -325,75 +356,74 @@ impl ProviderRouter {
                 continue;
             }
 
-            let policy = self.retry.get(&candidate.provider_id).cloned();
-            let max_attempts = policy.as_ref().map_or(1, |p| u32::from(p.max_attempts));
-            let timeout = self.timeouts.get(&candidate.provider_id).copied();
+            match self
+                .call_with_retry(&candidate, &req.model, "provider embed completed", || {
+                    provider.embed(req.clone())
+                })
+                .await
+            {
+                Ok(embeddings) => {
+                    self.cost.record(&model_key, input_tokens, 0, true);
+                    return Ok(embeddings);
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
 
-            let mut attempt = 1u32;
-            loop {
-                let started = Instant::now();
-                let result = match timeout {
-                    Some(limit) => {
-                        match tokio::time::timeout(limit, provider.embed(req.clone())).await {
-                            Ok(result) => result,
-                            Err(_) => Err(ProviderError::Timeout(format!(
-                                "provider '{}' exceeded timeout of {}ms",
-                                candidate.provider_id,
-                                limit.as_millis()
-                            ))),
-                        }
-                    }
-                    None => provider.embed(req.clone()).await,
-                };
-                let latency_ms = started.elapsed().as_millis() as u64;
+        Err(last_error.unwrap_or(ProviderError::AllProvidersFailed))
+    }
 
-                match result {
-                    Ok(embeddings) => {
-                        tracing::info!(
-                            provider = %candidate.provider_id,
-                            model = %req.model,
-                            attempt,
-                            latency_ms,
-                            "provider embed completed"
-                        );
-                        self.cost.record(&model_key, input_tokens, 0, true);
-                        return Ok(embeddings);
-                    }
-                    Err(err) => {
-                        if attempt < max_attempts && is_retryable(&err) {
-                            let delay = policy
-                                .as_ref()
-                                .map_or(Duration::ZERO, |p| p.backoff_delay(attempt));
-                            tracing::warn!(
-                                provider = %candidate.provider_id,
-                                model = %req.model,
-                                attempt,
-                                latency_ms,
-                                backoff_ms = delay.as_millis() as u64,
-                                error = %err,
-                                "retryable provider error, retrying"
-                            );
-                            attempt += 1;
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        let reason = if is_retryable(&err) {
-                            "retry exhausted, falling back"
-                        } else {
-                            "non-retryable, falling back"
-                        };
-                        tracing::warn!(
-                            provider = %candidate.provider_id,
-                            model = %req.model,
-                            attempt,
-                            latency_ms,
-                            error = %err,
-                            reason,
-                            "provider failed"
-                        );
-                        last_error = Some(err);
-                        break;
-                    }
+    /// Plain fallback loop for one-shot, non-streaming provider calls
+    /// (image, speech, video): unlike `chat`/`embed` there is no retry,
+    /// rate-limit, or cost accounting — the first success wins, otherwise
+    /// the last provider's error surfaces.
+    async fn one_shot<Req, Resp, F, Fut>(
+        &self,
+        model_ref: &str,
+        mut req: Req,
+        op: &'static str,
+        describe: fn(&Resp) -> String,
+        mut call: F,
+    ) -> Result<Resp, ProviderError>
+    where
+        Req: OneShotRequest,
+        F: FnMut(Arc<dyn Provider>, Req) -> Fut,
+        Fut: std::future::Future<Output = Result<Resp, ProviderError>>,
+    {
+        let chain = self.resolve_chain(model_ref)?;
+        if chain.is_empty() {
+            return Err(ProviderError::AllProvidersFailed);
+        }
+
+        let mut last_error: Option<ProviderError> = None;
+        for candidate in chain {
+            let provider = self
+                .providers
+                .get(&candidate.provider_id)
+                .cloned()
+                .ok_or_else(|| ProviderError::ProviderNotFound(candidate.provider_id.clone()))?;
+
+            req.set_model(candidate.model_name.clone());
+            match call(provider, req.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        provider = %candidate.provider_id,
+                        model = %req.model(),
+                        detail = %describe(&response),
+                        "{}",
+                        format!("provider {op} completed")
+                    );
+                    return Ok(response);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %candidate.provider_id,
+                        model = %req.model(),
+                        error = %err,
+                        "{}",
+                        format!("{op} failed, trying next fallback")
+                    );
+                    last_error = Some(err);
                 }
             }
         }
@@ -402,149 +432,51 @@ impl ProviderRouter {
     }
 
     /// Generate images through the routed provider.
-    ///
-    /// Unlike `chat`/`embed`, image generation uses a plain fallback loop
-    /// without the retry / rate-limit / cost-tracking ops wrappers: image
-    /// endpoints are one-shot non-streaming calls with no token accounting.
     pub async fn generate_image(
         &self,
         model_ref: &str,
-        mut req: ImageRequest,
+        req: ImageRequest,
     ) -> Result<ImageResponse, ProviderError> {
-        let chain = self.resolve_chain(model_ref)?;
-        if chain.is_empty() {
-            return Err(ProviderError::AllProvidersFailed);
-        }
-
-        let mut last_error: Option<ProviderError> = None;
-        for candidate in chain {
-            let provider = self
-                .providers
-                .get(&candidate.provider_id)
-                .cloned()
-                .ok_or_else(|| ProviderError::ProviderNotFound(candidate.provider_id.clone()))?;
-
-            req.model = candidate.model_name.clone();
-            match provider.generate_image(req.clone()).await {
-                Ok(response) => {
-                    tracing::info!(
-                        provider = %candidate.provider_id,
-                        model = %req.model,
-                        images = response.images.len(),
-                        "provider image generation completed"
-                    );
-                    return Ok(response);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        provider = %candidate.provider_id,
-                        model = %req.model,
-                        error = %err,
-                        "image generation failed, trying next fallback"
-                    );
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or(ProviderError::AllProvidersFailed))
+        self.one_shot(
+            model_ref,
+            req,
+            "image generation",
+            |r: &ImageResponse| format!("images={}", r.images.len()),
+            |provider, req| async move { provider.generate_image(req).await },
+        )
+        .await
     }
 
     /// Synthesize speech through the routed provider.
-    ///
-    /// Like `generate_image`, speech synthesis uses a plain fallback loop
-    /// without the retry / rate-limit / cost-tracking ops wrappers: speech
-    /// endpoints are one-shot non-streaming calls with no token accounting.
     pub async fn synthesize_speech(
         &self,
         model_ref: &str,
-        mut req: SpeechRequest,
+        req: SpeechRequest,
     ) -> Result<SpeechResponse, ProviderError> {
-        let chain = self.resolve_chain(model_ref)?;
-        if chain.is_empty() {
-            return Err(ProviderError::AllProvidersFailed);
-        }
-
-        let mut last_error: Option<ProviderError> = None;
-        for candidate in chain {
-            let provider = self
-                .providers
-                .get(&candidate.provider_id)
-                .cloned()
-                .ok_or_else(|| ProviderError::ProviderNotFound(candidate.provider_id.clone()))?;
-
-            req.model = candidate.model_name.clone();
-            match provider.synthesize_speech(req.clone()).await {
-                Ok(response) => {
-                    tracing::info!(
-                        provider = %candidate.provider_id,
-                        model = %req.model,
-                        audio_bytes = response.audio.len(),
-                        "provider speech synthesis completed"
-                    );
-                    return Ok(response);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        provider = %candidate.provider_id,
-                        model = %req.model,
-                        error = %err,
-                        "speech synthesis failed, trying next fallback"
-                    );
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or(ProviderError::AllProvidersFailed))
+        self.one_shot(
+            model_ref,
+            req,
+            "speech synthesis",
+            |r: &SpeechResponse| format!("audio_bytes={}", r.audio.len()),
+            |provider, req| async move { provider.synthesize_speech(req).await },
+        )
+        .await
     }
 
     /// Generate videos through the routed provider.
-    ///
-    /// Like `generate_image`, video generation uses a plain fallback loop
-    /// without retry / rate-limit / cost-tracking wrappers.
     pub async fn generate_video(
         &self,
         model_ref: &str,
-        mut req: VideoRequest,
+        req: VideoRequest,
     ) -> Result<VideoResponse, ProviderError> {
-        let chain = self.resolve_chain(model_ref)?;
-        if chain.is_empty() {
-            return Err(ProviderError::AllProvidersFailed);
-        }
-
-        let mut last_error: Option<ProviderError> = None;
-        for candidate in chain {
-            let provider = self
-                .providers
-                .get(&candidate.provider_id)
-                .cloned()
-                .ok_or_else(|| ProviderError::ProviderNotFound(candidate.provider_id.clone()))?;
-
-            req.model = candidate.model_name.clone();
-            match provider.generate_video(req.clone()).await {
-                Ok(response) => {
-                    tracing::info!(
-                        provider = %candidate.provider_id,
-                        model = %req.model,
-                        videos = response.videos.len(),
-                        "provider video generation completed"
-                    );
-                    return Ok(response);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        provider = %candidate.provider_id,
-                        model = %req.model,
-                        error = %err,
-                        "video generation failed, trying next fallback"
-                    );
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or(ProviderError::AllProvidersFailed))
+        self.one_shot(
+            model_ref,
+            req,
+            "video generation",
+            |r: &VideoResponse| format!("videos={}", r.videos.len()),
+            |provider, req| async move { provider.generate_video(req).await },
+        )
+        .await
     }
 
     /// Resolve a model reference into an ordered list of provider/model candidates.
@@ -563,6 +495,52 @@ impl ProviderRouter {
         }
 
         Ok(chain)
+    }
+
+    /// Validate a model reference without starting a chat: it must resolve
+    /// through aliases into a `provider/model` form whose provider is
+    /// registered. Used to fail fast before launching work that would error
+    /// on its first chat call anyway (e.g. sub-agent model overrides).
+    pub fn validate_model_ref(&self, model_ref: &str) -> Result<(), ProviderError> {
+        let primary = resolve_model_ref(model_ref, &self.aliases)?;
+        if self.providers.contains_key(&primary.provider_id) {
+            Ok(())
+        } else {
+            Err(ProviderError::ProviderNotFound(primary.provider_id))
+        }
+    }
+}
+
+/// Request kinds routed through [`ProviderRouter::one_shot`].
+trait OneShotRequest: Clone {
+    fn set_model(&mut self, model: String);
+    fn model(&self) -> &str;
+}
+
+impl OneShotRequest for ImageRequest {
+    fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl OneShotRequest for SpeechRequest {
+    fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl OneShotRequest for VideoRequest {
+    fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+    fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -845,6 +823,33 @@ mod tests {
         let mut stream = router.chat("claude", req).await.unwrap();
         let chunk = first_chunk(&mut stream).await;
         assert_eq!(chunk.delta, "from-anthropic");
+    }
+
+    #[test]
+    fn validate_model_ref_checks_alias_and_provider() {
+        let mut router = ProviderRouter::new();
+        router.register_provider(Arc::new(OkProvider {
+            id: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+        }));
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "claude".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
+        );
+        router.set_aliases(aliases);
+
+        // Explicit provider/model refs and aliases both validate.
+        assert!(
+            router
+                .validate_model_ref("anthropic/claude-sonnet-4-6")
+                .is_ok()
+        );
+        assert!(router.validate_model_ref("claude").is_ok());
+        // Unknown aliases, unregistered providers, and empty refs are rejected.
+        assert!(router.validate_model_ref("default").is_err());
+        assert!(router.validate_model_ref("ghost/model").is_err());
+        assert!(router.validate_model_ref("").is_err());
     }
 
     #[tokio::test]

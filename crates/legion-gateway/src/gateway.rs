@@ -1,4 +1,6 @@
 use crate::error::GatewayError;
+use crate::events::EventBus;
+use crate::events::events_handler;
 use crate::http::{canvas_placeholder, dashboard, webhook_handler};
 use crate::market::PluginMarket;
 use crate::nodes::NodeManager;
@@ -9,7 +11,6 @@ use axum::routing::{get, post};
 use axum::{Extension, Router as AxumRouter};
 use legion_automation::cron::{self, CronJobStore, CronScheduler};
 use legion_automation::heartbeat::{Heartbeat, HeartbeatConfig};
-use legion_automation::hooks::HookRunner;
 use legion_automation::task_runner::TaskRunner;
 use legion_automation::tasks::JsonlTaskStore;
 use legion_channel::{TelegramProvider, WebChatProvider};
@@ -18,6 +19,7 @@ use legion_host::{AgentHost, MetricsRegistry, SessionStore, routing::Router};
 use legion_mcp::McpManager;
 use legion_plugin_sdk::PluginRegistry;
 use legion_plugin_sdk::channel::{ChannelProvider, InboundMessage};
+use legion_provider::model_ref::resolve_agent_model;
 use legion_runtime::{AgentRuntime, ApprovalQueueRegistry, Harness};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -45,6 +47,9 @@ pub struct Gateway {
     cron_scheduler: Option<Arc<CronScheduler>>,
     task_store: Option<legion_automation::tasks::SharedTaskStore>,
     task_runner: Option<Arc<TaskRunner>>,
+    /// Shared cron job store handed to the automation subsystem when it is
+    /// started after a successful bind.
+    cron_store: Arc<dyn CronJobStore>,
     node_manager: Arc<NodeManager>,
     metrics_registry: MetricsRegistry,
     plugin_market: PluginMarket,
@@ -91,20 +96,18 @@ impl Gateway {
         let approval_registry = Arc::new(ApprovalQueueRegistry::new());
         let router_approval_registry = approval_registry.clone();
         let inbound_router = Arc::new(host.router.clone());
+        let router_session_store = session_store.clone();
         let bot_guard = Arc::new(legion_channel::access::BotLoopGuard::new(
             std::time::Duration::from_secs(60),
             5,
         ));
         let inbound_router_handle = tokio::spawn(async move {
             while let Some(msg) = inbound_rx.recv().await {
-                let resolve = {
-                    let inbound_router = inbound_router.clone();
-                    move |msg: &InboundMessage| inbound_router.resolve_agent(msg)
-                };
-                legion_channel::route_inbound_to_runtime(
+                legion_host::channel_inbound::route_inbound_to_runtime(
                     router_runtime.clone(),
                     router_config.clone(),
-                    Arc::new(resolve),
+                    inbound_router.clone(),
+                    router_session_store.clone(),
                     router_registry.clone(),
                     Some(router_approval_registry.clone()),
                     Some(bot_guard.clone()),
@@ -150,10 +153,11 @@ impl Gateway {
             matrix.start(matrix_config.clone(), inbound_tx).await?;
         }
 
-        // Start automation subsystem: cron scheduler, heartbeat, hooks, and task runner.
-        let (automation_handles, cron_scheduler, task_store, task_runner) =
-            start_automation(&config, runtime.clone(), cron_store).await?;
-
+        // Automation (cron scheduler, heartbeat, hooks, task runner) is NOT
+        // started here: a process that fails to bind must never run scheduled
+        // jobs. It starts after a successful bind in start()/start_bound(), or
+        // explicitly via start_automation() from tests that serve router()
+        // directly.
         let node_manager = Arc::new(NodeManager::new());
         let plugin_market = PluginMarket::new().with_system_plugins();
 
@@ -163,7 +167,7 @@ impl Gateway {
             runtime,
             pairing_store: PairingStore::new(),
             shutdown_tx: None,
-            gateway_id: format!("gw-{}", uuid_like()),
+            gateway_id: format!("gw-{}", legion_core::util::next_id()),
             webchat,
             _telegram: telegram,
             _slack: slack,
@@ -171,10 +175,11 @@ impl Gateway {
             _lark: lark,
             _matrix: matrix,
             _inbound_router_handle: Some(inbound_router_handle),
-            _automation_handles: automation_handles,
-            cron_scheduler,
-            task_store,
-            task_runner,
+            _automation_handles: Vec::new(),
+            cron_scheduler: None,
+            task_store: None,
+            task_runner: None,
+            cron_store,
             node_manager,
             metrics_registry,
             plugin_market,
@@ -198,19 +203,6 @@ impl Gateway {
         self
     }
 
-    /// Replace the runtime harness with a caller-provided harness (useful for tests).
-    pub fn with_harness(mut self, harness: Arc<dyn Harness>) -> Self {
-        self.runtime = harness.clone();
-        self.task_runner = self.task_runner.take().map(|tr| {
-            Arc::new(TaskRunner::new(
-                tr.task_store.clone(),
-                harness.clone(),
-                tr.config.clone(),
-            ))
-        });
-        self
-    }
-
     /// Replace the session store with a caller-provided one (useful for tests).
     pub fn with_session_store(mut self, store: Arc<SessionStore>) -> Self {
         self.session_store = store;
@@ -227,10 +219,30 @@ impl Gateway {
         self.approval_registry.clone()
     }
 
+    /// Start the automation subsystem (cron scheduler, heartbeat, hooks, task
+    /// runner). Must only run after the listener has been bound: a duplicate
+    /// gateway process that fails to bind would otherwise keep executing
+    /// scheduled jobs and leave orphaned task records behind. Idempotent.
+    pub async fn start_automation(&mut self) -> Result<(), GatewayError> {
+        if self.cron_scheduler.is_some() {
+            return Ok(());
+        }
+        let (handles, scheduler, task_store, task_runner) =
+            start_automation(&self.config, self.runtime.clone(), self.cron_store.clone()).await?;
+        self._automation_handles = handles;
+        self.cron_scheduler = scheduler;
+        self.task_store = task_store;
+        self.task_runner = task_runner;
+        Ok(())
+    }
+
     /// Start the WS/HTTP server. This method consumes `self` and blocks until shutdown.
     pub async fn start(mut self) -> Result<(), GatewayError> {
         self.archive_expired_sessions().await;
         let listener = self.bind_listener().await?;
+        // Only start scheduled work once the port is ours; otherwise every
+        // failed duplicate-start attempt would also run cron jobs.
+        self.start_automation().await?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
         self.run_server(listener, shutdown_rx).await
@@ -243,7 +255,7 @@ impl Gateway {
     /// The caller can signal graceful shutdown by sending on the returned
     /// oneshot channel.
     pub async fn start_bound(
-        self,
+        mut self,
     ) -> Result<
         (
             SocketAddr,
@@ -254,6 +266,9 @@ impl Gateway {
     > {
         self.archive_expired_sessions().await;
         let listener = self.bind_listener().await?;
+        // Only start scheduled work once the port is ours; otherwise every
+        // failed duplicate-start attempt would also run cron jobs.
+        self.start_automation().await?;
         let bound_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -313,6 +328,15 @@ impl Gateway {
             }
         };
 
+        // Stop background automation and inbound routing so a shutting-down
+        // gateway does not keep running cron jobs or processing channel messages.
+        for handle in self._automation_handles {
+            handle.abort();
+        }
+        if let Some(handle) = self._inbound_router_handle {
+            handle.abort();
+        }
+
         if let Err(err) = self.webchat.stop().await {
             tracing::warn!(error = %err, "failed to stop webchat channel");
         }
@@ -343,14 +367,6 @@ impl Gateway {
         }
         self.mcp_manager.shutdown_all().await;
 
-        // Trigger gateway lifecycle hooks on shutdown.
-        let runner = HookRunner::default_dir();
-        runner
-            .run(&legion_automation::hooks::HookContext::new(
-                legion_automation::hooks::HookEvent::GatewayStop,
-            ))
-            .await;
-
         result
     }
 
@@ -373,6 +389,7 @@ impl Gateway {
             session_store: self.session_store.clone(),
             approval_registry: self.approval_registry.clone(),
             question_registry: self.question_registry.clone(),
+            event_bus: EventBus::new(),
         });
 
         let mut router = AxumRouter::new()
@@ -384,7 +401,8 @@ impl Gateway {
             )
             .route("/__legion__/canvas/", get(canvas_placeholder))
             .route("/webhook/{id}", post(webhook_handler))
-            .route("/ws", get(websocket_handler));
+            .route("/ws", get(websocket_handler))
+            .route("/events", get(events_handler));
 
         if self.config.observability.enabled && self.config.observability.metrics_enabled {
             router = router.route(
@@ -403,27 +421,6 @@ impl Gateway {
         }
         Ok(())
     }
-}
-
-fn resolve_model(config: &Config, agent_id: &str) -> String {
-    if agent_id == "main" {
-        config.agents.defaults.model.clone()
-    } else {
-        config
-            .agents
-            .list
-            .iter()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.model.clone())
-            .or_else(|| config.agents.defaults.model.clone())
-    }
-    .unwrap_or_else(|| "openai/gpt-4o".to_string())
-}
-
-fn uuid_like() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!("{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 async fn start_automation(
@@ -470,7 +467,7 @@ async fn start_automation(
 
     if config.heartbeat.enabled {
         let workspace = legion_runtime::resolve_workspace(config, "main", None);
-        let model_ref = resolve_model(config, "main");
+        let model_ref = resolve_agent_model(config, "main");
         let heartbeat = Arc::new(Heartbeat::new(
             HeartbeatConfig {
                 agent_id: "main".to_string(),
@@ -482,14 +479,6 @@ async fn start_automation(
         ));
         handles.push(tokio::spawn(heartbeat.run()));
     }
-
-    // Trigger gateway lifecycle hooks on startup.
-    let runner = HookRunner::default_dir();
-    runner
-        .run(&legion_automation::hooks::HookContext::new(
-            legion_automation::hooks::HookEvent::GatewayStart,
-        ))
-        .await;
 
     Ok((
         handles,

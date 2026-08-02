@@ -88,14 +88,15 @@ fn escape_sequence_len(s: &str) -> usize {
     }
 }
 
-pub(crate) fn input_visual_lines(text: &str, width: usize) -> Vec<String> {
+/// Soft-wrap a single logical line (no `\n`) to `width` terminal columns.
+pub(crate) fn wrap_display_line(line: &str, width: usize) -> Vec<String> {
     if width == 0 {
-        return vec![text.to_string()];
+        return vec![line.to_string()];
     }
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_width = 0;
-    for c in text.chars() {
+    for c in line.chars() {
         let w = char_width(c);
         if current_width + w > width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
@@ -145,16 +146,11 @@ pub(crate) fn expand_paste_placeholders(
     result
 }
 
-/// Record `text` in the session input history and clear the input box,
-/// resetting all transient input state. `paste_store` is deliberately kept:
-/// history entries contain paste placeholders, and recalling one with ↑
-/// must still expand to the original pasted text. Placeholder ids are
-/// unique per session, so retention cannot cross-expand.
+/// Record `text` in the input history and clear the input box, resetting all
+/// transient input state. `text` is already paste-expanded by the callers
+/// (see `events.rs`), so what lands in history is the durable, expanded text.
 pub(crate) fn commit_and_clear_input(state: &mut AppState, text: &str) {
-    let trimmed = text.trim();
-    if !trimmed.is_empty() {
-        state.input_history.push(trimmed.to_string());
-    }
+    state.input_history.record(text);
     state.history_index = None;
     state.draft_input = None;
     state.composer.clear();
@@ -166,20 +162,22 @@ pub(crate) fn commit_and_clear_input(state: &mut AppState, text: &str) {
 /// The current draft is saved on first ↑ and restored by ↓ past the newest
 /// history entry. The cursor is placed at the end of the recalled text.
 pub(crate) fn navigate_input_history(state: &mut AppState, up: bool) {
-    if state.input_history.is_empty() {
+    let history = state.input_history.entries();
+    if history.is_empty() {
         return;
     }
+    let len = history.len();
     if up {
         if state.history_index.is_none() {
             state.draft_input = Some(state.composer.join());
-            state.history_index = Some(state.input_history.len() - 1);
+            state.history_index = Some(len - 1);
         } else if let Some(idx) = state.history_index {
             if idx > 0 {
                 state.history_index = Some(idx - 1);
             }
         }
     } else if let Some(idx) = state.history_index {
-        if idx + 1 < state.input_history.len() {
+        if idx + 1 < len {
             state.history_index = Some(idx + 1);
         } else {
             if let Some(draft) = state.draft_input.take() {
@@ -193,7 +191,8 @@ pub(crate) fn navigate_input_history(state: &mut AppState, up: bool) {
         }
     }
     if let Some(idx) = state.history_index {
-        state.composer.set_text(&state.input_history[idx]);
+        let text = history[idx].clone();
+        state.composer.set_text(&text);
         state.slash_selected = 0;
     }
 }

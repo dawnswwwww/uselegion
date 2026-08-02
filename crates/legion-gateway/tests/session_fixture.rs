@@ -138,6 +138,7 @@ async fn session_fixture_records_user_assistant_turn() {
         dump_prompts: false,
         yolo: false,
         workspace: None,
+        sender: None,
     };
 
     let (stream, accepted, resolved_key) = host.prepare_run(params, None, None).await.unwrap();
@@ -156,7 +157,8 @@ async fn session_fixture_records_user_assistant_turn() {
             }
         },
     )
-    .await;
+    .await
+    .unwrap();
 
     // Event frame shape assertions.
     assert!(

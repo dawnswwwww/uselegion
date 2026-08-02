@@ -7,6 +7,7 @@
 use crate::tasks::{SharedTaskStore, Task, TaskKind, TaskStatus, TaskStoreError};
 use chrono::Utc;
 use futures::StreamExt;
+use legion_provider::model_ref::resolve_agent_model;
 use legion_runtime::{Harness, RunRequest};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -158,7 +159,7 @@ impl TaskRunner {
         task.mark_running();
         self.task_store.update(task.clone()).await?;
 
-        let model_ref = resolve_model(&self.config, &task.agent_id);
+        let model_ref = resolve_agent_model(&self.config, &task.agent_id);
         let session_id = task
             .session_id
             .clone()
@@ -203,27 +204,13 @@ impl TaskRunner {
     }
 }
 
-fn resolve_model(config: &legion_core::config::Config, agent_id: &str) -> String {
-    if agent_id == "main" {
-        config.agents.defaults.model.clone()
-    } else {
-        config
-            .agents
-            .list
-            .iter()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.model.clone())
-            .or_else(|| config.agents.defaults.model.clone())
-    }
-    .unwrap_or_else(|| "openai/gpt-4o".to_string())
-}
-
 fn session_key_for_task(task: &Task) -> String {
-    format!(
-        "agent:{}:task:{}:default:direct:{}",
-        task.agent_id,
+    legion_plugin_sdk::session_key::direct_session_key(
+        &task.agent_id,
+        "task",
         task.kind.as_ref(),
-        task.id
+        "default",
+        &task.id,
     )
 }
 

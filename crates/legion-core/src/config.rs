@@ -1,6 +1,6 @@
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use thiserror::Error;
 
@@ -1006,6 +1006,12 @@ pub struct CompactionConfig {
     /// Model context window in tokens.
     #[serde(default = "default_context_window")]
     pub context_window: usize,
+    /// Per-model context-window overrides keyed by `provider/model` (e.g.
+    /// `"minimax/MiniMax-M3": 1000000`). A model name may also carry an inline
+    /// suffix (`minimax/MiniMax-M3[1m]`) which takes precedence over this table.
+    /// Entries that match no active model are ignored.
+    #[serde(default)]
+    pub context_windows: BTreeMap<String, usize>,
     /// Fraction of the context window that triggers compaction.
     #[serde(default = "default_compaction_threshold_ratio")]
     pub threshold_ratio: f32,
@@ -1059,6 +1065,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             context_window: default_context_window(),
+            context_windows: BTreeMap::new(),
             threshold_ratio: default_compaction_threshold_ratio(),
             min_messages_to_keep: default_min_messages_to_keep(),
             max_summary_tokens: default_max_summary_tokens(),
@@ -1374,6 +1381,10 @@ fn default_connect_timeout_ms() -> u64 {
     15_000
 }
 
+fn default_tool_timeout_ms() -> u64 {
+    60_000
+}
+
 /// Transport used to reach an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "type")]
@@ -1430,6 +1441,14 @@ pub struct McpServerConfig {
     /// Timeout used when connecting / listing tools. Falls back to 15s.
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// Pin a specific MCP protocol version (e.g. `"2025-06-18"`), skipping
+    /// the negotiation fallback chain. When unset, the client negotiates the
+    /// newest version the server accepts.
+    #[serde(default)]
+    pub protocol_version: Option<String>,
+    /// Per-request timeout for `tools/call`. Falls back to 60s.
+    #[serde(default = "default_tool_timeout_ms")]
+    pub tool_timeout_ms: u64,
 }
 
 /// Configuration for the MCP subsystem.
@@ -2558,6 +2577,9 @@ mod tests {
         assert!(server.enabled);
         assert_eq!(server.auto_approve, vec!["read_file"]);
         assert_eq!(server.connect_timeout_ms, 15_000);
+        // Fields added later default cleanly for old configs.
+        assert_eq!(server.protocol_version, None);
+        assert_eq!(server.tool_timeout_ms, 60_000);
         match &server.transport {
             McpTransport::Stdio { command, args, env } => {
                 assert_eq!(command, "npx");
@@ -2592,6 +2614,35 @@ mod tests {
             }
             other => panic!("expected http, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn mcp_config_parses_protocol_version_pin_and_tool_timeout() {
+        let json = r#"{
+            "gateway": { "auth": { "token": "x" } },
+            "mcp": {
+                "servers": [
+                    {
+                        "name": "github",
+                        "type": "http",
+                        "url": "https://mcp.example.com/rpc",
+                        "protocolVersion": "2025-06-18",
+                        "toolTimeoutMs": 5000
+                    }
+                ]
+            }
+        }"#;
+        let cfg = Config::from_json(json).unwrap();
+        let server = &cfg.mcp.servers[0];
+        assert_eq!(server.protocol_version.as_deref(), Some("2025-06-18"));
+        assert_eq!(server.tool_timeout_ms, 5_000);
+
+        // The fields round-trip through serialization.
+        let serialized = serde_json::to_value(server).unwrap();
+        assert_eq!(serialized["protocolVersion"], "2025-06-18");
+        assert_eq!(serialized["toolTimeoutMs"], 5_000);
+        let reparsed: McpServerConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(&reparsed, server);
     }
 
     #[test]

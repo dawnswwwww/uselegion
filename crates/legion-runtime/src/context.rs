@@ -388,13 +388,6 @@ impl SessionContext {
         }
     }
 
-    /// Register a file path as having been viewed by the agent.
-    pub fn mark_viewed_file(&self, path: PathBuf) {
-        if let Ok(mut guard) = self.viewed_files.lock() {
-            guard.insert(path);
-        }
-    }
-
     /// Return a clone of the viewed-files sink for tools to report reads.
     pub fn viewed_files_sink(&self) -> Option<Arc<std::sync::Mutex<HashSet<PathBuf>>>> {
         Some(self.viewed_files.clone())

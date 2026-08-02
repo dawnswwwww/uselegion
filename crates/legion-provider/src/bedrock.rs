@@ -1,15 +1,16 @@
 use crate::auth::AuthProfile;
 use crate::eventstream::EventStreamDecoder;
+use crate::http;
 use crate::provider::Provider;
 use crate::sigv4::{AwsCreds, sign_request};
 use crate::types::{
-    ChatChunk, ChatRequest, ChatRole, ChatStream, EmbedRequest, Embedding, FinishReason,
-    FunctionCall, ModelInfo, ProviderError, ToolCall,
+    ChatChunk, ChatRequest, ChatRole, ChatStream, EmbedRequest, Embedding, FinishReason, ModelInfo,
+    PartialToolCall, ProviderError, ToolCallAccumulator, merged_system_text, parse_tool_arguments,
+    tool_run_end,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::time::SystemTime;
 
 /// AWS service name used for SigV4 signing.
@@ -147,14 +148,7 @@ impl Provider for BedrockProvider {
             .signed_post(&url, &body, "application/vnd.aws.eventstream")?
             .send()
             .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
+        let response = http::check_status(response, false).await?;
 
         // The response is an AWS event-stream: buffer bytes, decode frames,
         // and map each frame's JSON payload to a ChatChunk. Frames that carry
@@ -237,13 +231,7 @@ impl Provider for BedrockProvider {
                 .signed_post(&url, &body, "application/json")?
                 .send()
                 .await?;
-            let status = response.status();
-            if !status.is_success() {
-                let text = response.text().await.unwrap_or_default();
-                return Err(ProviderError::StreamAborted(format!(
-                    "HTTP {status}: {text}"
-                )));
-            }
+            let response = http::check_status(response, false).await?;
             let payload: TitanEmbedResponse = response.json().await?;
             embeddings.push(Embedding {
                 index,
@@ -262,13 +250,7 @@ impl Provider for BedrockProvider {
 /// `toolResult` blocks grouped into one `user` message per consecutive run.
 /// This is a pure function so the mapping can be unit-tested without any I/O.
 fn to_converse_request(req: &ChatRequest) -> serde_json::Value {
-    let system_text = req
-        .messages
-        .iter()
-        .filter(|m| m.role == ChatRole::System)
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let system_text = merged_system_text(&req.messages);
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut i = 0;
@@ -292,9 +274,7 @@ fn to_converse_request(req: &ChatRequest) -> serde_json::Value {
                 }
                 if let Some(calls) = &m.tool_calls {
                     for call in calls {
-                        let input: serde_json::Value =
-                            serde_json::from_str(&call.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}));
+                        let input = parse_tool_arguments(&call.function.arguments);
                         blocks.push(serde_json::json!({
                             "toolUse": {
                                 "toolUseId": call.id,
@@ -312,8 +292,9 @@ fn to_converse_request(req: &ChatRequest) -> serde_json::Value {
             }
             ChatRole::Tool => {
                 // Consecutive tool results must be merged into one user message.
+                let end = tool_run_end(&req.messages, i);
                 let mut blocks = Vec::new();
-                while i < req.messages.len() && req.messages[i].role == ChatRole::Tool {
+                while i < end {
                     let tool = &req.messages[i];
                     blocks.push(serde_json::json!({
                         "toolResult": {
@@ -374,9 +355,7 @@ fn to_converse_request(req: &ChatRequest) -> serde_json::Value {
             .collect();
         body["toolConfig"] = serde_json::json!({ "tools": specs });
     }
-    for (k, v) in &req.extra {
-        body[k] = v.clone();
-    }
+    req.apply_extra_to(&mut body);
 
     body
 }
@@ -385,14 +364,7 @@ fn to_converse_request(req: &ChatRequest) -> serde_json::Value {
 /// index (Bedrock can stream multiple tool calls in parallel blocks).
 #[derive(Debug, Default)]
 struct BedrockStreamState {
-    tool_uses: HashMap<usize, PartialToolUse>,
-}
-
-#[derive(Debug)]
-struct PartialToolUse {
-    id: String,
-    name: String,
-    input_json: String,
+    tool_uses: ToolCallAccumulator,
 }
 
 fn content_block_index(payload: &serde_json::Value) -> usize {
@@ -414,15 +386,16 @@ fn converse_event_to_chunk(
         "contentBlockStart" => {
             let index = content_block_index(payload);
             if let Some(tool_use) = payload.get("start").and_then(|s| s.get("toolUse")) {
-                state.tool_uses.insert(
+                state.tool_uses.start(
                     index,
-                    PartialToolUse {
+                    PartialToolCall {
                         id: tool_use["toolUseId"]
                             .as_str()
                             .unwrap_or_default()
                             .to_string(),
+                        kind: "function".to_string(),
                         name: tool_use["name"].as_str().unwrap_or_default().to_string(),
-                        input_json: String::new(),
+                        arguments: String::new(),
                     },
                 );
             }
@@ -439,28 +412,19 @@ fn converse_event_to_chunk(
                 }));
             }
             // Tool-use input arrives as JSON string fragments; accumulate.
-            if let Some(input) = payload["delta"]["toolUse"]["input"].as_str()
-                && let Some(tool) = state.tool_uses.get_mut(&index)
-            {
-                tool.input_json.push_str(input);
+            if let Some(input) = payload["delta"]["toolUse"]["input"].as_str() {
+                state.tool_uses.append_arguments(index, input);
             }
             None
         }
         "contentBlockStop" => {
             let index = content_block_index(payload);
-            let tool = state.tool_uses.remove(&index)?;
+            let tool = state.tool_uses.finish(index)?;
             Some(Ok(ChatChunk {
                 index,
                 delta: String::new(),
                 finish_reason: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: tool.id,
-                    kind: "function".to_string(),
-                    function: FunctionCall {
-                        name: tool.name,
-                        arguments: tool.input_json,
-                    },
-                }]),
+                tool_calls: Some(vec![tool]),
             }))
         }
         "messageStop" => {
@@ -499,7 +463,8 @@ struct TitanEmbedResponse {
 mod tests {
     use super::*;
     use crate::eventstream::encode_frame;
-    use crate::types::{ChatMessage, ToolDefinition};
+    use crate::types::{ChatMessage, FunctionCall, ToolCall, ToolDefinition};
+    use std::collections::HashMap;
     use wiremock::matchers::{header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

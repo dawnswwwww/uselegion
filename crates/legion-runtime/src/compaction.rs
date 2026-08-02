@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use futures::StreamExt;
+use legion_provider::model_ref::parse_context_window_suffix;
 use legion_provider::router::ProviderRouter;
 use legion_provider::types::{ChatMessage, ChatRequest, ChatRole, FinishReason};
 use tracing::{info, warn};
@@ -10,6 +11,7 @@ use crate::context::SessionContext;
 use crate::token_counter::estimate_total_tokens;
 use crate::types::{BoundaryMark, CompactionResult, RuntimeError};
 use legion_core::config::CompactionConfig;
+use legion_core::util::iso_now;
 
 const SUMMARY_SYSTEM_PROMPT: &str = r#"You are summarizing a conversation between a user and an AI coding assistant.
 Produce a concise but information-dense summary of the conversation fragment below.
@@ -87,7 +89,7 @@ impl Compactor {
         session_ctx: Option<&SessionContext>,
         query: &str,
     ) -> Result<Option<(String, Option<BoundaryMark>)>, RuntimeError> {
-        if !self.should_compact(messages, system_prompt) {
+        if !self.should_compact(messages, system_prompt, model_ref) {
             return Ok(None);
         }
 
@@ -150,23 +152,48 @@ impl Compactor {
         }
     }
 
+    /// Resolve the effective context window for `model_ref`, honoring overrides
+    /// in priority order:
+    ///
+    /// 1. A trailing model-name suffix (`minimax/MiniMax-M3[1m]`) — most specific.
+    /// 2. A `compaction.context_windows` table entry keyed by the suffix-stripped
+    ///    `provider/model`.
+    /// 3. The global `compaction.context_window` fallback.
+    ///
+    /// Only `context_window` is overridden; `buffer_tokens` and `threshold_ratio`
+    /// are always taken from the global config.
+    pub fn effective_context_window(&self, model_ref: &str) -> usize {
+        if let Some(win) = parse_context_window_suffix(model_ref).1 {
+            return win;
+        }
+        if let Some(win) = self.config.context_windows.get(model_ref).copied() {
+            return win;
+        }
+        self.config.context_window
+    }
+
     /// Decide whether the current message list has grown large enough to compact.
     ///
     /// When `buffer_tokens` is configured, compaction triggers once the estimated
-    /// tokens reach `context_window - buffer_tokens`, leaving headroom for the
+    /// tokens reach `effective_window - buffer_tokens`, leaving headroom for the
     /// next model turn. When `buffer_tokens` is zero, the legacy ratio threshold
-    /// is used.
-    pub fn should_compact(&self, messages: &[ChatMessage], system_prompt: &str) -> bool {
+    /// is used. `model_ref` selects the per-model context window (suffix or
+    /// `context_windows` table override; falls back to the global value).
+    pub fn should_compact(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+        model_ref: &str,
+    ) -> bool {
         if messages.len() < self.config.min_messages_to_keep.saturating_add(2) {
             return false;
         }
 
+        let effective_window = self.effective_context_window(model_ref);
         let threshold = if self.config.buffer_tokens > 0 {
-            self.config
-                .context_window
-                .saturating_sub(self.config.buffer_tokens)
+            effective_window.saturating_sub(self.config.buffer_tokens)
         } else {
-            (self.config.context_window as f32 * self.config.threshold_ratio) as usize
+            (effective_window as f32 * self.config.threshold_ratio) as usize
         };
         estimate_total_tokens(messages, system_prompt) >= threshold
     }
@@ -294,7 +321,10 @@ impl TwoPassCompactor {
         session_ctx: Option<&SessionContext>,
         query: &str,
     ) -> Result<Option<(String, Option<BoundaryMark>)>, RuntimeError> {
-        if !self.inner.should_compact(messages, system_prompt) {
+        if !self
+            .inner
+            .should_compact(messages, system_prompt, model_ref)
+        {
             return Ok(None);
         }
 
@@ -621,14 +651,6 @@ fn select_compaction_boundary(messages: &[ChatMessage], min_keep: usize) -> usiz
     }
 }
 
-/// Minimal ISO-8601 timestamp without adding a chrono dependency.
-fn iso_now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| format!("{}.{:03}Z", d.as_secs(), d.subsec_millis()))
-        .unwrap_or_default()
-}
-
 async fn generate_summary(
     provider: &ProviderRouter,
     model_ref: &str,
@@ -842,14 +864,14 @@ mod tests {
             ChatMessage::user("next"),
         ];
         let compactor = Compactor::new(cfg);
-        assert!(compactor.should_compact(&messages, ""));
+        assert!(compactor.should_compact(&messages, "", "provider/model"));
     }
 
     #[test]
     fn should_not_compact_when_below_threshold() {
         let messages = vec![ChatMessage::user("hi")];
         let compactor = Compactor::new(config());
-        assert!(!compactor.should_compact(&messages, ""));
+        assert!(!compactor.should_compact(&messages, "", "provider/model"));
     }
 
     #[test]
@@ -864,7 +886,7 @@ mod tests {
             ChatMessage::user("next"),
         ];
         let compactor = Compactor::new(buffer_config());
-        assert!(compactor.should_compact(&messages, ""));
+        assert!(compactor.should_compact(&messages, "", "provider/model"));
     }
 
     #[test]
@@ -890,7 +912,67 @@ mod tests {
             ChatMessage::user("next"),
         ];
         let compactor = Compactor::new(cfg);
-        assert!(compactor.should_compact(&messages, ""));
+        assert!(compactor.should_compact(&messages, "", "provider/model"));
+    }
+
+    #[test]
+    fn effective_window_uses_global_fallback() {
+        let compactor = Compactor::new(config());
+        assert_eq!(compactor.effective_context_window("provider/model"), 1_000,);
+    }
+
+    #[test]
+    fn effective_window_suffix_overrides_table_and_global() {
+        // Global = 1_000 (from `config()`), table = 2_000, suffix = 1_000_000.
+        // Suffix must win.
+        let mut cfg = config();
+        cfg.context_windows
+            .insert("provider/model".to_string(), 2_000);
+        let compactor = Compactor::new(cfg);
+        assert_eq!(
+            compactor.effective_context_window("provider/model[1m]"),
+            1_000_000,
+        );
+    }
+
+    #[test]
+    fn effective_window_table_overrides_global() {
+        let mut cfg = config();
+        cfg.context_windows
+            .insert("minimax/MiniMax-M3".to_string(), 1_000_000);
+        let compactor = Compactor::new(cfg);
+        assert_eq!(
+            compactor.effective_context_window("minimax/MiniMax-M3"),
+            1_000_000,
+        );
+        // An unlisted model falls back to the global value.
+        assert_eq!(compactor.effective_context_window("provider/other"), 1_000,);
+    }
+
+    #[test]
+    fn effective_window_ignores_malformed_suffix() {
+        let compactor = Compactor::new(config());
+        // `[abc]` is not a valid window, so the global value is used.
+        assert_eq!(
+            compactor.effective_context_window("provider/model[abc]"),
+            1_000,
+        );
+    }
+
+    #[test]
+    fn should_compact_uses_suffix_window() {
+        // Global window 1_000 / ratio 0.8 => legacy threshold 800, which the
+        // content below would exceed. But a `[1000000]` suffix widens the
+        // window so compaction must NOT trigger.
+        let big_content = "word ".repeat(1_500);
+        let messages = vec![
+            ChatMessage::system("you are helpful"),
+            ChatMessage::user(&big_content),
+            ChatMessage::assistant("ack"),
+            ChatMessage::user("next"),
+        ];
+        let compactor = Compactor::new(config());
+        assert!(!compactor.should_compact(&messages, "", "provider/model[1000000]",));
     }
 
     #[test]
@@ -1434,6 +1516,7 @@ mod tests {
 
         let cfg = CompactionConfig {
             context_window: 1_000,
+            context_windows: std::collections::BTreeMap::new(),
             threshold_ratio: 0.0, // force compaction
             min_messages_to_keep: 1,
             max_summary_tokens: 256,
@@ -1485,6 +1568,7 @@ mod tests {
 
         let cfg = CompactionConfig {
             context_window: 1_000,
+            context_windows: std::collections::BTreeMap::new(),
             threshold_ratio: 0.0,
             min_messages_to_keep: 1,
             max_summary_tokens: 256,

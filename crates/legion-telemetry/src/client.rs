@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use legion_core::config::TelemetryConfig;
+use legion_core::fs::expand_tilde;
 
-use crate::{
-    LogEntry, LogLevel, LogSource, SessionMetric, TelemetryError, UnifiedLog, expand_tilde,
-};
+use crate::{LogEntry, LogLevel, LogSource, SessionMetric, TelemetryError, UnifiedLog};
 
 /// Product telemetry client: unified log + session metrics.
 ///
@@ -78,7 +77,13 @@ impl TelemetryClient {
             return;
         };
         match serde_json::to_value(&event) {
-            Ok(value) => {
+            Ok(mut value) => {
+                // Stamp every record with its emission time (`ts`, RFC 3339,
+                // same convention as the unified log) so event spacing and
+                // overlap are reconstructible from the file alone.
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert("ts".to_string(), chrono::Utc::now().to_rfc3339().into());
+                }
                 if let Err(err) = log.emit_raw(&value) {
                     tracing::warn!(error = %err, "failed to write session metric");
                 }
@@ -151,8 +156,17 @@ mod tests {
         client.log_session_event(event.clone()).await;
 
         let contents = std::fs::read_to_string(client.session_metrics_path().unwrap()).unwrap();
-        let parsed: SessionMetric = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        let line = contents.lines().next().unwrap();
+        // The event payload round-trips (unknown fields are ignored).
+        let parsed: SessionMetric = serde_json::from_str(line).unwrap();
         assert_eq!(parsed, event);
+        // Every record is stamped with an RFC 3339 emission time.
+        let raw: serde_json::Value = serde_json::from_str(line).unwrap();
+        let ts = raw.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+            "metric record must carry an RFC 3339 ts field, got {ts:?}"
+        );
     }
 
     #[tokio::test]

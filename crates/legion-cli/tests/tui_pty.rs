@@ -17,7 +17,7 @@ fn legion_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_legion"))
 }
 
-fn spawn_with_isolated_home<'a>(args: &[&'a str]) -> Result<(TuiPty, TempDir)> {
+fn spawn_with_isolated_home(args: &[&str]) -> Result<(TuiPty, TempDir)> {
     let home = TempDir::new()?;
     let pty = TuiPty::spawn(
         &legion_binary(),

@@ -36,8 +36,6 @@ pub struct SqliteVecBackend {
     db: Pool<Sqlite>,
     embedder: Arc<dyn Embedder>,
     workspace: PathBuf,
-    #[allow(dead_code)]
-    collection_path: PathBuf,
     decay: DecayConfig,
     merge: MergeConfig,
 }
@@ -80,7 +78,6 @@ impl SqliteVecBackend {
             db: pool,
             embedder,
             workspace: workspace.as_ref().to_path_buf(),
-            collection_path,
             decay: DecayConfig::default(),
             merge: MergeConfig::default(),
         };

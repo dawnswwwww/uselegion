@@ -331,14 +331,6 @@ impl RunRequest {
         self.workspace_override = workspace;
         self
     }
-
-    pub fn with_plan_mode_tracker(
-        mut self,
-        tracker: Arc<tokio::sync::Mutex<crate::plan_mode::PlanModeTracker>>,
-    ) -> Self {
-        self.plan_mode_tracker = Some(tracker);
-        self
-    }
 }
 
 #[cfg(test)]

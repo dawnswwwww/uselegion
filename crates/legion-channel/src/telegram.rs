@@ -1,3 +1,7 @@
+use crate::util::{
+    Lifecycle, StopPolicy, cfg_required, cfg_str, cfg_str_or, ensure_success, reconnect_delay,
+    send_json,
+};
 use async_trait::async_trait;
 use legion_plugin_sdk::channel::{
     ChannelCapabilities, ChannelError, ChannelProvider, InboundMessage, Media, OutboundMessage,
@@ -8,7 +12,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 /// Built-in Telegram channel provider using the Bot API.
 ///
@@ -16,10 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 /// `https://api.telegram.org/bot<token>/getUpdates`.
 #[derive(Debug)]
 pub struct TelegramProvider {
-    http: reqwest::Client,
-    config: Mutex<Option<TelegramConfig>>,
-    running: Arc<AtomicBool>,
-    poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    lifecycle: Lifecycle<TelegramConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,20 +36,14 @@ struct TelegramConfig {
 impl TelegramProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
-            config: Mutex::new(None),
-            running: Arc::new(AtomicBool::new(false)),
-            poll_handle: Mutex::new(None),
+            lifecycle: Lifecycle::new(),
         }
     }
 
     /// Build a provider using a custom HTTP client (useful in tests).
     pub fn with_http(http: reqwest::Client) -> Self {
         Self {
-            http,
-            config: Mutex::new(None),
-            running: Arc::new(AtomicBool::new(false)),
-            poll_handle: Mutex::new(None),
+            lifecycle: Lifecycle::with_http(http),
         }
     }
 }
@@ -78,6 +73,7 @@ impl ChannelProvider for TelegramProvider {
             thread: false,
             reactions: true,
             typing: true,
+            buttons: false,
         }
     }
 
@@ -87,51 +83,41 @@ impl ChannelProvider for TelegramProvider {
         inbound_tx: mpsc::Sender<InboundMessage>,
     ) -> Result<(), ChannelError> {
         let cfg = parse_config(config)?;
-        *self.config.lock().await = Some(cfg.clone());
-        self.running.store(true, Ordering::SeqCst);
 
-        let running = self.running.clone();
-        let http = self.http.clone();
+        let running = self.lifecycle.running.clone();
+        let http = self.lifecycle.http.clone();
         let token = cfg.token.clone();
         let base_url = cfg.base_url.clone();
         let account_id = cfg.account_id.clone();
         let bot_username = cfg.bot_username.clone();
 
-        let handle = tokio::spawn(async move {
-            poll_updates(
-                &http,
-                &base_url,
-                &token,
-                &account_id,
-                bot_username.as_deref(),
-                inbound_tx,
-                running,
-            )
+        self.lifecycle
+            .begin(cfg.clone(), async move {
+                poll_updates(
+                    &http,
+                    &base_url,
+                    &token,
+                    &account_id,
+                    bot_username.as_deref(),
+                    inbound_tx,
+                    running,
+                )
+                .await;
+            })
             .await;
-        });
 
-        *self.poll_handle.lock().await = Some(handle);
         tracing::info!(channel = "telegram", account = %cfg.account_id, "Telegram channel started");
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), ChannelError> {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.poll_handle.lock().await.take() {
-            let _ = handle.await;
-        }
-        *self.config.lock().await = None;
+        self.lifecycle.stop(StopPolicy::Await).await;
         tracing::info!(channel = "telegram", "Telegram channel stopped");
         Ok(())
     }
 
     async fn send(&self, message: OutboundMessage) -> Result<(), ChannelError> {
-        let cfg = self
-            .config
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChannelError::NotStarted)?;
+        let cfg = self.lifecycle.config().await?;
 
         let chat_id = message.peer.id.parse::<i64>().map_err(|_| {
             ChannelError::SendFailed(format!("invalid telegram chat id: {}", message.peer.id))
@@ -147,35 +133,14 @@ impl ChannelProvider for TelegramProvider {
                 .map(|message_id| ReplyParameters { message_id }),
         };
 
-        let response = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".into());
-            return Err(ChannelError::SendFailed(format!(
-                "telegram sendMessage failed: {status} {body}"
-            )));
-        }
+        let response = send_json(self.lifecycle.http.post(&url), &payload).await?;
+        ensure_success(response, "telegram sendMessage").await?;
 
         Ok(())
     }
 
     async fn send_typing(&self, peer: &Peer) -> Result<(), ChannelError> {
-        let cfg = self
-            .config
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChannelError::NotStarted)?;
+        let cfg = self.lifecycle.config().await?;
 
         let chat_id = peer.id.parse::<i64>().map_err(|_| {
             ChannelError::SendFailed(format!("invalid telegram chat id: {}", peer.id))
@@ -187,24 +152,8 @@ impl ChannelProvider for TelegramProvider {
             action: "typing",
         };
 
-        let response = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".into());
-            return Err(ChannelError::SendFailed(format!(
-                "telegram sendChatAction failed: {status} {body}"
-            )));
-        }
+        let response = send_json(self.lifecycle.http.post(&url), &payload).await?;
+        ensure_success(response, "telegram sendChatAction").await?;
 
         Ok(())
     }
@@ -215,12 +164,7 @@ impl ChannelProvider for TelegramProvider {
         message_id: &str,
         emoji: &str,
     ) -> Result<(), ChannelError> {
-        let cfg = self
-            .config
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChannelError::NotStarted)?;
+        let cfg = self.lifecycle.config().await?;
 
         let chat_id = peer.id.parse::<i64>().map_err(|_| {
             ChannelError::SendFailed(format!("invalid telegram chat id: {}", peer.id))
@@ -239,52 +183,21 @@ impl ChannelProvider for TelegramProvider {
             }],
         };
 
-        let response = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".into());
-            return Err(ChannelError::SendFailed(format!(
-                "telegram setMessageReaction failed: {status} {body}"
-            )));
-        }
+        let response = send_json(self.lifecycle.http.post(&url), &payload).await?;
+        ensure_success(response, "telegram setMessageReaction").await?;
 
         Ok(())
     }
 }
 
 fn parse_config(config: serde_json::Value) -> Result<TelegramConfig, ChannelError> {
-    let token = config
-        .get("token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChannelError::InvalidConfig("telegram token is required".into()))?
-        .to_string();
+    let token = cfg_required(&config, &["token"], "telegram token is required")?;
 
-    let base_url = config
-        .get("base_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://api.telegram.org")
-        .to_string();
+    let base_url = cfg_str_or(&config, &["base_url"], "https://api.telegram.org");
 
-    let account_id = config
-        .get("account_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+    let account_id = cfg_str_or(&config, &["account_id"], "default");
 
-    let bot_username = config
-        .get("botUsername")
-        .or_else(|| config.get("bot_username"))
-        .and_then(|v| v.as_str())
+    let bot_username = cfg_str(&config, &["botUsername", "bot_username"])
         .map(|name| name.trim_start_matches('@').to_string())
         .filter(|name| !name.is_empty());
 
@@ -321,7 +234,7 @@ async fn poll_updates(
                         status = %response.status(),
                         "telegram getUpdates returned error"
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    reconnect_delay().await;
                     continue;
                 }
 
@@ -351,7 +264,7 @@ async fn poll_updates(
             }
             Err(err) => {
                 tracing::warn!(error = %err, "telegram getUpdates request failed");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                reconnect_delay().await;
             }
         }
     }
@@ -646,6 +559,7 @@ struct ReactionType {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::sync::Mutex;
 
     #[test]
     fn should_parse_dm_update() {
@@ -948,15 +862,17 @@ mod tests {
 
     fn started_provider(base_url: String) -> TelegramProvider {
         TelegramProvider {
-            http: reqwest::Client::new(),
-            config: Mutex::new(Some(TelegramConfig {
-                token: "t".into(),
-                base_url,
-                account_id: "default".into(),
-                bot_username: None,
-            })),
-            running: Arc::new(AtomicBool::new(false)),
-            poll_handle: Mutex::new(None),
+            lifecycle: Lifecycle {
+                http: reqwest::Client::new(),
+                running: Arc::new(AtomicBool::new(false)),
+                config: Mutex::new(Some(TelegramConfig {
+                    token: "t".into(),
+                    base_url,
+                    account_id: "default".into(),
+                    bot_username: None,
+                })),
+                task: Mutex::new(None),
+            },
         }
     }
 

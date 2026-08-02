@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "legion")]
+#[command(name = "legion", version)]
 #[command(about = "Legion agent harness CLI", long_about = None)]
 struct Cli {
     /// Resume a specific TUI session: a peer id (transcript file name under
@@ -23,8 +23,9 @@ struct Cli {
     /// key. Without it each TUI launch starts a fresh session.
     #[arg(long)]
     session: Option<String>,
-    /// Run the TUI with the agent runtime embedded in this process. This is
-    /// the default — the flag is kept as an explicit no-op for clarity.
+    /// Force the TUI runtime to stay embedded in this process; skip the
+    /// gateway probe. Use this to guarantee cwd, tools, and approval stay
+    /// fully local and offline.
     #[arg(long, conflicts_with = "gateway")]
     local: bool,
     /// Require the gateway for the TUI (started if needed); never run
@@ -34,7 +35,7 @@ struct Cli {
     gateway: bool,
     /// Yolo mode: auto-approve every tool prompt without asking. Hard
     /// policy denies (e.g. disabled tools) still apply.
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     yolo: bool,
     /// Working directory for the agent. Defaults to the current directory.
     /// Pass an explicit path to override; pass `none` to use the config
@@ -64,8 +65,8 @@ enum Command {
         /// session key. Without it the shared `cli` session is used.
         #[arg(long)]
         session: Option<String>,
-        /// Run the turn with the agent runtime embedded in this process.
-        /// This is the default — the flag is kept as an explicit no-op.
+        /// Force this turn to run embedded in this process; skip the gateway
+        /// probe so it never touches the gateway.
         #[arg(long, conflicts_with = "gateway")]
         local: bool,
         /// Require the gateway for this turn; never run embedded.
@@ -73,7 +74,7 @@ enum Command {
         gateway: bool,
         /// Yolo mode: auto-approve every tool prompt without asking. Hard
         /// policy denies (e.g. disabled tools) still apply.
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yolo: bool,
         /// Working directory for this turn. Defaults to the current
         /// directory. Pass `none` to use the config default
@@ -308,8 +309,51 @@ enum SkillsAction {
 
 #[derive(Subcommand)]
 enum McpAction {
-    /// List configured MCP servers.
+    /// List configured MCP servers (config-only, no connections).
     List,
+    /// Add an MCP server to the config file.
+    Add {
+        /// Server name (used as the tool namespace prefix `mcp__<name>__<tool>`).
+        name: String,
+        /// Transport type.
+        #[arg(long, value_parser = ["stdio", "http", "sse", "ws"], default_value = "stdio")]
+        transport: String,
+        /// Environment variable for the stdio transport, KEY=VALUE. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// HTTP header for http/sse/ws transports, "Name: value". Repeatable.
+        #[arg(long = "header", value_name = "NAME: VALUE")]
+        header: Vec<String>,
+        /// Tool names that skip approval prompts (comma-separated). Repeatable.
+        #[arg(long, value_delimiter = ',')]
+        auto_approve: Vec<String>,
+        /// Pin the MCP protocol version (e.g. "2025-06-18") instead of negotiating.
+        #[arg(long)]
+        protocol_version: Option<String>,
+        /// Connect / list-tools timeout in milliseconds.
+        #[arg(long)]
+        connect_timeout_ms: Option<u64>,
+        /// Per-request tools/call timeout in milliseconds.
+        #[arg(long)]
+        tool_timeout_ms: Option<u64>,
+        /// Server URL (required for http/sse/ws; omit for stdio).
+        url: Option<String>,
+        /// Stdio command and its arguments, after `--`.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Remove an MCP server from the config file.
+    Remove {
+        /// Server name.
+        name: String,
+    },
+    /// Print one server's full config as JSON.
+    Get {
+        /// Server name.
+        name: String,
+    },
+    /// Connect to configured servers and show live status.
+    Status,
     /// Connect to configured servers and list their tools.
     Tools,
     /// Re-read config and attempt to connect to each server.
@@ -572,9 +616,38 @@ fn build_provider_router(config: &Config) -> Result<ProviderRouter, CliError> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+
+    // The TUI takes over the terminal (raw mode + alternate screen), so
+    // tracing must not write to stdout/stderr — every log line would be
+    // injected into the frame and garble it. Log to ~/.legion/tui.log
+    // instead, mirroring the gateway's ~/.legion/gateway.log convention.
+    if cli.command.is_none() {
+        let log_file = dirs::home_dir()
+            .map(|h| h.join(".legion").join("tui.log"))
+            .and_then(|path| {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).ok()?;
+                }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        match log_file {
+            Some(file) => {
+                tracing_subscriber::fmt()
+                    .with_writer(move || file.try_clone().expect("tui log file clone"))
+                    .init();
+            }
+            None => {
+                tracing_subscriber::fmt().with_writer(std::io::sink).init();
+            }
+        }
+    } else {
+        tracing_subscriber::fmt::init();
+    }
 
     match cli.command {
         None => {
@@ -848,14 +921,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SkillsAction::Reload => legion_cli::skills::reload(&config).await?,
             }
         }
-        Some(Command::Mcp { action }) => {
-            let config = load_config()?;
-            match action {
-                McpAction::List => legion_cli::mcp::list(&config).await?,
-                McpAction::Tools => legion_cli::mcp::tools(&config).await?,
-                McpAction::Reload => legion_cli::mcp::reload(&config).await?,
+        Some(Command::Mcp { action }) => match action {
+            McpAction::List => {
+                let config = load_config()?;
+                legion_cli::mcp::list(&config).await?
             }
-        }
+            McpAction::Tools => {
+                let config = load_config()?;
+                legion_cli::mcp::tools(&config).await?
+            }
+            McpAction::Reload => {
+                let config = load_config()?;
+                legion_cli::mcp::reload(&config).await?
+            }
+            McpAction::Status => {
+                let config = load_config()?;
+                legion_cli::mcp::status(&config).await?
+            }
+            McpAction::Add {
+                name,
+                transport,
+                env,
+                header,
+                auto_approve,
+                protocol_version,
+                connect_timeout_ms,
+                tool_timeout_ms,
+                url,
+                command,
+            } => {
+                let path = default_config_path().ok_or_else(|| {
+                    CliError::Other("unable to determine config path".to_string())
+                })?;
+                let opts = legion_cli::mcp::AddServerOptions {
+                    name,
+                    transport,
+                    url,
+                    command,
+                    env,
+                    headers: header,
+                    auto_approve,
+                    protocol_version,
+                    connect_timeout_ms,
+                    tool_timeout_ms,
+                };
+                legion_cli::mcp::add(&path, &opts)?;
+            }
+            McpAction::Remove { name } => {
+                let path = default_config_path().ok_or_else(|| {
+                    CliError::Other("unable to determine config path".to_string())
+                })?;
+                legion_cli::mcp::remove(&path, &name)?;
+            }
+            McpAction::Get { name } => {
+                let path = default_config_path().ok_or_else(|| {
+                    CliError::Other("unable to determine config path".to_string())
+                })?;
+                legion_cli::mcp::get(&path, &name)?;
+            }
+        },
         Some(Command::Doctor) => doctor().await?,
         Some(Command::Cron { action }) => {
             let config = load_config()?;
@@ -1202,5 +1326,127 @@ mod tests {
         assert!(resolve_loop_schedule("foo").is_err());
         assert!(resolve_loop_schedule("0m").is_err());
         assert!(resolve_loop_schedule("5x").is_err());
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn mcp_add_stdio_parses_command_after_double_dash() {
+        let cli = parse(&[
+            "legion",
+            "mcp",
+            "add",
+            "fs",
+            "--env",
+            "A=B",
+            "--env",
+            "C=D",
+            "--auto-approve",
+            "read_file,write_file",
+            "--protocol-version",
+            "2025-06-18",
+            "--tool-timeout-ms",
+            "5000",
+            "--",
+            "npx",
+            "-y",
+            "@mcp/server-fs",
+        ])
+        .unwrap();
+        let Some(Command::Mcp {
+            action:
+                McpAction::Add {
+                    name,
+                    transport,
+                    env,
+                    auto_approve,
+                    protocol_version,
+                    tool_timeout_ms,
+                    url,
+                    command,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected mcp add");
+        };
+        assert_eq!(name, "fs");
+        assert_eq!(transport, "stdio");
+        assert_eq!(env, vec!["A=B".to_string(), "C=D".to_string()]);
+        assert_eq!(
+            auto_approve,
+            vec!["read_file".to_string(), "write_file".to_string()]
+        );
+        assert_eq!(protocol_version.as_deref(), Some("2025-06-18"));
+        assert_eq!(tool_timeout_ms, Some(5000));
+        assert_eq!(url, None);
+        assert_eq!(
+            command,
+            vec![
+                "npx".to_string(),
+                "-y".to_string(),
+                "@mcp/server-fs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_add_http_parses_url_and_headers() {
+        let cli = parse(&[
+            "legion",
+            "mcp",
+            "add",
+            "web",
+            "--transport",
+            "http",
+            "--header",
+            "Authorization: Bearer t",
+            "https://example/rpc",
+        ])
+        .unwrap();
+        let Some(Command::Mcp {
+            action:
+                McpAction::Add {
+                    name,
+                    transport,
+                    header,
+                    url,
+                    command,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected mcp add");
+        };
+        assert_eq!(name, "web");
+        assert_eq!(transport, "http");
+        assert_eq!(header, vec!["Authorization: Bearer t".to_string()]);
+        assert_eq!(url.as_deref(), Some("https://example/rpc"));
+        assert!(command.is_empty());
+    }
+
+    #[test]
+    fn mcp_add_rejects_unknown_transport() {
+        assert!(parse(&["legion", "mcp", "add", "x", "--transport", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn mcp_remove_and_get_parse() {
+        let cli = parse(&["legion", "mcp", "remove", "fs"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::Remove { .. }
+            })
+        ));
+        let cli = parse(&["legion", "mcp", "get", "fs"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::Get { .. }
+            })
+        ));
     }
 }

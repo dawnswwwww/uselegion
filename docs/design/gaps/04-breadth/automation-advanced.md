@@ -18,7 +18,7 @@ legion 的 automation **基础扎实(亮点)**,缺高级编排:
 
 - **Cron 真实**:`legion-automation/src/cron.rs`(675 行),JSONL 持久化 `JsonlCronJobStore`,5 字段 cron + 一次性 `__at__`,`tick` 循环,完整测试。
 - **Heartbeat 真实**:`heartbeat.rs`(173 行),周期读 HEARTBEAT.md,明确不建 task/不刷 idle。
-- **Hooks 真实**:`hooks.rs`(289 行),6 事件 + 脚本 hook + in-process hook,失败不阻断。
+- **Hooks 已废弃**:原 `hooks.rs`(进程级 6 事件脚本钩子,大半死代码)已删除,事件出口能力收编进独立的 `/events` 版本化事件总线(见 [`docs/design/events-bus.md`](../events-bus.md))——外部工具/GUI 通过 `AttachSession` 订阅 session 生命周期/工具/文本流。
 - **Task runner 真实**:`task_runner.rs`(424 行)有 `depends_on` 依赖解析 + 状态机 + 超时。
 - **缺 Standing Orders(A4)**:无"每次会话注入的持久授权/边界"机制。
 - **缺 Inferred Commitments(A5)**:无"自然语言推断的短期跟进"——对话中说"明天提醒我"不会自动生成 task。
@@ -33,7 +33,7 @@ legion 的 automation **基础扎实(亮点)**,缺高级编排:
 
 - **P1 扩展性**:新自动化类型 = 实现 task kind / trigger,复用现有 task_runner。
 - **P2 安全**:Standing Orders 是**授权注入**,来源受控(仅配置/skill,非用户消息);Commitments 生成受 cooldown 限。
-- **P3 增量**:新特性默认关;现有 cron/heartbeat/hooks/task 行为不变。
+- **P3 增量**:新特性默认关;现有 cron/heartbeat/task 行为不变。
 - **P4 证据**:现状见 §1;借鉴见 §6。
 - **P5 可观测**:Standing Order 注入、Commitment 生成、Flow 执行产生 `tracing`。
 - **P6 失败显式**:Commitment LLM 失败静默;Flow 步骤失败按策略(abort/continue/branch)。

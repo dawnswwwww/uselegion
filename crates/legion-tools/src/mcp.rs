@@ -74,6 +74,15 @@ impl Tool for McpTool {
             other => serde_json::to_string(other)
                 .unwrap_or_else(|_| "<unserializable mcp result>".to_string()),
         };
+        // Structured content rides along as JSON when the server provided it.
+        let content = match &result.structured_content {
+            Some(structured) => format!(
+                "{content}\n{}",
+                serde_json::to_string(structured)
+                    .unwrap_or_else(|_| "<unserializable structured content>".to_string())
+            ),
+            None => content,
+        };
         if result.is_error {
             Ok(ToolResult::error(content))
         } else {
@@ -107,6 +116,7 @@ mod tests {
             Ok(McpToolResult {
                 content: serde_json::json!({ "echoed": { "name": name, "args": args } }),
                 is_error: false,
+                structured_content: None,
             })
         }
         async fn close(&self) -> Result<(), McpError> {
@@ -120,6 +130,8 @@ mod tests {
             name: "ping".to_string(),
             description: "ping".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+            output_schema: None,
         };
         let adapter = McpToolAdapter::new("echo", desc, Arc::new(EchoClient), false);
         let tool = McpTool::new(adapter);
@@ -161,9 +173,77 @@ mod tests {
             name: "read_file".to_string(),
             description: "read".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+            output_schema: None,
         };
         let adapter = McpToolAdapter::new("fs", desc, Arc::new(EchoClient), true);
         let tool = McpTool::new(adapter);
         assert_eq!(tool.policy().approval, Approval::Off);
+    }
+
+    struct StructuredClient;
+
+    #[async_trait]
+    impl McpClient for StructuredClient {
+        fn server_name(&self) -> &str {
+            "db"
+        }
+        async fn connect(&self) -> Result<(), McpError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<McpToolDesc>, McpError> {
+            Ok(Vec::new())
+        }
+        async fn call_tool(&self, _: &str, _: Value) -> Result<McpToolResult, McpError> {
+            Ok(McpToolResult {
+                content: Value::String("query ok".to_string()),
+                is_error: false,
+                structured_content: Some(serde_json::json!({"rows": 3})),
+            })
+        }
+        async fn close(&self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_appends_structured_content_to_output() {
+        let desc = McpToolDesc {
+            name: "query".to_string(),
+            description: "query".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+            output_schema: None,
+        };
+        let adapter = McpToolAdapter::new("db", desc, Arc::new(StructuredClient), false);
+        let tool = McpTool::new(adapter);
+
+        let result = tool
+            .execute(
+                serde_json::json!({}),
+                ToolContext {
+                    workspace: std::path::PathBuf::from("/tmp"),
+                    session_id: "s".to_string(),
+                    agent_id: "a".to_string(),
+                    sender: None,
+                    memory: None,
+                    viewed_files: None,
+                    allowed_tools: None,
+                    spawner: None,
+                    messenger: None,
+                    swarm: None,
+                    depth: 0,
+                    parent_history: None,
+                    question_gate: None,
+                    todo_store: None,
+                    background_tasks: None,
+                    plan_mode_tracker: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("query ok"));
+        assert!(result.content.contains(r#"{"rows":3}"#));
     }
 }

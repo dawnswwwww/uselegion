@@ -1,3 +1,4 @@
+use legion_core::util::lock_recover;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -41,7 +42,7 @@ impl PairingStore {
 
     /// Determine whether a device is already approved.
     pub fn is_approved(&self, device_id: &str) -> bool {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state
             .devices
             .get(device_id)
@@ -51,13 +52,13 @@ impl PairingStore {
 
     /// Look up a device by id.
     pub fn get_device(&self, device_id: &str) -> Option<Device> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state.devices.get(device_id).cloned()
     }
 
     /// Verify a device token.
     pub fn verify_token(&self, device_id: &str, token: &str) -> bool {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state
             .devices
             .get(device_id)
@@ -67,7 +68,7 @@ impl PairingStore {
 
     /// Approve a device explicitly, issuing a persistent device token.
     pub fn approve(&self, device_id: impl Into<String>) -> String {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         let device_id = device_id.into();
         state.token_counter += 1;
         let token = format!("dev-token-{}", state.token_counter);
@@ -89,7 +90,7 @@ impl PairingStore {
 
     /// Record a new device as pending approval (non-loopback, unknown device).
     pub fn request_approval(&self, device: Device) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         if !state.devices.contains_key(&device.device_id)
             && !state.pending.contains(&device.device_id)
         {
@@ -108,7 +109,7 @@ impl PairingStore {
 
     /// List pending device ids awaiting explicit approval.
     pub fn pending_approvals(&self) -> Vec<String> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state.pending.clone()
     }
 }

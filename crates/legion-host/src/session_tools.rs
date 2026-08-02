@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use legion_plugin_sdk::session_key::{is_safe_segment, parse_session_key};
 use legion_provider::types::ChatRole;
 use legion_runtime::tools::{Policy, Tool, ToolContext, ToolError, ToolResult};
 use serde_json::{Value, json};
@@ -29,21 +30,15 @@ const MAX_MESSAGE_CHARS: usize = 2000;
 
 /// Parse a session key (`agent:<agent>:<scope>:<channel>:<account>:<kind>:<peer>`)
 /// into `(agent_id, peer_id)`.
-fn parse_session_key(session_key: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = session_key.split(':').collect();
-    if parts.len() != 7 || parts[0] != "agent" {
-        return None;
-    }
-    Some((parts[1].to_string(), parts[6].to_string()))
+fn parse_agent_and_peer(session_key: &str) -> Option<(String, String)> {
+    let parts = parse_session_key(session_key)?;
+    Some((parts.agent_id, parts.peer_id))
 }
 
 /// Peer ids map directly to transcript file names (`<peer>.jsonl`), so they
 /// must not contain path separators or other special characters.
 pub fn is_safe_peer_id(peer_id: &str) -> bool {
-    !peer_id.is_empty()
-        && peer_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    is_safe_segment(peer_id)
 }
 
 fn usize_param(params: &Value, key: &str, default: usize, max: usize) -> usize {
@@ -108,7 +103,7 @@ impl Tool for SessionStatusTool {
     }
 
     async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<ToolResult, ToolError> {
-        let Some((agent_id, peer_id)) = parse_session_key(&ctx.session_id) else {
+        let Some((agent_id, peer_id)) = parse_agent_and_peer(&ctx.session_id) else {
             return Ok(ToolResult::error(format!(
                 "invalid session key: {}",
                 ctx.session_id
@@ -284,7 +279,7 @@ impl Tool for SessionsHistoryTool {
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<ToolResult, ToolError> {
         let peer_id = match params.get("peerId").and_then(Value::as_str) {
             Some(peer) => peer.to_string(),
-            None => match parse_session_key(&ctx.session_id) {
+            None => match parse_agent_and_peer(&ctx.session_id) {
                 Some((_, peer)) => peer,
                 None => {
                     return Ok(ToolResult::error(format!(
@@ -359,7 +354,9 @@ mod tests {
     }
 
     fn session_key(agent_id: &str, peer_id: &str) -> String {
-        format!("agent:{agent_id}:dm:webchat:default:direct:{peer_id}")
+        legion_plugin_sdk::session_key::direct_session_key(
+            agent_id, "dm", "webchat", "default", peer_id,
+        )
     }
 
     fn ctx(agent_id: &str, session_key: &str) -> ToolContext {
@@ -422,7 +419,8 @@ mod tests {
                     tool_message("file contents"),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
         store
             .append_boundary(
                 &key,
@@ -432,8 +430,12 @@ mod tests {
                     tokens_compacted: 42,
                 },
             )
-            .await;
-        store.append(&key, &[ChatMessage::user("again")]).await;
+            .await
+            .unwrap();
+        store
+            .append(&key, &[ChatMessage::user("again")])
+            .await
+            .unwrap();
 
         let tool = SessionStatusTool::new(store, policy());
         let result = tool.execute(json!({}), ctx("main", &key)).await.unwrap();
@@ -455,7 +457,10 @@ mod tests {
     async fn session_status_denies_cross_agent_key() {
         let (store, _dir) = store();
         let key = session_key("main", "user1");
-        store.append(&key, &[ChatMessage::user("hi")]).await;
+        store
+            .append(&key, &[ChatMessage::user("hi")])
+            .await
+            .unwrap();
 
         let tool = SessionStatusTool::new(store, policy());
         let result = tool.execute(json!({}), ctx("other", &key)).await.unwrap();
@@ -496,7 +501,8 @@ mod tests {
                     &session_key("main", peer),
                     &[ChatMessage::user(format!("hi {peer}"))],
                 )
-                .await;
+                .await
+                .unwrap();
         }
 
         let tool = SessionsListTool::new(store, policy(), 65_536);
@@ -541,7 +547,8 @@ mod tests {
                         ChatMessage::assistant(format!("answer {i}")),
                     ],
                 )
-                .await;
+                .await
+                .unwrap();
         }
     }
 
@@ -598,7 +605,8 @@ mod tests {
                     ChatMessage::user("x".repeat(3000)),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
 
         let tool = SessionsHistoryTool::new(store, policy());
         let result = tool.execute(json!({}), ctx("main", &key)).await.unwrap();

@@ -21,7 +21,9 @@ use legion_runtime::{
     AgentRuntime, AutoExtractor, CommitmentExtractor, Harness, HarnessRegistry, LlmRecallSelector,
     MemoryBackend, RuntimeSubagentSpawner, SurfacedStore,
 };
+use legion_telemetry::TelemetryClient;
 use legion_tools::CoreToolRegistry;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -29,7 +31,10 @@ use tracing::info;
 /// Assemble the runtime side from configuration: load and initialize
 /// plugins, connect MCP servers, build provider routers, memory, tools,
 /// and the harness registry.
-pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHost, HostError> {
+pub async fn assemble_agent_host(
+    config: Config,
+    cron_store_path: Option<PathBuf>,
+) -> Result<super::host::AgentHost, HostError> {
     let mut system_plugins = load_system_plugins().await?;
     // Take the registry out to load user plugins and initialize; the
     // channel provider Arcs stay in `system_plugins` for the caller.
@@ -44,9 +49,7 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
         }
     }
 
-    let workspace = dirs::home_dir()
-        .map(|h| h.join(".legion").join("workspace"))
-        .unwrap_or_else(|| PathBuf::from(".legion/workspace"));
+    let workspace = legion_core::fs::legion_home().join("workspace");
     let plugin_ctx = legion_plugin_sdk::PluginContext {
         config: serde_json::Value::Null,
         workspace,
@@ -82,14 +85,20 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
     }
     let mcp_manager = Arc::new(mcp_manager);
 
-    let main_router = Arc::new(build_provider_router(&config, "main")?);
-    let memory_backend = build_memory_backend(&config).await?;
+    let routers = build_provider_routers(&config)?;
+    let main_router = routers
+        .get("main")
+        .cloned()
+        .expect("main router is always built");
+    let memory_backend = build_memory_backend(&config, main_router.clone()).await?;
     let auto_extractor = build_auto_extractor(&config, main_router.clone(), memory_backend.clone());
     // Open the cron store before the runtime so inferred commitments
     // (automation-advanced Phase B) and the cron scheduler share one
     // instance writing to `cron.jsonl`.
+    let cron_store_path =
+        cron_store_path.unwrap_or_else(|| automation_data_dir().join("cron.jsonl"));
     let cron_store: Arc<dyn CronJobStore> = Arc::new(
-        JsonlCronJobStore::open(automation_data_dir().join("cron.jsonl"))
+        JsonlCronJobStore::open(&cron_store_path)
             .await
             .map_err(|e| HostError::Automation(format!("cron store: {e}")))?,
     );
@@ -97,10 +106,11 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
         build_commitment_extractor(&config, main_router.clone(), cron_store.clone());
     let recall_selector = build_recall_selector(&config, main_router.clone());
     let session_store = Arc::new(SessionStore::default());
-    let mut core_tools = CoreToolRegistry::new_with_mcp_and_router(
+    let mut core_tools = CoreToolRegistry::new_with_mcp_and_router_and_cron_store_path(
         &config,
         Some(mcp_manager.tools()),
         Some(main_router.clone()),
+        Some(cron_store_path.clone()),
     );
     // Session self-inspection tools (tools-p1p2 Phase A). Read-only, so
     // they default to Approval::Off. Permission boundary (gap doc §6.6):
@@ -128,6 +138,29 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
             legion_runtime::tools::Approval::Off,
         ),
     )));
+    // Session goal tools (goal mode). They only ever read/write the goal file
+    // derived from the calling session's own key, so they default to
+    // Approval::Off — same rationale as todo_write.
+    if config.goals.enabled {
+        core_tools.register(Arc::new(crate::goal_tools::GetGoalTool::new(
+            legion_runtime::tools::Policy::from_config(
+                config.tools.get("get_goal"),
+                legion_runtime::tools::Approval::Off,
+            ),
+        )));
+        core_tools.register(Arc::new(crate::goal_tools::CreateGoalTool::new(
+            legion_runtime::tools::Policy::from_config(
+                config.tools.get("create_goal"),
+                legion_runtime::tools::Approval::Off,
+            ),
+        )));
+        core_tools.register(Arc::new(crate::goal_tools::UpdateGoalTool::new(
+            legion_runtime::tools::Policy::from_config(
+                config.tools.get("update_goal"),
+                legion_runtime::tools::Approval::Off,
+            ),
+        )));
+    }
     // image_generate (tools-p1p2 Phase B). Defaults to Approval::Required:
     // generation costs money and carries content risk (gap doc §4.3/§6.1).
     // Uses the main agent's router; per-model selection is a tool input.
@@ -149,9 +182,10 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
             legion_runtime::tools::Approval::Off,
         ),
     )));
+    let core_tools = Arc::new(core_tools);
     let mut agent_runtime = AgentRuntime::new(
-        main_router,
-        Arc::new(core_tools),
+        main_router.clone(),
+        core_tools.clone(),
         memory_backend,
         config.clone(),
     )
@@ -161,16 +195,31 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
     .with_selector(recall_selector)
     .with_surfaced(SurfacedStore::default());
     for agent in &config.agents.list {
-        agent_runtime = agent_runtime.with_agent_router(
-            agent.id.clone(),
-            Arc::new(build_provider_router(&config, &agent.id)?),
-        );
+        let router = routers
+            .get(&agent.id)
+            .cloned()
+            .unwrap_or_else(|| main_router.clone());
+        agent_runtime = agent_runtime.with_agent_router(agent.id.clone(), router);
     }
     let mut harness_registry = HarnessRegistry::new();
     if let Some(id) = config.agent_runtime.id.clone() {
         harness_registry = harness_registry.with_default(id);
     }
-    let agent_runtime = Arc::new(agent_runtime);
+
+    // Wire up the telemetry client when enabled. This creates the log
+    // directories on first use so observability is active by default.
+    let telemetry = if config.telemetry.enabled {
+        match TelemetryClient::from_config(&config.telemetry) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to initialize telemetry; continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let agent_runtime = Arc::new(agent_runtime.with_telemetry(telemetry));
     let spawner = Arc::new(RuntimeSubagentSpawner::new(
         agent_runtime.clone(),
         config.subagents.clone(),
@@ -185,11 +234,15 @@ pub async fn assemble_agent_host(config: Config) -> Result<super::host::AgentHos
     agent_runtime.set_messenger(Arc::new(
         crate::agent_messenger::RuntimeAgentMessenger::new(agent_runtime.clone(), config.clone()),
     ));
+
     harness_registry.register(agent_runtime);
     if let Some(command) = config.acp.command.clone() {
+        // Share the same fully-built registry with ACP so it sees the same
+        // MCP tools, session tools, image/tts tools, and cron scheduler tools
+        // as the main runtime.
         harness_registry.register(Arc::new(legion_acp::AcpHarness::new(
             command,
-            Arc::new(CoreToolRegistry::new(&config)),
+            core_tools.clone(),
             config.clone(),
         )));
     }
@@ -264,8 +317,27 @@ pub(crate) fn build_provider_router(
     Ok(router)
 }
 
+/// Build one router per agent (including the implicit `main` agent) so that
+/// auth profiles, provider configs, aliases, and fallbacks are loaded exactly
+/// once. Callers reuse the returned map instead of calling
+/// [`build_provider_router`] repeatedly.
+pub(crate) fn build_provider_routers(
+    config: &Config,
+) -> Result<HashMap<String, Arc<ProviderRouter>>, HostError> {
+    let mut routers = HashMap::new();
+    let mut ids: Vec<String> = config.agents.list.iter().map(|a| a.id.clone()).collect();
+    if !ids.iter().any(|id| id == "main") {
+        ids.push("main".to_string());
+    }
+    for id in ids {
+        routers.insert(id.clone(), Arc::new(build_provider_router(config, &id)?));
+    }
+    Ok(routers)
+}
+
 pub(crate) async fn build_memory_backend(
     config: &Config,
+    main_router: Arc<ProviderRouter>,
 ) -> Result<Arc<dyn MemoryBackend>, HostError> {
     let collection_path = config
         .memory
@@ -280,10 +352,7 @@ pub(crate) async fn build_memory_backend(
     let dimension = config.memory.builtin.embedding_dimension;
 
     let embedder: Arc<dyn Embedder> = match &config.memory.builtin.embedding_provider {
-        Some(model_ref) => {
-            let router = Arc::new(build_provider_router(config, "main")?);
-            Arc::new(ProviderEmbedder::new(router, model_ref, dimension))
-        }
+        Some(model_ref) => Arc::new(ProviderEmbedder::new(main_router, model_ref, dimension)),
         None => Arc::new(FakeEmbedder::new(dimension)),
     };
 
@@ -430,7 +499,8 @@ mod tests {
         ))
         .unwrap();
 
-        let backend = build_memory_backend(&config).await.unwrap();
+        let router = Arc::new(build_provider_router(&config, "main").unwrap());
+        let backend = build_memory_backend(&config, router).await.unwrap();
 
         // The backend should be able to search the indexed MEMORY.md.
         let notes = backend.search("dark mode", 5).await.unwrap();

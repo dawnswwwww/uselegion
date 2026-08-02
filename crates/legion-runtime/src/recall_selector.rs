@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
 use legion_provider::router::ProviderRouter;
 use legion_provider::types::{ChatMessage, ChatRequest};
 
@@ -63,30 +62,16 @@ impl LlmRecallSelector {
             vec![ChatMessage::system(SYSTEM_PROMPT), ChatMessage::user(user)],
         );
 
-        let text = match tokio::time::timeout(self.timeout, self.router.chat(&self.model_ref, req))
-            .await
+        let text = match crate::llm::chat_text_with_timeout(
+            &self.router,
+            &self.model_ref,
+            req,
+            self.timeout,
+        )
+        .await
         {
-            Ok(Ok(mut stream)) => {
-                let mut buf = String::new();
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(c) => buf.push_str(&c.delta),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "recall selector stream error");
-                            return fallback(candidates, limit);
-                        }
-                    }
-                }
-                buf
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "recall selector LLM call failed");
-                return fallback(candidates, limit);
-            }
-            Err(_) => {
-                tracing::warn!("recall selector LLM call timed out");
-                return fallback(candidates, limit);
-            }
+            Some(text) => text,
+            None => return fallback(candidates, limit),
         };
 
         let indices = parse_indices(&text);
@@ -120,13 +105,7 @@ fn fallback(candidates: Vec<MemoryNote>, limit: usize) -> Vec<MemoryNote> {
 
 /// Extract the first JSON array of non-negative integers from the model output.
 fn parse_indices(text: &str) -> Vec<usize> {
-    let (Some(s), Some(e)) = (text.find('['), text.rfind(']')) else {
-        return Vec::new();
-    };
-    if e < s {
-        return Vec::new();
-    }
-    serde_json::from_str::<Vec<usize>>(&text[s..=e]).unwrap_or_default()
+    crate::llm::extract_json_array(text).unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -1,12 +1,11 @@
 use crate::auth::AuthProfile;
+use crate::http;
 use crate::provider::Provider;
 use crate::types::{
     ChatChunk, ChatRequest, ChatRole, ChatStream, EmbedRequest, Embedding, FinishReason,
-    FunctionCall, ModelInfo, ProviderError, ToolCall,
+    FunctionCall, ModelInfo, ProviderError, ToolCall, merged_system_text, parse_tool_arguments,
 };
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -42,17 +41,10 @@ impl GeminiProvider {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::HeaderName::from_static("x-goog-api-key"),
-            reqwest::header::HeaderValue::from_str(key)
-                .map_err(|e| ProviderError::InvalidAuth(e.to_string()))?,
-        );
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
+            http::header_value(key)?,
         );
 
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?;
+        let client = http::json_client(headers)?;
 
         Ok(Self {
             id: id.into(),
@@ -108,37 +100,19 @@ impl Provider for GeminiProvider {
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
         let mut body = serde_json::to_value(to_gemini_request(&req))?;
-        for (k, v) in &req.extra {
-            body[k] = v.clone();
-        }
+        req.apply_extra_to(&mut body);
         let url = self.chat_url(&req.model);
         tracing::debug!(url = %url, body = %serde_json::to_string(&body).unwrap_or_default(), "Gemini chat request");
 
-        let response = self.client.post(&url).json(&body).send().await?;
+        let response =
+            http::check_status(self.client.post(&url).json(&body).send().await?, false).await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
-
-        let stream = response
-            .bytes_stream()
-            .eventsource()
-            .map(|event| match event {
-                Ok(event) => {
-                    let parsed: Result<GeminiStreamChunk, _> = serde_json::from_str(&event.data);
-                    match parsed {
-                        Ok(chunk) => Ok(chunk.into_chat_chunk()),
-                        Err(err) => Err(ProviderError::SseParse(err.to_string())),
-                    }
-                }
-                Err(err) => Err(ProviderError::SseParse(err.to_string())),
-            });
-
-        Ok(Box::pin(stream))
+        Ok(http::sse_stream(response, (), |_state, data| {
+            Some(
+                http::parse_sse_json::<GeminiStreamChunk>(data)
+                    .map(|chunk| chunk.into_chat_chunk()),
+            )
+        }))
     }
 
     async fn embed(&self, req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
@@ -193,13 +167,7 @@ fn to_gemini_request(req: &ChatRequest) -> GeminiRequest {
         }
     }
 
-    let system_text = req
-        .messages
-        .iter()
-        .filter(|m| m.role == ChatRole::System)
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let system_text = merged_system_text(&req.messages);
     let system_instruction = if system_text.is_empty() {
         None
     } else {
@@ -236,8 +204,7 @@ fn to_gemini_request(req: &ChatRequest) -> GeminiRequest {
                 }
                 if let Some(calls) = &m.tool_calls {
                     for call in calls {
-                        let args = serde_json::from_str(&call.function.arguments)
-                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                        let args = parse_tool_arguments(&call.function.arguments);
                         parts.push(GeminiPart {
                             text: None,
                             function_call: Some(GeminiFunctionCall {
@@ -474,6 +441,7 @@ struct GeminiEmbedding {
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ToolDefinition};
+    use futures::StreamExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

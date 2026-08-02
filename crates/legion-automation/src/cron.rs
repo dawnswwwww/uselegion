@@ -7,14 +7,15 @@ use crate::tasks::{SharedTaskStore, Task, TaskKind};
 use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
 use cron::Schedule;
 use futures::StreamExt;
-use legion_runtime::{Harness, RunRequest};
+use legion_provider::model_ref::resolve_agent_model;
+use legion_runtime::{ApprovalGate, Harness, RunRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -25,6 +26,10 @@ pub enum CronError {
     InvalidExpression(String),
     #[error("job '{0}' not found")]
     NotFound(String),
+    #[error("job id '{0}' already exists")]
+    DuplicateId(String),
+    #[error("job '{0}' is already running")]
+    AlreadyRunning(String),
     #[error("task store error: {0}")]
     TaskStore(#[from] crate::tasks::TaskStoreError),
     #[error("I/O error: {0}")]
@@ -66,14 +71,21 @@ pub struct CronJob {
 
 impl CronJob {
     /// Compute the next scheduled run time for this job.
+    ///
+    /// Cron fields are interpreted in the **local** timezone (standard cron
+    /// semantics): a schedule like `53 18 16 7 *` fires at 18:53 local time,
+    /// not 18:53 UTC. The returned instant is always UTC.
     pub fn compute_next_run(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         if self.schedule == "__at__" {
             return self.at.filter(|t| *t > after);
         }
         match normalize_cron_expression(&self.schedule) {
-            Ok(normalized) => Schedule::from_str(&normalized)
-                .ok()
-                .and_then(|schedule| schedule.after(&after).next()),
+            Ok(normalized) => Schedule::from_str(&normalized).ok().and_then(|schedule| {
+                schedule
+                    .after(&after.with_timezone(&Local))
+                    .next()
+                    .map(|next| next.with_timezone(&Utc))
+            }),
             Err(_) => None,
         }
     }
@@ -99,10 +111,25 @@ pub trait CronJobStore: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<CronJob>, CronError>;
 }
 
+type JobMap = HashMap<String, CronJob>;
+type SharedJobMap = Arc<Mutex<JobMap>>;
+type SharedJobMapWeak = Weak<Mutex<JobMap>>;
+type PathSharedMap = HashMap<PathBuf, SharedJobMapWeak>;
+
+/// In-memory job cache shared across all [`JsonlCronJobStore`] instances that
+/// point to the same file path. This lets the cron scheduler and the
+/// `scheduler_*` tools (which each construct their own store handle) see each
+/// other's writes without having to reload the JSONL file on every tick.
+static STORE_CACHE: OnceLock<std::sync::Mutex<PathSharedMap>> = OnceLock::new();
+
+fn store_cache() -> &'static std::sync::Mutex<PathSharedMap> {
+    STORE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 /// JSONL-backed cron job store.
 pub struct JsonlCronJobStore {
     path: PathBuf,
-    jobs: Mutex<HashMap<String, CronJob>>,
+    jobs: SharedJobMap,
 }
 
 impl JsonlCronJobStore {
@@ -111,11 +138,28 @@ impl JsonlCronJobStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+
+        // Reuse the in-memory map for this path if one is still alive. This
+        // keeps the scheduler loop and the agent tools in sync even when they
+        // open separate store handles at the same path.
+        {
+            let mut cache = store_cache().lock().unwrap();
+            if let Some(weak) = cache.get(&path) {
+                if let Some(arc) = weak.upgrade() {
+                    return Ok(Self { path, jobs: arc });
+                }
+                // The old handle was dropped; clean up the stale entry.
+                cache.remove(&path);
+            }
+        }
+
         let jobs = Self::load(&path).await?;
-        Ok(Self {
-            path,
-            jobs: Mutex::new(jobs),
-        })
+        let jobs = Arc::new(Mutex::new(jobs));
+        {
+            let mut cache = store_cache().lock().unwrap();
+            cache.insert(path.clone(), Arc::downgrade(&jobs));
+        }
+        Ok(Self { path, jobs })
     }
 
     async fn load(path: &Path) -> Result<HashMap<String, CronJob>, CronError> {
@@ -143,50 +187,24 @@ impl JsonlCronJobStore {
     }
 
     async fn save(&self, jobs: &HashMap<String, CronJob>) -> Result<(), CronError> {
-        // Crash-safe write: serialize into a uniquely-named temp file in the
-        // same directory, then rename over the target so a crash mid-write
-        // never leaves a truncated store behind.
-        let tmp = tmp_path_for(&self.path);
-        let written = async {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            for job in jobs.values() {
-                let line = serde_json::to_string(job)?;
-                file.write_all(line.as_bytes()).await?;
-                file.write_all(b"\n").await?;
-            }
-            file.flush().await?;
-            Ok::<(), CronError>(())
+        let mut buf = Vec::new();
+        for job in jobs.values() {
+            let line = serde_json::to_string(job)?;
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
         }
-        .await;
-        if let Err(err) = written {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err);
-        }
-        if let Err(err) = tokio::fs::rename(&tmp, &self.path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err.into());
-        }
+        legion_core::fs::atomic_write_async(&self.path, &buf).await?;
         Ok(())
     }
-}
-
-/// Unique temp path next to `path` for atomic write-then-rename persistence.
-fn tmp_path_for(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "store".to_string());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    path.with_file_name(format!("{file_name}.tmp-{}-{nanos}", std::process::id()))
 }
 
 #[async_trait::async_trait]
 impl CronJobStore for JsonlCronJobStore {
     async fn create(&self, job: CronJob) -> Result<(), CronError> {
         let mut jobs = self.jobs.lock().await;
+        if jobs.contains_key(&job.id) {
+            return Err(CronError::DuplicateId(job.id.clone()));
+        }
         jobs.insert(job.id.clone(), job);
         self.save(&jobs).await
     }
@@ -222,6 +240,13 @@ impl CronJobStore for JsonlCronJobStore {
 /// A thread-safe boxed cron job store.
 pub type SharedCronJobStore = Arc<dyn CronJobStore>;
 
+/// Sink for cron job run events. The scheduler invokes this closure for every
+/// event emitted while driving a scheduled run, allowing observers (e.g. the
+/// TUI) to render progress without blocking the scheduler. The first argument
+/// is the run id (the cron task id) so the observer can shape payloads exactly
+/// like regular agent runs.
+pub type CronEventSink = Arc<dyn Fn(&str, legion_runtime::RunEvent) + Send + Sync>;
+
 /// Builder for adding a new cron job.
 #[derive(Debug, Clone)]
 pub struct AddJobRequest {
@@ -229,10 +254,33 @@ pub struct AddJobRequest {
     pub agent_id: String,
     pub message: String,
     pub at: Option<DateTime<Utc>>,
+    /// Human-readable job name. Defaults to an empty string if not set.
+    pub name: String,
+    /// Whether the job is enabled. Defaults to `true`.
+    pub enabled: bool,
     /// When set together with the `"__webhook__"` schedule, creates a
     /// webhook-only job that is triggered via `POST /webhook/{id}` and skips
     /// cron-expression validation.
     pub webhook_secret: Option<String>,
+    /// Optional ID prefix. When `Some`, the job id becomes `{prefix}-{ts}-{n}`,
+    /// otherwise it defaults to `cron-{ts}-{n}`. Used to distinguish jobs that
+    /// belong to different scopes (e.g. session-level vs. global gateway loops).
+    pub id_prefix: Option<String>,
+}
+
+impl Default for AddJobRequest {
+    fn default() -> Self {
+        Self {
+            schedule: String::new(),
+            agent_id: String::new(),
+            message: String::new(),
+            at: None,
+            name: String::new(),
+            enabled: true,
+            webhook_secret: None,
+            id_prefix: None,
+        }
+    }
 }
 
 /// Scheduler that owns cron jobs, dispatches executions, and records tasks.
@@ -241,6 +289,61 @@ pub struct CronScheduler {
     task_store: SharedTaskStore,
     runtime: Arc<dyn Harness>,
     config: legion_core::config::Config,
+    /// Optional observer for run events produced by scheduled jobs. Used by
+    /// the local TUI to render cron output in the current window.
+    event_sink: Option<CronEventSink>,
+    /// Optional approval gate attached to every scheduled run. The local TUI
+    /// uses this to propagate `--yolo` into session loops so unattended cron
+    /// jobs can auto-approve tool prompts instead of waiting for a human who
+    /// is not present.
+    approval_gate: Option<Arc<ApprovalGate>>,
+    /// Job ids currently being executed. Prevents the same job from being
+    /// triggered twice concurrently by overlapping ticks or by a manual `run`
+    /// while a scheduled tick is already in progress.
+    in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Create a cron job in `store` from `req`, applying the same validation,
+/// id generation, and `next_run` calculation regardless of who calls it.
+pub async fn create_job(
+    store: &dyn CronJobStore,
+    req: AddJobRequest,
+) -> Result<CronJob, CronError> {
+    let is_webhook_only = req.webhook_secret.is_some() && req.schedule == "__webhook__";
+    let schedule = if let Some(at) = req.at {
+        if req.schedule != "__at__" {
+            return Err(CronError::InvalidExpression(
+                "one-shot job must use __at__ schedule".to_string(),
+            ));
+        }
+        validate_at(at)?;
+        "__at__".to_string()
+    } else if is_webhook_only {
+        // Webhook-only job: no clock schedule, so no cron validation.
+        "__webhook__".to_string()
+    } else {
+        validate_cron(&req.schedule)?;
+        req.schedule.clone()
+    };
+
+    let prefix = req.id_prefix.as_deref().unwrap_or("cron");
+    let id = crate::generate_job_id(prefix);
+    let mut job = CronJob {
+        id,
+        agent_id: req.agent_id,
+        message: req.message,
+        name: req.name,
+        schedule,
+        at: req.at,
+        enabled: req.enabled,
+        created_at: Utc::now(),
+        next_run: None,
+        last_run: None,
+        webhook_secret: req.webhook_secret,
+    };
+    job.refresh_next_run();
+    store.create(job.clone()).await?;
+    Ok(job)
 }
 
 impl CronScheduler {
@@ -255,53 +358,30 @@ impl CronScheduler {
             task_store,
             runtime,
             config,
+            event_sink: None,
+            approval_gate: None,
+            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Attach an event sink that will receive every [`RunEvent`] emitted while
+    /// driving a scheduled job.
+    pub fn with_event_sink(mut self, sink: CronEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    /// Attach an approval gate that every scheduled run will use. When the
+    /// gate auto-approves, unattended cron jobs can execute tools that would
+    /// otherwise prompt for approval and time out.
+    pub fn with_approval_gate(mut self, gate: Arc<ApprovalGate>) -> Self {
+        self.approval_gate = Some(gate);
+        self
     }
 
     /// Add a new recurring or one-shot cron job.
     pub async fn add(&self, req: AddJobRequest) -> Result<CronJob, CronError> {
-        let is_webhook_only = req.webhook_secret.is_some() && req.schedule == "__webhook__";
-        let schedule = if let Some(at) = req.at {
-            if req.schedule != "__at__" {
-                return Err(CronError::InvalidExpression(
-                    "one-shot job must use __at__ schedule".to_string(),
-                ));
-            }
-            validate_at(at)?;
-            "__at__".to_string()
-        } else if is_webhook_only {
-            // Webhook-only job: no clock schedule, so no cron validation.
-            "__webhook__".to_string()
-        } else {
-            validate_cron(&req.schedule)?;
-            req.schedule.clone()
-        };
-
-        let id = {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(1);
-            format!(
-                "cron-{}-{}",
-                Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            )
-        };
-        let mut job = CronJob {
-            id,
-            agent_id: req.agent_id,
-            message: req.message,
-            name: String::new(),
-            schedule,
-            at: req.at,
-            enabled: true,
-            created_at: Utc::now(),
-            next_run: None,
-            last_run: None,
-            webhook_secret: req.webhook_secret,
-        };
-        job.refresh_next_run();
-        self.job_store.create(job.clone()).await?;
-        Ok(job)
+        create_job(&*self.job_store, req).await
     }
 
     /// List all cron jobs.
@@ -326,7 +406,12 @@ impl CronScheduler {
             .get(id)
             .await?
             .ok_or_else(|| CronError::NotFound(id.to_string()))?;
-        self.execute(job).await
+        if !self.acquire_job(&job.id).await {
+            return Err(CronError::AlreadyRunning(job.id.clone()));
+        }
+        let result = self.execute(job).await;
+        self.release_job(id).await;
+        result
     }
 
     /// Check for jobs that are due and execute them. One-shot jobs are removed
@@ -345,7 +430,12 @@ impl CronScheduler {
             }
             if let Some(next_run) = job.next_run {
                 if next_run <= now {
+                    if !self.acquire_job(&job.id).await {
+                        warn!(job_id = %job.id, "skipping tick; job already running");
+                        continue;
+                    }
                     let result = self.execute(job.clone()).await;
+                    self.release_job(&job.id).await;
                     if job.is_one_shot() {
                         if let Err(err) = self.job_store.remove(&job.id).await {
                             warn!(job_id = %job.id, error = %err, "failed to remove one-shot job");
@@ -365,6 +455,14 @@ impl CronScheduler {
         results
     }
 
+    async fn acquire_job(&self, job_id: &str) -> bool {
+        self.in_flight.lock().await.insert(job_id.to_string())
+    }
+
+    async fn release_job(&self, job_id: &str) {
+        self.in_flight.lock().await.remove(job_id);
+    }
+
     async fn execute(&self, job: CronJob) -> Result<Task, CronError> {
         let task_id = format!(
             "task-cron-{}",
@@ -375,8 +473,8 @@ impl CronScheduler {
         task.mark_running();
         self.task_store.create(task.clone()).await?;
 
-        let model_ref = resolve_model(&self.config, &job.agent_id);
-        let request = RunRequest::new(
+        let model_ref = resolve_agent_model(&self.config, &job.agent_id);
+        let mut request = RunRequest::new(
             task.session_id.clone().unwrap_or_default(),
             &job.agent_id,
             &job.message,
@@ -385,7 +483,12 @@ impl CronScheduler {
         .with_system_prompt(format!(
             "You are running a scheduled cron job ({}). Execute the following instruction:",
             job.id
-        ));
+        ))
+        // Cron runs are unattended; do not claim an interactive human is present.
+        .with_interactive(false);
+        if let Some(gate) = &self.approval_gate {
+            request = request.with_approval_gate(gate.clone());
+        }
 
         let mut stream = match self.runtime.run(request) {
             Ok(stream) => stream,
@@ -399,12 +502,15 @@ impl CronScheduler {
         // Drive the stream to completion so the task record captures outcome.
         let mut saw_error = None;
         while let Some(event) = stream.next().await {
+            if let Some(sink) = &self.event_sink {
+                sink(&task_id, event.clone());
+            }
             if let legion_runtime::RunEvent::Lifecycle {
                 phase: legion_runtime::LifecyclePhase::Error,
                 error,
-            } = event
+            } = &event
             {
-                saw_error = error;
+                saw_error = error.clone();
                 break;
             }
         }
@@ -451,23 +557,14 @@ fn validate_at(at: DateTime<Utc>) -> Result<(), CronError> {
     Ok(())
 }
 
-fn resolve_model(config: &legion_core::config::Config, agent_id: &str) -> String {
-    if agent_id == "main" {
-        config.agents.defaults.model.clone()
-    } else {
-        config
-            .agents
-            .list
-            .iter()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.model.clone())
-            .or_else(|| config.agents.defaults.model.clone())
-    }
-    .unwrap_or_else(|| "openai/gpt-4o".to_string())
-}
-
 fn session_key_for_cron(job: &CronJob) -> String {
-    format!("agent:{}:cron:cron:default:direct:{}", job.agent_id, job.id)
+    legion_plugin_sdk::session_key::direct_session_key(
+        &job.agent_id,
+        "cron",
+        "cron",
+        "default",
+        &job.id,
+    )
 }
 
 /// Verify a GitHub-style webhook signature header against the request body.
@@ -693,6 +790,31 @@ mod tests {
     }
 
     #[test]
+    fn cron_fields_are_interpreted_in_local_time() {
+        use chrono::Timelike;
+        // `30 12 * * *` (12:30 every day) must fire at 12:30 local, not 12:30 UTC.
+        let job = CronJob {
+            id: "j-local".to_string(),
+            agent_id: "main".to_string(),
+            message: "lunch".to_string(),
+            name: String::new(),
+            schedule: "30 12 * * *".to_string(),
+            at: None,
+            enabled: true,
+            created_at: Utc::now(),
+            next_run: None,
+            last_run: None,
+            webhook_secret: None,
+        };
+        let next = job
+            .compute_next_run(Utc::now())
+            .expect("next run computable");
+        let local_next = next.with_timezone(&Local);
+        assert_eq!(local_next.hour(), 12);
+        assert_eq!(local_next.minute(), 30);
+    }
+
+    #[test]
     fn should_calculate_next_run_for_one_shot_job() {
         let future = Utc::now() + ChronoDuration::hours(2);
         let job = CronJob {
@@ -749,6 +871,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn separate_handles_at_same_path_share_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.jsonl");
+
+        let tool_store = JsonlCronJobStore::open(&path).await.unwrap();
+        let scheduler_store = JsonlCronJobStore::open(&path).await.unwrap();
+
+        let job = CronJob {
+            id: "shared-1".to_string(),
+            agent_id: "main".to_string(),
+            message: "hello".to_string(),
+            name: String::new(),
+            schedule: "*/1 * * * *".to_string(),
+            at: None,
+            enabled: true,
+            created_at: Utc::now(),
+            next_run: None,
+            last_run: None,
+            webhook_secret: None,
+        };
+        tool_store.create(job).await.unwrap();
+
+        let jobs = scheduler_store.list().await.unwrap();
+        assert!(
+            jobs.iter().any(|j| j.id == "shared-1"),
+            "second handle must see the first handle's write: {jobs:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn should_add_recurring_job() {
         let (scheduler, _dir) = test_scheduler(false).await;
         let job = scheduler
@@ -756,8 +908,7 @@ mod tests {
                 schedule: "0 9 * * *".to_string(),
                 agent_id: "main".to_string(),
                 message: "daily report".to_string(),
-                at: None,
-                webhook_secret: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -765,6 +916,27 @@ mod tests {
         assert_eq!(job.agent_id, "main");
         assert_eq!(job.message, "daily report");
         assert!(job.next_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn add_with_id_prefix_uses_prefix() {
+        let (scheduler, _dir) = test_scheduler(false).await;
+        let job = scheduler
+            .add(AddJobRequest {
+                schedule: "0 9 * * *".to_string(),
+                agent_id: "main".to_string(),
+                message: "daily report".to_string(),
+                id_prefix: Some("session-cron".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            job.id.starts_with("session-cron-"),
+            "expected session-cron prefix, got {}",
+            job.id
+        );
     }
 
     #[tokio::test]
@@ -777,7 +949,7 @@ mod tests {
                 agent_id: "main".to_string(),
                 message: "once".to_string(),
                 at: Some(at),
-                webhook_secret: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -794,8 +966,7 @@ mod tests {
                 schedule: "not a cron".to_string(),
                 agent_id: "main".to_string(),
                 message: "x".to_string(),
-                at: None,
-                webhook_secret: None,
+                ..Default::default()
             })
             .await;
         assert!(matches!(result, Err(CronError::InvalidExpression(_))));
@@ -809,8 +980,7 @@ mod tests {
                 schedule: "0 9 * * *".to_string(),
                 agent_id: "main".to_string(),
                 message: "ping".to_string(),
-                at: None,
-                webhook_secret: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -829,8 +999,7 @@ mod tests {
                 schedule: "0 9 * * *".to_string(),
                 agent_id: "main".to_string(),
                 message: "ping".to_string(),
-                at: None,
-                webhook_secret: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -838,6 +1007,63 @@ mod tests {
         let task = scheduler.run(&job.id).await.unwrap();
         assert_eq!(task.status, crate::tasks::TaskStatus::Failed);
         assert!(task.error.unwrap().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_duplicate_job_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlCronJobStore::open(dir.path().join("cron.jsonl"))
+            .await
+            .unwrap();
+        let job = CronJob {
+            id: "cron-1".to_string(),
+            agent_id: "main".to_string(),
+            message: "first".to_string(),
+            name: String::new(),
+            schedule: "0 9 * * *".to_string(),
+            at: None,
+            enabled: true,
+            created_at: Utc::now(),
+            next_run: None,
+            last_run: None,
+            webhook_secret: None,
+        };
+        store.create(job.clone()).await.unwrap();
+
+        let mut duplicate = job;
+        duplicate.message = "second".to_string();
+        let err = store.create(duplicate).await.unwrap_err();
+        assert!(matches!(err, CronError::DuplicateId(id) if id == "cron-1"));
+    }
+
+    #[tokio::test]
+    async fn should_skip_tick_when_job_is_already_running() {
+        let (scheduler, _dir) = test_scheduler(false).await;
+        let job = scheduler
+            .add(AddJobRequest {
+                schedule: "* * * * * *".to_string(),
+                agent_id: "main".to_string(),
+                message: "ping".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Manually mark the job as in-flight.
+        assert!(scheduler.acquire_job(&job.id).await);
+
+        // tick() should see the job as due but skip it because it is running.
+        let results = scheduler.tick().await;
+        assert!(results.is_empty());
+
+        // A second manual run should also be rejected.
+        let err = scheduler.run(&job.id).await.unwrap_err();
+        assert!(matches!(err, CronError::AlreadyRunning(id) if id == job.id));
+
+        scheduler.release_job(&job.id).await;
+        // After release the job can run normally.
+        let task = scheduler.run(&job.id).await.unwrap();
+        assert_eq!(task.kind, TaskKind::Cron);
     }
 
     fn sign(secret: &str, body: &[u8]) -> String {
@@ -886,8 +1112,8 @@ mod tests {
                 schedule: "__webhook__".to_string(),
                 agent_id: "main".to_string(),
                 message: "deploy".to_string(),
-                at: None,
                 webhook_secret: Some("s3cret".to_string()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -907,8 +1133,7 @@ mod tests {
                 schedule: "__webhook__".to_string(),
                 agent_id: "main".to_string(),
                 message: "deploy".to_string(),
-                at: None,
-                webhook_secret: None,
+                ..Default::default()
             })
             .await;
         assert!(matches!(result, Err(CronError::InvalidExpression(_))));
@@ -922,8 +1147,7 @@ mod tests {
                 schedule: "0 9 * * *".to_string(),
                 agent_id: "main".to_string(),
                 message: "ping".to_string(),
-                at: None,
-                webhook_secret: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1042,7 +1266,7 @@ mod tests {
                 agent_id: "main".to_string(),
                 message: "too late".to_string(),
                 at: Some(Utc::now() - ChronoDuration::hours(1)),
-                webhook_secret: None,
+                ..Default::default()
             })
             .await;
         assert!(matches!(result, Err(CronError::InvalidExpression(_))));

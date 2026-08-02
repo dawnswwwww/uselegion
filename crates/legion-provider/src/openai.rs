@@ -1,13 +1,12 @@
 use crate::auth::AuthProfile;
+use crate::http;
 use crate::provider::Provider;
 use crate::types::{
-    ChatChunk, ChatRequest, ChatRole, ChatStream, EmbedRequest, Embedding, FinishReason,
-    FunctionCall, GeneratedImage, ImageRequest, ImageResponse, ModelInfo, ProviderError,
-    SpeechRequest, SpeechResponse, ToolCall,
+    ChatChunk, ChatRequest, ChatStream, EmbedRequest, Embedding, FinishReason, GeneratedImage,
+    ImageRequest, ImageResponse, ModelInfo, ProviderError, SpeechRequest, SpeechResponse,
+    ToolCallAccumulator, role_str,
 };
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -40,17 +39,10 @@ impl OpenAiProvider {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-                .map_err(|e| ProviderError::InvalidAuth(e.to_string()))?,
-        );
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
+            http::header_value(&format!("Bearer {key}"))?,
         );
 
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?;
+        let client = http::json_client(headers)?;
 
         Ok(Self {
             id: id.into(),
@@ -141,19 +133,9 @@ impl OpenAiProvider {
                 .collect();
             body["tools"] = serde_json::Value::Array(openai_tools);
         }
-        for (k, v) in &req.extra {
-            body[k] = v.clone();
-        }
+        req.apply_extra_to(&mut body);
 
         body
-    }
-
-    fn build_request(&self, url: &str, body: serde_json::Value) -> reqwest::RequestBuilder {
-        let mut builder = self.client.post(url).json(&body);
-        for (k, v) in &self.extra_headers {
-            builder = builder.header(k, v);
-        }
-        builder
     }
 }
 
@@ -170,42 +152,30 @@ impl Provider for OpenAiProvider {
     async fn chat(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
         let body = self.build_body(&req);
         tracing::debug!(url = %self.chat_url(), body = %serde_json::to_string(&body).unwrap_or_default(), "OpenAI chat request");
-        let response = self.build_request(&self.chat_url(), body).send().await?;
+        let response = http::check_status(
+            http::post_json(&self.client, &self.chat_url(), body, &self.extra_headers)
+                .send()
+                .await?,
+            true,
+        )
+        .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            if is_prompt_too_long(&text) {
-                return Err(ProviderError::PromptTooLong);
-            }
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
-
-        let stream = response.bytes_stream().eventsource().scan(
-            OpenAiToolAccumulator::default(),
-            |state, event| {
-                let result = match event {
-                    Ok(event) if event.data == "[DONE]" => Ok(ChatChunk {
+        Ok(http::sse_stream(
+            response,
+            ToolCallAccumulator::default(),
+            |state, data| {
+                if data == "[DONE]" {
+                    return Some(Ok(ChatChunk {
                         finish_reason: Some(FinishReason::Stop),
                         ..Default::default()
-                    }),
-                    Ok(event) => {
-                        let parsed: Result<OpenAiCompletionChunk, _> =
-                            serde_json::from_str(&event.data);
-                        match parsed {
-                            Ok(chunk) => chunk.into_chat_chunk(state),
-                            Err(err) => Err(ProviderError::JsonParse(err)),
-                        }
-                    }
-                    Err(err) => Err(ProviderError::SseParse(err.to_string())),
-                };
-                futures::future::ready(Some(result))
+                    }));
+                }
+                Some(
+                    http::parse_sse_json::<OpenAiCompletionChunk>(data)
+                        .and_then(|chunk| chunk.into_chat_chunk(state)),
+                )
             },
-        );
-
-        Ok(Box::pin(stream))
+        ))
     }
 
     async fn embed(&self, req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
@@ -214,8 +184,7 @@ impl Provider for OpenAiProvider {
             "input": req.input,
         });
 
-        let response = self
-            .build_request(&self.embed_url(), body)
+        let response = http::post_json(&self.client, &self.embed_url(), body, &self.extra_headers)
             .send()
             .await?
             .error_for_status()?;
@@ -243,15 +212,13 @@ impl Provider for OpenAiProvider {
             body["n"] = serde_json::Value::from(n);
         }
 
-        let response = self.build_request(&self.image_url(), body).send().await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
+        let response = http::check_status(
+            http::post_json(&self.client, &self.image_url(), body, &self.extra_headers)
+                .send()
+                .await?,
+            false,
+        )
+        .await?;
 
         let payload: OpenAiImageResponse = response.json().await?;
         Ok(ImageResponse {
@@ -275,36 +242,17 @@ impl Provider for OpenAiProvider {
             "response_format": format,
         });
 
-        let response = self.build_request(&self.speech_url(), body).send().await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
+        let response = http::check_status(
+            http::post_json(&self.client, &self.speech_url(), body, &self.extra_headers)
+                .send()
+                .await?,
+            false,
+        )
+        .await?;
 
         let audio = response.bytes().await?.to_vec();
         Ok(SpeechResponse { audio, format })
     }
-}
-
-fn role_str(role: &ChatRole) -> &'static str {
-    match role {
-        ChatRole::System => "system",
-        ChatRole::User => "user",
-        ChatRole::Assistant => "assistant",
-        ChatRole::Tool => "tool",
-    }
-}
-
-fn is_prompt_too_long(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("context_length_exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("prompt is too long")
-        || lower.contains("context overflow")
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,10 +276,6 @@ struct OpenAiDelta {
 }
 
 /// A partial tool-call delta as it appears in a single streaming chunk.
-///
-/// OpenAI spreads a tool call across multiple chunks: the first chunk usually
-/// contains `id`, `type`, and `function.name`, while subsequent chunks only
-/// append `function.arguments`.
 #[derive(Debug, Deserialize, Default)]
 struct OpenAiToolCallDelta {
     index: usize,
@@ -347,63 +291,33 @@ struct OpenAiFunctionDelta {
     arguments: Option<String>,
 }
 
-/// Accumulator that rebuilds complete tool calls from streaming deltas.
-#[derive(Debug, Default)]
-struct OpenAiToolAccumulator {
-    calls: HashMap<usize, PartialToolCall>,
-}
-
-#[derive(Debug, Default)]
-struct PartialToolCall {
-    id: String,
-    kind: String,
-    name: String,
-    arguments: String,
-}
-
-impl OpenAiToolAccumulator {
-    fn apply(&mut self, deltas: Vec<OpenAiToolCallDelta>) {
-        for d in deltas {
-            let entry = self.calls.entry(d.index).or_default();
-            if let Some(id) = d.id {
-                entry.id = id;
+/// Apply a batch of streaming tool-call deltas to the shared accumulator.
+///
+/// OpenAI spreads a tool call across multiple chunks: the first chunk usually
+/// contains `id`, `type`, and `function.name`, while subsequent chunks only
+/// append `function.arguments`.
+fn apply_tool_deltas(state: &mut ToolCallAccumulator, deltas: Vec<OpenAiToolCallDelta>) {
+    for d in deltas {
+        let entry = state.entry(d.index);
+        if let Some(id) = d.id {
+            entry.id = id;
+        }
+        if let Some(kind) = d.kind {
+            entry.kind = kind;
+        }
+        if let Some(function) = d.function {
+            if let Some(name) = function.name {
+                entry.name = name;
             }
-            if let Some(kind) = d.kind {
-                entry.kind = kind;
-            }
-            if let Some(function) = d.function {
-                if let Some(name) = function.name {
-                    entry.name = name;
-                }
-                if let Some(arguments) = function.arguments {
-                    entry.arguments.push_str(&arguments);
-                }
+            if let Some(arguments) = function.arguments {
+                entry.arguments.push_str(&arguments);
             }
         }
-    }
-
-    fn into_complete_calls(self) -> Vec<ToolCall> {
-        let mut indexed: Vec<_> = self.calls.into_iter().collect();
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed
-            .into_iter()
-            .map(|(_, p)| ToolCall {
-                id: p.id,
-                kind: p.kind,
-                function: FunctionCall {
-                    name: p.name,
-                    arguments: p.arguments,
-                },
-            })
-            .collect()
     }
 }
 
 impl OpenAiCompletionChunk {
-    fn into_chat_chunk(
-        self,
-        state: &mut OpenAiToolAccumulator,
-    ) -> Result<ChatChunk, ProviderError> {
+    fn into_chat_chunk(self, state: &mut ToolCallAccumulator) -> Result<ChatChunk, ProviderError> {
         let choice = self.choices.into_iter().next().unwrap_or_default();
         let finish_reason = choice.finish_reason.and_then(|r| match r.as_str() {
             "stop" => Some(FinishReason::Stop),
@@ -414,7 +328,7 @@ impl OpenAiCompletionChunk {
         });
 
         if let Some(deltas) = choice.delta.tool_calls {
-            state.apply(deltas);
+            apply_tool_deltas(state, deltas);
         }
 
         let tool_calls = if finish_reason == Some(FinishReason::ToolCalls) {
@@ -493,19 +407,8 @@ mod tests {
     }
 
     #[test]
-    fn detects_prompt_too_long_from_error_body() {
-        assert!(is_prompt_too_long(
-            r#"{"error":{"code":"context_length_exceeded","message":"..."}}"#
-        ));
-        assert!(is_prompt_too_long(
-            "This model's maximum context length is 8192 tokens"
-        ));
-        assert!(!is_prompt_too_long("invalid_api_key"));
-    }
-
-    #[test]
     fn accumulates_streaming_tool_call_deltas() {
-        let mut state = OpenAiToolAccumulator::default();
+        let mut state = ToolCallAccumulator::default();
 
         let chunk1: OpenAiCompletionChunk = serde_json::from_str(
             r#"{

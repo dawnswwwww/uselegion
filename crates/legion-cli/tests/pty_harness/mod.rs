@@ -3,6 +3,8 @@
 //! Spawns the `legion` binary inside a pseudo-terminal, drives it with
 //! injected keystrokes, and captures the screen state via a small VTE parser.
 
+#![allow(dead_code)]
+
 pub mod screen;
 
 use std::io::{Read, Write};

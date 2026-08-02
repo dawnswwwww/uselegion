@@ -1,0 +1,19 @@
+{
+  "name": "@uselegion/cli-linux-arm64-musl",
+  "version": "0.0.0",
+  "description": "Prebuilt `legion` binary for Linux arm64 (musl, statically linked). Installed via @uselegion/cli.",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dawnswwwww/uselegion"
+  },
+  "files": [
+    "bin/"
+  ]
+}

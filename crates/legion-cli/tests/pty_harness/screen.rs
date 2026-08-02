@@ -4,6 +4,8 @@
 //! common cursor-movement / erase sequences emitted by ratatui + crossterm.
 //! It does not attempt to faithfully render colors, attributes, or wide cells.
 
+#![allow(dead_code)]
+
 #[derive(Debug, Clone)]
 pub struct Screen {
     rows: Vec<Vec<char>>,

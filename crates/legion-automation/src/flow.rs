@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use legion_core::config::{Config, FlowFailurePolicy, FlowStep, TaskFlow};
+use legion_provider::model_ref::resolve_agent_model;
 use legion_runtime::{Harness, LifecyclePhase, RunEvent, RunRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -186,8 +187,18 @@ impl FlowRunner {
         flow: &'a TaskFlow,
         step: &'a FlowStep,
     ) -> (&'a str, Result<(), String>) {
-        let model_ref = resolve_model(&self.config, &flow.agent_id);
-        let session_id = format!("agent:{}:flow:{}:{}", flow.agent_id, flow.id, step.name);
+        let model_ref = resolve_agent_model(&self.config, &flow.agent_id);
+        // One transcript per flow step: the peer id is `<flow>-<step>` so the
+        // key has the canonical seven-segment shape and the step session is
+        // resumable/inspectable like any other session.
+        let peer_id = format!("{}-{}", flow.id, step.name);
+        let session_id = legion_plugin_sdk::session_key::direct_session_key(
+            &flow.agent_id,
+            "flow",
+            "flow",
+            "default",
+            &peer_id,
+        );
         let request = RunRequest::new(&session_id, &flow.agent_id, &step.message, model_ref)
             .with_system_prompt(format!(
                 "You are executing step '{}' of task flow '{}'. Complete the following instruction:",
@@ -263,21 +274,6 @@ pub fn transitive_dependents<'a>(steps: &'a [FlowStep], failed: &str) -> HashSet
         }
     }
     skipped
-}
-
-fn resolve_model(config: &Config, agent_id: &str) -> String {
-    if agent_id == "main" {
-        config.agents.defaults.model.clone()
-    } else {
-        config
-            .agents
-            .list
-            .iter()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.model.clone())
-            .or_else(|| config.agents.defaults.model.clone())
-    }
-    .unwrap_or_else(|| "openai/gpt-4o".to_string())
 }
 
 #[cfg(test)]

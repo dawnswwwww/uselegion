@@ -1,4 +1,5 @@
 pub mod error;
+pub mod events;
 pub mod gateway;
 pub mod http;
 pub mod market;
@@ -7,6 +8,7 @@ pub mod nodes;
 pub mod observability;
 pub mod pairing;
 pub mod websocket;
+mod ws_rpc;
 
 // Re-export transport-neutral host types from legion-host so existing callers
 // (including integration tests and the CLI during the Phase 2 transition)

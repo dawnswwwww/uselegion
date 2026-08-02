@@ -49,11 +49,11 @@ pub(crate) struct WriterThread {
 impl WriterThread {
     /// Spawn a thread that writes every byte it receives to `out`.
     ///
-    /// Returns the buffered terminal writer, a clone of the underlying channel
-    /// sender for direct scrollback writes, and the thread handle.
-    pub(crate) fn spawn<W: Write + Send + 'static>(
-        mut out: W,
-    ) -> (TermWriter, Sender<Vec<u8>>, WriterThread) {
+    /// Returns the buffered terminal writer and the thread handle. The writer
+    /// is the sole producer of terminal bytes: all rendering (transcript,
+    /// status, input) flows through ratatui into this one channel, which is
+    /// what keeps regions from overlapping a second scrollback writer.
+    pub(crate) fn spawn<W: Write + Send + 'static>(mut out: W) -> (TermWriter, WriterThread) {
         let (tx, rx) = channel::<Vec<u8>>();
         let handle = std::thread::spawn(move || {
             while let Ok(bytes) = rx.recv() {
@@ -64,10 +64,9 @@ impl WriterThread {
         });
         (
             TermWriter {
-                tx: tx.clone(),
+                tx,
                 buf: Vec::new(),
             },
-            tx,
             WriterThread {
                 handle: Some(handle),
             },
@@ -107,14 +106,13 @@ mod tests {
     #[test]
     fn writer_thread_receives_and_writes_bytes() {
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
-        let (mut term_writer, scrollback_tx, thread) = WriterThread::spawn(buf.clone());
+        let (mut term_writer, thread) = WriterThread::spawn(buf.clone());
 
         write!(term_writer, "hello").unwrap();
         term_writer.flush().unwrap();
-        drop(term_writer);
-        // Dropping the last sender closes the channel so the writer thread can
+        // Dropping the writer closes the channel so the writer thread can
         // exit after draining.
-        drop(scrollback_tx);
+        drop(term_writer);
         thread.join().unwrap();
 
         assert_eq!(&*buf.0.lock().unwrap(), b"hello");

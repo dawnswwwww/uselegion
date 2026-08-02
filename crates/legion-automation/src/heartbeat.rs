@@ -102,9 +102,12 @@ impl Heartbeat {
 }
 
 fn session_key_for_heartbeat(agent_id: &str) -> String {
-    format!(
-        "agent:{}:heartbeat:heartbeat:default:direct:heartbeat",
-        agent_id
+    legion_plugin_sdk::session_key::direct_session_key(
+        agent_id,
+        "heartbeat",
+        "heartbeat",
+        "default",
+        "heartbeat",
     )
 }
 

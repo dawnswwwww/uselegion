@@ -166,6 +166,118 @@ impl ChatRequest {
             extra: HashMap::new(),
         }
     }
+
+    /// Merge the `extra` keys into a wire body, overwriting existing keys.
+    pub(crate) fn apply_extra_to(&self, body: &mut serde_json::Value) {
+        for (k, v) in &self.extra {
+            body[k] = v.clone();
+        }
+    }
+}
+
+/// Wire role string shared by the OpenAI-style message formats.
+pub(crate) fn role_str(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    }
+}
+
+/// Concatenate all system-message contents into one text block, for wire
+/// formats that take a single system field (Gemini, Bedrock).
+pub(crate) fn merged_system_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Parse accumulated tool-call arguments, treating malformed JSON as an
+/// empty object (wire formats require an object for `input`/`args`).
+pub(crate) fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Return the end index (exclusive) of the run of consecutive `Tool`
+/// messages starting at `start`, so callers can group them into one wire
+/// message.
+pub(crate) fn tool_run_end(messages: &[ChatMessage], start: usize) -> usize {
+    let mut end = start;
+    while end < messages.len() && messages[end].role == ChatRole::Tool {
+        end += 1;
+    }
+    end
+}
+
+/// Partially-accumulated tool call rebuilt from streaming deltas.
+#[derive(Debug, Default)]
+pub(crate) struct PartialToolCall {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl PartialToolCall {
+    fn into_tool_call(self) -> ToolCall {
+        ToolCall {
+            id: self.id,
+            kind: self.kind,
+            function: FunctionCall {
+                name: self.name,
+                arguments: self.arguments,
+            },
+        }
+    }
+}
+
+/// Accumulator that rebuilds complete tool calls from streaming deltas,
+/// keyed by the provider's tool-call index. Providers keep their own
+/// emission strategies; only the accumulate/complete bookkeeping is shared.
+#[derive(Debug, Default)]
+pub(crate) struct ToolCallAccumulator {
+    calls: HashMap<usize, PartialToolCall>,
+}
+
+impl ToolCallAccumulator {
+    /// Entry for in-place delta application (overwrite id/kind/name, append
+    /// arguments), as OpenAI-style streams require.
+    pub(crate) fn entry(&mut self, index: usize) -> &mut PartialToolCall {
+        self.calls.entry(index).or_default()
+    }
+
+    /// Start a new partial call at `index`, replacing any previous state.
+    pub(crate) fn start(&mut self, index: usize, partial: PartialToolCall) {
+        self.calls.insert(index, partial);
+    }
+
+    /// Append an arguments fragment to the partial call at `index`.
+    pub(crate) fn append_arguments(&mut self, index: usize, arguments: &str) {
+        if let Some(partial) = self.calls.get_mut(&index) {
+            partial.arguments.push_str(arguments);
+        }
+    }
+
+    /// Complete and remove the call at `index`.
+    pub(crate) fn finish(&mut self, index: usize) -> Option<ToolCall> {
+        self.calls
+            .remove(&index)
+            .map(PartialToolCall::into_tool_call)
+    }
+
+    /// Drain all accumulated calls, ordered by index.
+    pub(crate) fn into_complete_calls(self) -> Vec<ToolCall> {
+        let mut indexed: Vec<_> = self.calls.into_iter().collect();
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed
+            .into_iter()
+            .map(|(_, p)| p.into_tool_call())
+            .collect()
+    }
 }
 
 /// Tool definition for provider tool-use.

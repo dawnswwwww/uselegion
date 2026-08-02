@@ -1,8 +1,9 @@
 use crate::auth::AuthProfile;
+use crate::http;
 use crate::provider::Provider;
 use crate::types::{
-    ChatChunk, ChatRequest, ChatRole, ChatStream, EmbedRequest, Embedding, FinishReason,
-    FunctionCall, ModelInfo, ProviderError, ToolCall,
+    ChatChunk, ChatRequest, ChatStream, EmbedRequest, Embedding, FinishReason, FunctionCall,
+    ModelInfo, ProviderError, ToolCall, role_str,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -109,9 +110,7 @@ impl OllamaProvider {
                 .collect();
             body["tools"] = serde_json::Value::Array(ollama_tools);
         }
-        for (k, v) in &req.extra {
-            body[k] = v.clone();
-        }
+        req.apply_extra_to(&mut body);
 
         body
     }
@@ -156,14 +155,7 @@ impl Provider for OllamaProvider {
         tracing::debug!(url = %self.chat_url(), body = %serde_json::to_string(&body).unwrap_or_default(), "Ollama chat request");
 
         let response = self.client.post(self.chat_url()).json(&body).send().await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::StreamAborted(format!(
-                "HTTP {status}: {text}"
-            )));
-        }
+        let response = http::check_status(response, false).await?;
 
         // Ollama streams newline-delimited JSON (not SSE): each line is a
         // complete JSON object. Buffer bytes, split on newlines, and flush a
@@ -235,15 +227,6 @@ impl Provider for OllamaProvider {
             .enumerate()
             .map(|(index, embedding)| Embedding { index, embedding })
             .collect())
-    }
-}
-
-fn role_str(role: &ChatRole) -> &'static str {
-    match role {
-        ChatRole::System => "system",
-        ChatRole::User => "user",
-        ChatRole::Assistant => "assistant",
-        ChatRole::Tool => "tool",
     }
 }
 
@@ -366,7 +349,7 @@ struct OllamaTagModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::{ChatMessage, ChatRole};
     use std::collections::HashMap;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

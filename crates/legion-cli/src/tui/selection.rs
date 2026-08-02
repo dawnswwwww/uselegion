@@ -322,6 +322,7 @@ mod tests {
                 Line::from(vec![Span::raw("     "), Span::raw("world")]),
             ],
             think_hints: Vec::new(),
+            tool_hint: None,
         };
         let cache = vec![Some(rendered)];
         let sel = Selection::new(Cursor::new(0, 0, 0), Cursor::new(0, 1, 10));
@@ -340,6 +341,7 @@ mod tests {
             },
             lines: vec![Line::from(vec![Span::raw(text)])],
             think_hints: Vec::new(),
+            tool_hint: None,
         })
     }
 
@@ -399,6 +401,7 @@ mod tests {
                 Line::from(vec![Span::raw("L3")]),
             ],
             think_hints: Vec::new(),
+            tool_hint: None,
         })];
         let rects = vec![(0usize, Rect::new(1, 1, 78, 2), 2)];
         let cursor = position_to_cursor(Position::new(3, 1), &rects, &cache);

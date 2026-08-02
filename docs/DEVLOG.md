@@ -51,7 +51,7 @@
 | [sandbox-isolation](design/gaps/03-shallow/sandbox-isolation.md) | shallow | P0 | ✅ 已完成 | Phase A Linux restricted + Phase B macOS/sandbox_available | 2026-07-09 |
 | [plugin-facade](design/gaps/02-missing/plugin-facade.md) | missing | P0 | ✅ 已完成 | Phase A1+A2;Phase B/C 动态库/市场待后续 | 2026-07-09 |
 | [skills](design/gaps/02-missing/skills.md) | missing | P0 | ✅ 已完成 | Phase A+B+C 已完成;LLM 选择器已落地 | 2026-07-10 |
-| [mcp](design/gaps/02-missing/mcp.md) | missing | P1 | ✅ 已完成 | Phase A+B+C(stdio/http/sse/ws + 重连 + 指标 + CLI) | 2026-07-10 |
+| [mcp](design/gaps/02-missing/mcp.md) | missing | P1 | ✅ 已完成 | Phase A+B+C(stdio/http/sse/ws + 重连 + 指标 + CLI)+ 2026-07-31 协议升级(版本协商链/2026-07-28 stateless/Streamable HTTP/分页/内省 API + `legion mcp add/remove/get/status` + TUI `/mcp`) | 2026-07-31 |
 | [memory-layers](design/gaps/03-shallow/memory-layers.md) | shallow | P1 | ✅ 已完成 | Phase C 衰减合并 + LLM 召回 + 可配 limit + 跨轮去重 | 2026-07-10 |
 | [compaction](design/gaps/03-shallow/compaction.md) | shallow | P1 | ✅ 已完成 | Phase B/C/D | 2026-07-09 |
 | [multi-agent](design/gaps/02-missing/multi-agent.md) | missing | P1 | ✅ 已完成 | Phase A+B+C(Typed/Fork + spawn_subagent + run_coordinator + sidechain + 权限收敛 + 防护 + 审批默认拒绝)+ D(Swarm:in-process 命名 teammate + mailbox) | 2026-07-11 |
@@ -68,6 +68,58 @@
 ---
 
 ## 开发日志(最新在上)
+
+### 2026-07-31 · MCP 协议升级:版本协商链、2026-07-28 stateless、Streamable HTTP、内省 API 与 CLI/TUI 管理面
+- **type**: feature
+- **gap**: [mcp](design/gaps/02-missing/mcp.md)
+- **目标**:把 `legion-mcp` 从单一 2024-11-05 客户端升级为多版本协议客户端(2026-07-28 → 2024-11-05 协商链),http 传输升级 Streamable HTTP,补齐分页与 resources/prompts 内省,并把管理面扩为 claude-code 对齐的 `legion mcp` CLI 与 TUI `/mcp` slash 命令。
+- **改动**:
+  - `crates/legion-mcp/src/version.rs`(新):`SUPPORTED_VERSIONS`(2026-07-28/2025-11-25/2025-06-18/2025-03-26/2024-11-05,新→旧),`initialize` 按链回退,server 返回版本宽松采纳 + capabilities 存储,`protocolVersion` pin 跳过协商链。
+  - `crates/legion-mcp/src/client.rs`:2026-07-28 stateless 模式(无 `notifications/initialized`;`_meta` 携带 `io.modelcontextprotocol/clientInfo` + client 能力;`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` 头;-32601 → `server/discover` 回退);http 传输升级 Streamable HTTP(`Accept: application/json, text/event-stream`、SSE 帧解析、`Mcp-Session-Id` 捕获重发仅限 2025-xx、≥2025-03-26 initialize 后带版本头);tools/resources/prompts list 分页(cursor/nextCursor,100 页上限);新内省 API `list_resources`/`read_resource`/`list_prompts`/`get_prompt`(capability 门控,未知时宽松);`McpToolDesc` 带 annotations/outputSchema,结果带 structuredContent(附加进 legion 工具输出)。
+  - `crates/legion-mcp/src/manager.rs`:per-server 内省 + `server_status()` 快照(协议版本、capabilities、工具数)——UI/自查用,非 agent 工具。
+  - `crates/legion-core/src/config.rs`:`McpServerConfig` 新增 `protocolVersion`(`Option<String>`)与 `toolTimeoutMs`(默认 60000,全传输 per-request `tools/call` 超时)。
+  - `crates/legion-cli/src/mcp.rs` / `mcp_config.rs`:`legion mcp add`(`--transport stdio|http|sse|ws`、`--env`、`--header`、`--auto-approve`、`--protocol-version`、`--connect-timeout-ms`、`--tool-timeout-ms`,stdio 命令在 `--` 后)、`remove`/`get`/`status`(live:协商版本 + 工具数,不可达 `✗`)、增强 `list`(enabled + 传输摘要);`tools`/`reload` 不变。
+  - `crates/legion-cli/src/mcp_cmd.rs`(新):TUI `/mcp`(list/status/tools/resources/prompts/enable/disable/add/remove);配置编辑持久化 legion.json(备份 + schema 校验),重启生效;异步查询经 local-notice 通道回聊天。
+  - 文档:重写 `docs/design/gaps/02-missing/mcp.md`(现状 + 协议版本矩阵 + 剩余差距),更新 overview 与 README。
+- **决策**:
+  - legacy `sse` 传输(2024-11-05 双通道)保留——上游 deprecated 但有 12 个月 offramp。
+  - 内省 API 不进 agent 工具池,仅供 CLI/TUI 状态面。
+  - server→client 通知仍丢弃,`tools/list_changed` 实时刷新不做(见剩余差距)。
+- **验证**:全量 workspace build/clippy/test/fmt 由并行验证任务执行(本批次为 docs 收尾)。
+- **遗留**:OAuth flow(仅检测 401 + `WWW-Authenticate` 报 `oauth step-up required`,无 token/PKCE/CIMD);MRTR/elicitation/sampling;`ttlMs`/`cacheScope` 未解析;Tasks extension、subscriptions/listen;MCP 配置热加载(须重启)。
+
+### 2026-07-29 · TUI 修复:tracing 日志不再污染画面,输入框软换行
+- **type**: fix
+- **gap**: —
+- **目标**:修复两个交互 bug:①发送消息后日志与 TUI 画面交错、整屏错位;②长输入不换行(输入框横滚)。
+- **改动**(`crates/legion-cli/`):
+  - `main.rs`:TUI 模式(无子命令)下 tracing 从 stdout 重定向到 `~/.legion/tui.log`(对齐 gateway.log 惯例),打不开日志文件则丢弃;其他子命令保持原样。根因:`tracing_subscriber::fmt::init()` 写 stdout,发送消息后 host assembly / runtime 的 INFO/ERROR 日志直接注入 raw mode 画面(HEAD 即存在,PTY 复现确认)。
+  - `tui/composer.rs`:编辑状态仍由 tui-textarea 维护,渲染改为自绘——tui-textarea 0.7 不支持软换行(长行横滚),与"输入框随包裹内容长高"的布局契约冲突。自绘按内宽软换行、光标逻辑行下划线、REVERSED 光标格、placeholder(DarkGray)、垂直滚动保持光标可见。
+  - `tui/input.rs`:抽出 `wrap_display_line`(单逻辑行软换行);删除 `input_visual_lines`(调用方已改)。
+  - `tui/render.rs`:输入框高度改为按逻辑行逐行统计——修复旧计算把 `\n` 当宽度 1 字符导致多行输入(Alt+Enter)高度少算的 bug。
+  - 测试:composer 渲染 4 个(软换行/滚动保持光标可见/placeholder/光标行下划线);tui.rs 2 个渲染级(150 字符全可见且输入框长高、3 逻辑行 → 输入框 5 行)。
+- **决策**:
+  - 不升级/替换 tui-textarea(0.7 已是最新且无换行支持),编辑行为不变,只接管渲染。
+  - 换行算法全 crate 单一实现(`wrap_display_line`),高度计算与渲染必然一致。
+- **验证**:`cargo test -p legion-cli --lib` 293 全绿;PTY 端到端(假 ollama 配置 + `--local`)确认发送后画面干净、150 字符软换行可见。
+- **遗留**:软换行下 Up/Down 仍按逻辑行移动(非视觉行);宽字符跨边界的换行为贪心断行。
+
+### 2026-07-29 · TUI 输入区布局契约:修复状态栏遮挡输入框,布局收敛为优先级分配
+- **type**: fix
+- **gap**: —
+- **目标**:修复状态栏(不透明背景)渲染到输入区 chunk 上、整屏盖住输入框的 bug;把"输入框永远完整可见"写成明确的布局不变量并整体重设计输入区布局。
+- **改动**(`crates/legion-cli/`):
+  - `tui/render.rs`:新增纯函数 `plan_layout`,按优先级分配高度——input(clamp 3..=10,永远完整)> chat 保底 1 行(高度 ≥ 5)> status(2→1→0 行)> 面板(todo 先于 queue 牺牲,显示后 chat 须 ≥ 5 行);五区域高度之和恒等于屏高,`draw_ui` 改用五个 `Length` 约束 + 命名区域,杜绝裸 `chunks[N]` 索引错位(本次 bug 根因)。
+  - `tui/render.rs`:history 搜索弹窗从全屏居中改为限定在输入区上方的行范围内居中,空间不足不画;slash 补全菜单维持锚定输入区上边缘。浮层一律不得覆盖输入框。
+  - 测试:`render.rs` 新增 `plan_layout` 多档屏高(3/4/5/8/15/30)单元测试;`tui.rs` 新增渲染级回归测试 `input_box_not_covered_by_status_bar`(含 queue 面板存在时)与 `input_box_visible_on_tiny_terminals`。
+  - 文档:新增 `docs/design/tui-input-layout.md`(布局契约与降级链)。
+  - 顺带修复:未提交的 queue 面板/单选自动跳题改动遗漏更新的过时测试 `question_enter_selects_option_then_submit_tab_submits`,已按新行为(单选 Enter 自动跳到下一题)重写。
+- **决策**:
+  - 极端高度(≤ 4 行)输入框 3 行优先,chat 归零;高度 ≥ 5 时 chat 保底 1 行,输入框高度上限相应收 1 行。
+  - status 位置维持输入框下方;hints 行(status 第 2 行)在降级链中先于 status 第 1 行牺牲。
+  - 输入框 10 行硬上限不变,内容超出框内滚动,不改为比例上限。
+- **验证**:`cargo test -p legion-cli --lib` 287 全绿(含新增 10 个布局测试);`cargo clippy -p legion-cli --all-targets`、`cargo fmt -- --check` 通过。
+- **遗留**:无。
 
 ### 2026-07-25 · TUI 交互与视觉大修:主题持久化、取消/队列、指示器、OSC 8 与渲染修复
 - **type**: feature

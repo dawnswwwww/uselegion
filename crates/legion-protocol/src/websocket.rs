@@ -141,13 +141,33 @@ pub struct Features {
 
 impl Default for Features {
     fn default() -> Self {
+        // Keep this list in sync with the dispatch table in
+        // `legion_gateway::ws_rpc::handle`; the gateway has a test
+        // (`ws_rpc::tests::features_match_dispatch_table`) that fails when
+        // the two drift apart.
         Self {
             methods: vec![
                 "health".to_string(),
                 "status".to_string(),
                 "send".to_string(),
+                "webchat".to_string(),
                 "agent".to_string(),
+                "approval.resolve".to_string(),
+                "question.resolve".to_string(),
+                "channels".to_string(),
+                "memory.search".to_string(),
+                "sessions.history".to_string(),
                 "system-presence".to_string(),
+                "cron.list".to_string(),
+                "cron.add".to_string(),
+                "cron.remove".to_string(),
+                "cron.run".to_string(),
+                "tasks.list".to_string(),
+                "tasks.show".to_string(),
+                "tasks.create".to_string(),
+                "tasks.run".to_string(),
+                "flows.list".to_string(),
+                "flows.run".to_string(),
                 "nodes.list".to_string(),
                 "nodes.status".to_string(),
                 "node.invoke".to_string(),

@@ -15,12 +15,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use legion_core::config::Config;
+use legion_plugin_sdk::session_key::direct_session_key;
+use legion_provider::model_ref::resolve_agent_model;
 use legion_runtime::messenger::{AgentMessenger, MessengerError};
 use legion_runtime::{AgentRuntime, LifecyclePhase, RunEvent, RunRequest};
-
-/// MVP default model reference, same as the channel inbound router
-/// (`legion_channel::route_inbound_to_runtime`).
-const A2A_MODEL_REF: &str = "openai/gpt-4o";
 
 /// Check whether `from` may deliver a message to `to` under `config`.
 ///
@@ -46,7 +44,8 @@ pub fn check_allowed(config: &Config, from: &str, to: &str) -> Result<(), Messen
 
 /// [`AgentMessenger`] backed by the in-process [`AgentRuntime`]. Each
 /// delivery spawns a detached turn on the target agent with session key
-/// `agent:<to>:a2a:<from>`; the turn's events are only logged.
+/// `agent:<to>:a2a:a2a:default:direct:<from>`; the turn's events are only
+/// logged.
 pub struct RuntimeAgentMessenger {
     runtime: Arc<AgentRuntime>,
     config: Config,
@@ -68,12 +67,12 @@ impl AgentMessenger for RuntimeAgentMessenger {
     ) -> Result<String, MessengerError> {
         check_allowed(&self.config, from_agent, to_agent)?;
 
-        let session_key = format!("agent:{to_agent}:a2a:{from_agent}");
+        let session_key = direct_session_key(to_agent, "a2a", "a2a", "default", from_agent);
         let request = RunRequest::new(
             session_key.clone(),
             to_agent.to_string(),
             format!("[agent:{from_agent}] {message}"),
-            A2A_MODEL_REF.to_string(),
+            resolve_agent_model(&self.config, to_agent),
         )
         // Background delivery: approvals fail closed instead of waiting on a
         // human, same as sub-agent runs.

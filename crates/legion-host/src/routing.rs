@@ -1,5 +1,7 @@
 use legion_core::config::{Binding, BindingMatch, Config};
+use legion_core::util::iso_now;
 use legion_plugin_sdk::channel::{InboundMessage, PeerKind};
+use legion_plugin_sdk::session_key::{SessionKeyParts, build_session_key, parse_session_key};
 
 /// Resolves inbound messages to an `agent_id` using the configured bindings.
 ///
@@ -75,18 +77,10 @@ fn binding_matches(match_: &BindingMatch, msg: &InboundMessage) -> bool {
     true
 }
 
-/// Parsed components of a session key.
-#[derive(Debug, Clone)]
-pub struct SessionKeyParts {
-    pub _agent_id: String,
-    pub scope: String,
-    pub channel: String,
-    pub account_id: String,
-    pub peer_kind: PeerKind,
-    pub peer_id: String,
-}
-
-fn build_router_message(parts: &SessionKeyParts, content: &str) -> InboundMessage {
+/// Build the synthetic inbound message used to route a session key through
+/// the configured bindings. Shared by the WS `agent` RPC (`crate::turn`) and
+/// [`resolve_session_key`].
+pub(crate) fn build_router_message(parts: &SessionKeyParts, content: &str) -> InboundMessage {
     InboundMessage {
         channel: parts.channel.clone(),
         account_id: parts.account_id.clone(),
@@ -122,47 +116,6 @@ pub fn resolve_session_key(session_key: &str, router: &Router) -> Option<String>
     let router_msg = build_router_message(&parts, "");
     let agent_id = router.resolve_agent(&router_msg);
     Some(build_session_key(&agent_id, &parts))
-}
-
-pub fn parse_session_key(key: &str) -> Option<SessionKeyParts> {
-    let parts: Vec<&str> = key.split(':').collect();
-    if parts.len() != 7 || parts[0] != "agent" {
-        return None;
-    }
-    let peer_kind = match parts[5] {
-        "direct" => PeerKind::Direct,
-        "group" => PeerKind::Group,
-        "thread" => PeerKind::Thread,
-        _ => return None,
-    };
-    Some(SessionKeyParts {
-        _agent_id: parts[1].to_string(),
-        scope: parts[2].to_string(),
-        channel: parts[3].to_string(),
-        account_id: parts[4].to_string(),
-        peer_kind,
-        peer_id: parts[6].to_string(),
-    })
-}
-
-pub fn build_session_key(agent_id: &str, parts: &SessionKeyParts) -> String {
-    let peer_kind = match parts.peer_kind {
-        PeerKind::Direct => "direct",
-        PeerKind::Group => "group",
-        PeerKind::Thread => "thread",
-    };
-    format!(
-        "agent:{}:{}:{}:{}:{}:{}",
-        agent_id, parts.scope, parts.channel, parts.account_id, peer_kind, parts.peer_id
-    )
-}
-
-fn iso_now() -> String {
-    // Minimal ISO-like timestamp without adding a chrono dependency.
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| format!("{}.{:03}Z", d.as_secs(), d.subsec_millis()))
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

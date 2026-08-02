@@ -1,6 +1,13 @@
 # Gap:Compaction 缺工程化防线(无熔断/复灌/PTL/cache)
 
 > **实施状态**:Phase A/B/C/D 全部已实施,见 [`docs/DEVLOG.md`](../../../DEVLOG.md) 2026-07-09。遗留:ContextEngine 当前为 run-level 抽象,ingest/assemble/compact/after_turn 的完整生命周期接口待后续真正引入替代引擎时补齐。
+>
+> **更新(2026-07-29):`context_window` 来源优先级**。compaction 的触发窗口不再只有全局单一值,支持三层覆盖(仅覆盖 `context_window`,不影响 `buffer_tokens`/`threshold_ratio`/`max_summary_tokens`),优先级高→低:
+> 1. **模型名后缀**:`minimax/MiniMax-M3[1m]`、`[512k]`、`[200000]`(`k`=千、`m`=百万,大小写不敏感;非法后缀如 `[abc]`/`[1.5m]` 被忽略,退化为默认)。后缀在 `parse_model_ref` 剥离,发给 provider 的模型名保持干净。
+> 2. **per-model 配置表**:`compaction.context_windows: { "minimax/MiniMax-M3": 1000000 }`,键为去掉后缀的 `provider/model`。
+> 3. **全局兜底**:`compaction.context_window`(默认 128_000)。
+>
+> 解析收敛在 `Compactor::effective_context_window(model_ref)`(单一真相源),`should_compact` 按轮次按模型解析。**待办**:Provider 目录(`ModelInfo.context_window`,目前仅 Gemini/Bedrock 填值)接入为第 0 层自动来源,需把 `ProviderRouter` 目录引入 compactor 并补全各 provider 目录数据。
 
 | 字段 | 值 |
 |---|---|

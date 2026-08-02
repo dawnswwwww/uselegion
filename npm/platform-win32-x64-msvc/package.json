@@ -1,0 +1,19 @@
+{
+  "name": "@uselegion/cli-win32-x64-msvc",
+  "version": "0.0.0",
+  "description": "Prebuilt `legion` binary for Windows x86_64 (experimental). Installed via @uselegion/cli.",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dawnswwwww/uselegion"
+  },
+  "files": [
+    "bin/"
+  ]
+}

@@ -1,3 +1,7 @@
+use crate::util::{
+    Lifecycle, StopPolicy, cfg_required, cfg_str_or, ensure_success, send_json, slack_envelope,
+    ws_reconnect_loop,
+};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use legion_plugin_sdk::channel::{
@@ -9,7 +13,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Built-in Slack channel provider using Socket Mode.
@@ -23,10 +27,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 /// API in this environment.
 #[derive(Debug)]
 pub struct SlackProvider {
-    http: reqwest::Client,
-    config: Mutex<Option<SlackConfig>>,
-    running: Arc<AtomicBool>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    lifecycle: Lifecycle<SlackConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,10 +41,7 @@ struct SlackConfig {
 impl SlackProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
-            config: Mutex::new(None),
-            running: Arc::new(AtomicBool::new(false)),
-            task: Mutex::new(None),
+            lifecycle: Lifecycle::new(),
         }
     }
 }
@@ -68,6 +66,7 @@ impl ChannelProvider for SlackProvider {
             thread: true,
             reactions: true,
             typing: false,
+            buttons: false,
         }
     }
 
@@ -77,39 +76,53 @@ impl ChannelProvider for SlackProvider {
         inbound_tx: mpsc::Sender<InboundMessage>,
     ) -> Result<(), ChannelError> {
         let cfg = parse_config(config)?;
-        *self.config.lock().await = Some(cfg.clone());
-        self.running.store(true, Ordering::SeqCst);
 
-        let running = self.running.clone();
-        let http = self.http.clone();
+        let running = self.lifecycle.running.clone();
+        let http = self.lifecycle.http.clone();
         let account_id = cfg.account_id.clone();
+        let task_cfg = cfg.clone();
 
-        let handle = tokio::spawn(async move {
-            socket_loop(&http, &cfg, inbound_tx, running).await;
-        });
+        self.lifecycle
+            .begin(cfg, async move {
+                let mut state = ();
+                let open_http = http.clone();
+                let open_cfg = task_cfg.clone();
+                let serve_cfg = task_cfg.clone();
+                let serve_running = running.clone();
+                ws_reconnect_loop(
+                    "slack",
+                    &running,
+                    &mut state,
+                    move || {
+                        let http = open_http.clone();
+                        let task_cfg = open_cfg.clone();
+                        Box::pin(async move { open_socket_url(&http, &task_cfg).await })
+                    },
+                    move |_state: &mut (), url: String| {
+                        let task_cfg = serve_cfg.clone();
+                        let inbound_tx = inbound_tx.clone();
+                        let running = serve_running.clone();
+                        Box::pin(
+                            async move { run_socket(&url, &task_cfg, &inbound_tx, &running).await },
+                        )
+                    },
+                )
+                .await;
+            })
+            .await;
 
-        *self.task.lock().await = Some(handle);
         tracing::info!(channel = "slack", account = %account_id, "Slack channel started");
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), ChannelError> {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.task.lock().await.take() {
-            handle.abort();
-        }
-        *self.config.lock().await = None;
+        self.lifecycle.stop(StopPolicy::Abort).await;
         tracing::info!(channel = "slack", "Slack channel stopped");
         Ok(())
     }
 
     async fn send(&self, message: OutboundMessage) -> Result<(), ChannelError> {
-        let cfg = self
-            .config
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChannelError::NotStarted)?;
+        let cfg = self.lifecycle.config().await?;
 
         let mut payload = json!({
             "channel": message.peer.id,
@@ -122,72 +135,34 @@ impl ChannelProvider for SlackProvider {
         }
 
         let url = format!("{}/chat.postMessage", cfg.base_url);
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&cfg.bot_token)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".into());
-            return Err(ChannelError::SendFailed(format!(
-                "slack chat.postMessage failed: {status} {body}"
-            )));
-        }
-
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-        if body.get("ok").and_then(|o| o.as_bool()) != Some(true) {
-            let error = body
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown_error");
-            return Err(ChannelError::SendFailed(format!(
-                "slack chat.postMessage rejected: {error}"
-            )));
-        }
+        let response = send_json(
+            self.lifecycle.http.post(&url).bearer_auth(&cfg.bot_token),
+            &payload,
+        )
+        .await?;
+        let response = ensure_success(response, "slack chat.postMessage").await?;
+        slack_envelope(response, "slack chat.postMessage").await?;
 
         Ok(())
     }
 }
 
 fn parse_config(config: Value) -> Result<SlackConfig, ChannelError> {
-    let bot_token = config
-        .get("botToken")
-        .or_else(|| config.get("bot_token"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChannelError::InvalidConfig("slack botToken is required".into()))?
-        .to_string();
+    let bot_token = cfg_required(
+        &config,
+        &["botToken", "bot_token"],
+        "slack botToken is required",
+    )?;
 
-    let app_token = config
-        .get("appToken")
-        .or_else(|| config.get("app_token"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChannelError::InvalidConfig("slack appToken is required".into()))?
-        .to_string();
+    let app_token = cfg_required(
+        &config,
+        &["appToken", "app_token"],
+        "slack appToken is required",
+    )?;
 
-    let base_url = config
-        .get("baseUrl")
-        .or_else(|| config.get("base_url"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://slack.com/api")
-        .to_string();
+    let base_url = cfg_str_or(&config, &["baseUrl", "base_url"], "https://slack.com/api");
 
-    let account_id = config
-        .get("accountId")
-        .or_else(|| config.get("account_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+    let account_id = cfg_str_or(&config, &["accountId", "account_id"], "default");
 
     Ok(SlackConfig {
         bot_token,
@@ -321,32 +296,6 @@ async fn open_socket_url(http: &reqwest::Client, cfg: &SlackConfig) -> Result<St
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| "apps.connections.open response missing url".to_string())
-}
-
-/// Outer reconnect loop: re-open the socket connection until stopped.
-async fn socket_loop(
-    http: &reqwest::Client,
-    cfg: &SlackConfig,
-    inbound_tx: mpsc::Sender<InboundMessage>,
-    running: Arc<AtomicBool>,
-) {
-    while running.load(Ordering::SeqCst) {
-        match open_socket_url(http, cfg).await {
-            Ok(url) => {
-                if let Err(err) = run_socket(&url, cfg, &inbound_tx, &running).await {
-                    tracing::warn!(error = %err, "slack socket connection ended");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to open slack socket connection");
-            }
-        }
-
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    }
 }
 
 /// One Socket Mode connection. Returns when the server asks us to reconnect,

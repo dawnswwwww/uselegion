@@ -87,6 +87,16 @@ impl McpToolAdapter {
         &self.desc.input_schema
     }
 
+    /// Raw tool annotations declared by the server, when present.
+    pub fn annotations(&self) -> Option<&Value> {
+        self.desc.annotations.as_ref()
+    }
+
+    /// JSON Schema describing the tool's structured output, when declared.
+    pub fn output_schema(&self) -> Option<&Value> {
+        self.desc.output_schema.as_ref()
+    }
+
     /// Whether the server config declares this tool in `autoApprove`.
     pub fn auto_approved(&self) -> bool {
         self.auto_approved
@@ -124,6 +134,8 @@ mod tests {
             name: "read_file".to_string(),
             description: "read a file".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+            output_schema: None,
         };
         // The client is unused for this test; build a dummy one.
         struct Dummy;
@@ -142,6 +154,7 @@ mod tests {
                 Ok(McpToolResult {
                     content: Value::Null,
                     is_error: false,
+                    structured_content: None,
                 })
             }
             async fn close(&self) -> Result<(), McpError> {
@@ -222,6 +235,8 @@ mod tests {
             name: "ping".to_string(),
             description: "ping".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+            output_schema: None,
         }
     }
 
@@ -232,6 +247,7 @@ mod tests {
             result: Ok(McpToolResult {
                 content: Value::Null,
                 is_error: false,
+                structured_content: None,
             }),
         });
         let adapter =
@@ -248,6 +264,7 @@ mod tests {
             result: Ok(McpToolResult {
                 content: serde_json::json!("boom"),
                 is_error: true,
+                structured_content: None,
             }),
         });
         let adapter =
@@ -268,5 +285,31 @@ mod tests {
         let _ = adapter.call(serde_json::json!({})).await;
         assert_eq!(metrics.calls.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn adapter_carries_annotations_and_output_schema() {
+        let annotations = serde_json::json!({"readOnlyHint": true, "destructiveHint": false});
+        let output_schema =
+            serde_json::json!({"type": "object", "properties": {"rows": {"type": "integer"}}});
+        let annotated = McpToolDesc {
+            annotations: Some(annotations.clone()),
+            output_schema: Some(output_schema.clone()),
+            ..desc()
+        };
+        let client = Arc::new(ScriptedClient {
+            result: Ok(McpToolResult {
+                content: Value::Null,
+                is_error: false,
+                structured_content: None,
+            }),
+        });
+        let adapter = McpToolAdapter::new("fs", annotated, client.clone(), false);
+        assert_eq!(adapter.annotations(), Some(&annotations));
+        assert_eq!(adapter.output_schema(), Some(&output_schema));
+
+        let plain = McpToolAdapter::new("fs", desc(), client, false);
+        assert_eq!(plain.annotations(), None);
+        assert_eq!(plain.output_schema(), None);
     }
 }

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use futures::SinkExt;
 use futures::channel::mpsc::Sender;
-use legion_provider::types::{ChatMessage, ChatRole, ToolCall as ProviderToolCall};
+use legion_provider::types::{ChatMessage, ChatRole};
 
 use crate::approval::{ApprovalCtx, ApprovalRequest, PermissionMode};
 use crate::memory::MemoryBackend;
@@ -483,17 +483,6 @@ async fn log_tool_call(
                 duration_ms,
             })
             .await;
-    }
-}
-
-impl ToolCall {
-    /// Build a runtime `ToolCall` from a provider tool call.
-    pub fn from_provider(tc: &ProviderToolCall) -> Self {
-        Self {
-            id: tc.id.clone(),
-            name: tc.function.name.clone(),
-            arguments: tc.function.arguments.clone(),
-        }
     }
 }
 

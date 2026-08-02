@@ -10,12 +10,11 @@ use std::path::{Path, PathBuf};
 /// Paths that must never be written by a sandboxed command, regardless of the
 /// configured writable paths.
 pub fn sensitive_paths() -> Vec<PathBuf> {
-    let home: PathBuf = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let legion_home = legion_core::fs::legion_home();
     vec![
-        home.join(".legion").join("legion.json"),
-        home.join(".legion").join("agents"),
+        legion_home.join("legion.json"),
+        legion_home.join("agents"),
         home.join(".ssh"),
         home.join(".gnupg"),
         PathBuf::from("/etc"),

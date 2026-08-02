@@ -192,10 +192,11 @@ pub enum SelectLayout {
 
 /// Prompt for a yes/no answer; `default_yes` controls the initial highlight.
 ///
-/// Rendered as a horizontal ←/→ selector ([`select`]); `y`/`n` also work.
+/// Rendered as a vertical ↑/↓ selector ([`select`]) — selections are always
+/// vertical; the horizontal layout is reserved for tab-style groups.
 pub fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool, CliError> {
     let default = if default_yes { 0 } else { 1 };
-    Ok(select(message, &["Yes", "No"], default, SelectLayout::Horizontal)? == 0)
+    Ok(select(message, &["Yes", "No"], default, SelectLayout::Vertical)? == 0)
 }
 
 /// Arrow-key selection among `options`, returning the chosen index.
@@ -818,16 +819,23 @@ pub async fn run_setup(
             );
             match select(
                 "What would you like to do?",
-                &["Keep", "Add provider", "Reconfigure", "Abort"],
+                &[
+                    "Keep",
+                    "Add provider",
+                    "Configure channels",
+                    "Reconfigure",
+                    "Abort",
+                ],
                 0,
-                SelectLayout::Horizontal,
+                SelectLayout::Vertical,
             )? {
                 0 => {
                     println!("Keeping the existing configuration; nothing changed.");
                     return Ok(());
                 }
                 1 => true,
-                2 => false,
+                2 => return configure_channels_interactive(&config_path).await,
+                3 => false,
                 _ => {
                     return Err(CliError::Other("setup aborted".to_string()));
                 }
@@ -905,7 +913,7 @@ pub async fn run_setup(
     // stay provider-only for backward compatibility).
     let channels = if interactive {
         println!();
-        gather_channels()?
+        gather_channels(Vec::new()).await?
     } else {
         Vec::new()
     };
@@ -1222,10 +1230,14 @@ fn gather_channel_secret(label: &str, env_var: &str) -> Result<String, CliError>
     }
 }
 
-/// Walk the optional channel onboarding loop; returns `channels` entries.
-fn gather_channels() -> Result<Vec<(String, Value)>, CliError> {
-    let mut configured: Vec<(String, Value)> = Vec::new();
-    loop {
+/// Walk the channel configuration loop; returns `channels` entries.
+///
+/// `initial` seeds the loop with already-configured channels (standalone
+/// reconfiguration of an existing config); re-selecting one re-asks its
+/// fields and overwrites it. Entries keep their order of first appearance.
+async fn gather_channels(initial: Vec<(String, Value)>) -> Result<Vec<(String, Value)>, CliError> {
+    let mut configured: Vec<(String, Value)> = initial;
+    'channel_loop: loop {
         let mut labels: Vec<String> = CHANNEL_MENU
             .iter()
             .map(|(id, label)| {
@@ -1284,11 +1296,56 @@ fn gather_channels() -> Result<Vec<(String, Value)>, CliError> {
                     continue;
                 }
                 let app_secret = gather_channel_secret("Lark app secret", "LARK_APP_SECRET")?;
+                let base_url = prompt_default(
+                    "Lark base URL (Enter for Feishu China; use https://open.larksuite.com for Lark)",
+                    "https://open.feishu.cn",
+                )?;
+
+                // Verify the credentials before collecting the allowlist, so a
+                // typo doesn't waste the user's time. Retry / save-anyay /
+                // cancel.
+                let bot_open_id = loop {
+                    print!("Testing Lark connection... ");
+                    std::io::stdout().flush()?;
+                    let outcome = probe_lark(&app_id, &app_secret, &base_url).await;
+                    if outcome.ok {
+                        let who = outcome
+                            .bot_name
+                            .as_deref()
+                            .or(outcome.bot_open_id.as_deref())
+                            .unwrap_or("bot");
+                        println!("verified (connected as {who}).");
+                        if let Some(warning) = outcome.error {
+                            println!("  note: {warning}");
+                        }
+                        break outcome.bot_open_id;
+                    }
+                    println!("failed.");
+                    if let Some(reason) = outcome.error {
+                        println!("  {reason}");
+                    }
+                    match select(
+                        "What next?",
+                        &["Retry", "Save anyway", "Cancel"],
+                        0,
+                        SelectLayout::Vertical,
+                    )? {
+                        0 => continue,               // retry with same inputs
+                        1 => break None,             // save despite the failure
+                        _ => continue 'channel_loop, // back to the channel menu
+                    }
+                };
+
                 let allowlist = gather_dm_allowlist(id, "Lark open_id, e.g. ou_…")?;
-                with_access(
-                    json!({ "appId": app_id, "appSecret": app_secret }),
-                    &allowlist,
-                )
+                let mut channel = json!({
+                    "appId": app_id,
+                    "appSecret": app_secret,
+                    "baseUrl": base_url,
+                });
+                if let Some(bot_open_id) = bot_open_id {
+                    channel["botOpenId"] = json!(bot_open_id);
+                }
+                with_access(channel, &allowlist)
             }
             "matrix" => {
                 let homeserver = loop {
@@ -1316,21 +1373,45 @@ fn gather_channels() -> Result<Vec<(String, Value)>, CliError> {
     Ok(configured)
 }
 
-/// Merge a new provider into an existing config file instead of rewriting it.
-///
-/// The gateway section and every unrelated key survive untouched. Plain JSON
-/// only — a `.json5` config must be edited by hand.
-fn merge_provider_into_config(config_path: &Path, choices: &SetupChoices) -> Result<(), CliError> {
+/// Read a config file as a plain-JSON object. A `.json5` config cannot be
+/// patched automatically and must be edited by hand.
+pub(crate) fn read_json_config(config_path: &Path) -> Result<Value, CliError> {
     let text = std::fs::read_to_string(config_path)?;
-    let mut config: Value = serde_json::from_str(&text).map_err(|e| {
+    let config: Value = serde_json::from_str(&text).map_err(|e| {
         CliError::Other(format!(
             "could not parse {} as JSON (json5 configs cannot be patched automatically): {e}",
             config_path.display()
         ))
     })?;
+    if !config.is_object() {
+        return Err(CliError::Other("config root is not an object".to_string()));
+    }
+    Ok(config)
+}
+
+/// Back up `config_path`, validate `config` against the schema, and write it.
+pub(crate) fn write_config_with_backup(config_path: &Path, config: &Value) -> Result<(), CliError> {
+    let backup_path = config_path.with_extension("json.bak");
+    std::fs::copy(config_path, &backup_path)?;
+    println!("Existing config backed up to {}", backup_path.display());
+
+    let text = serde_json::to_string_pretty(config)
+        .map_err(|e| CliError::Other(format!("failed to serialize config: {e}")))?;
+    // Validate before writing.
+    let _ = legion_core::config::Config::from_json(&text)?;
+    std::fs::write(config_path, text)?;
+    Ok(())
+}
+
+/// Merge a new provider into an existing config file instead of rewriting it.
+///
+/// The gateway section and every unrelated key survive untouched. Plain JSON
+/// only — a `.json5` config must be edited by hand.
+fn merge_provider_into_config(config_path: &Path, choices: &SetupChoices) -> Result<(), CliError> {
+    let mut config = read_json_config(config_path)?;
     let root = config
         .as_object_mut()
-        .ok_or_else(|| CliError::Other("config root is not an object".to_string()))?;
+        .expect("read_json_config returns an object");
 
     let models = root
         .entry("models")
@@ -1365,16 +1446,63 @@ fn merge_provider_into_config(config_path: &Path, choices: &SetupChoices) -> Res
             json!(format!("{}/{}", choices.provider_id, choices.default_model)),
         );
 
-    let backup_path = config_path.with_extension("json.bak");
-    std::fs::copy(config_path, &backup_path)?;
-    println!("Existing config backed up to {}", backup_path.display());
+    write_config_with_backup(config_path, &config)
+}
 
-    let merged = serde_json::to_string_pretty(&config)
-        .map_err(|e| CliError::Other(format!("failed to serialize config: {e}")))?;
-    // Validate before writing.
-    let _ = legion_core::config::Config::from_json(&merged)?;
-    std::fs::write(config_path, merged)?;
+/// Standalone channel configuration for an existing config: seed the channel
+/// loop with what is already configured, then write the result back, leaving
+/// every other section untouched.
+async fn configure_channels_interactive(config_path: &Path) -> Result<(), CliError> {
+    let existing: Vec<(String, Value)> = read_json_config(config_path)?
+        .get("channels")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    println!();
+    let channels = gather_channels(existing.clone()).await?;
+    if channels == existing {
+        println!("Channels unchanged; nothing written.");
+        return Ok(());
+    }
+    merge_channels_into_config(config_path, &channels)?;
+
+    println!();
+    if channels.is_empty() {
+        println!("Channels cleared in {}", config_path.display());
+    } else {
+        let names: Vec<&str> = channels.iter().map(|(id, _)| id.as_str()).collect();
+        println!(
+            "Channels updated in {}: {}",
+            config_path.display(),
+            names.join(", ")
+        );
+    }
+    println!("Restart the gateway for channel changes to take effect.");
     Ok(())
+}
+
+/// Replace the `channels` section of an existing config, leaving every other
+/// key untouched. An empty list removes the key, matching fresh-setup output.
+fn merge_channels_into_config(
+    config_path: &Path,
+    channels: &[(String, Value)],
+) -> Result<(), CliError> {
+    let mut config = read_json_config(config_path)?;
+    let root = config
+        .as_object_mut()
+        .expect("read_json_config returns an object");
+    if channels.is_empty() {
+        root.remove("channels");
+    } else {
+        let map: Map<String, Value> = channels.iter().cloned().collect();
+        root.insert("channels".to_string(), Value::Object(map));
+    }
+    write_config_with_backup(config_path, &config)
 }
 
 /// Offer and run the advisory live connection test.
@@ -1401,6 +1529,203 @@ async fn maybe_test_connection(choices: &SetupChoices) -> Result<(), CliError> {
                 Err(CliError::Other("setup aborted".to_string()))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lark / Feishu connection probe
+// ---------------------------------------------------------------------------
+
+/// Parsed `tenant_access_token/internal` response: either the token or the
+/// reason credentials were rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LarkTokenParse {
+    token: Option<String>,
+    error: Option<String>,
+}
+
+/// Classify a `tenant_access_token/internal` JSON envelope without touching
+/// the network, so the logic is unit-testable. Feishu returns `code != 0`
+/// (e.g. `app secret is not correct`) even on HTTP 200 when credentials fail.
+fn classify_token_response(body: &Value) -> LarkTokenParse {
+    if body.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        let msg = body
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_error");
+        return LarkTokenParse {
+            token: None,
+            error: Some(msg.to_string()),
+        };
+    }
+    let token = body
+        .get("tenant_access_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    // Bind `error` before the struct literal so `token` is not moved before its
+    // discriminant is read here.
+    let error = if token.is_none() {
+        Some("tenant_access_token response missing token".to_string())
+    } else {
+        None
+    };
+    LarkTokenParse { token, error }
+}
+
+/// Parsed `/bot/v3/info` response: bot `open_id` and name, when available.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LarkBotParse {
+    bot_open_id: Option<String>,
+    bot_name: Option<String>,
+    /// Present when the call succeeded at the credential level but bot info
+    /// could not be retrieved (e.g. bot capability disabled).
+    warning: Option<String>,
+}
+
+/// Extract bot identity from a `/bot/v3/info` JSON envelope. A non-zero code
+/// here is downgraded to a warning rather than a hard failure, because a valid
+/// `tenant_access_token` already proves the credentials.
+fn classify_bot_info(body: &Value) -> LarkBotParse {
+    if body.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        let msg = body
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_error");
+        return LarkBotParse {
+            warning: Some(format!(
+                "credentials valid, but bot info unavailable ({msg}); enable the bot capability in the app"
+            )),
+            ..Default::default()
+        };
+    }
+    let bot = body.get("data").and_then(|d| d.get("bot"));
+    LarkBotParse {
+        bot_open_id: bot
+            .and_then(|b| b.get("open_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        bot_name: bot
+            .and_then(|b| b.get("app_name"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        warning: None,
+    }
+}
+
+/// Outcome of probing Lark/Feishu app credentials during setup.
+#[derive(Debug, Clone)]
+struct LarkProbeOutcome {
+    /// `true` when the `tenant_access_token` request succeeded — the
+    /// credentials are valid. Bot info is best-effort on top of that.
+    ok: bool,
+    /// Human-readable reason on failure, or a non-blocking warning on success.
+    error: Option<String>,
+    /// Bot display name from `/bot/v3/info`, when available.
+    bot_name: Option<String>,
+    /// Bot `open_id` from `/bot/v3/info`, used to backfill config.
+    bot_open_id: Option<String>,
+}
+
+/// Probe Lark/Feishu app credentials by requesting a `tenant_access_token`
+/// and, on success, the bot identity. Both calls go through `base_url`
+/// (`https://open.feishu.cn` for China, `https://open.larksuite.com` for Lark).
+async fn probe_lark(app_id: &str, app_secret: &str, base_url: &str) -> LarkProbeOutcome {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            return LarkProbeOutcome {
+                ok: false,
+                error: Some(format!("failed to build HTTP client: {e}")),
+                bot_name: None,
+                bot_open_id: None,
+            };
+        }
+    };
+
+    // Step 1 — verify credentials by exchanging them for a tenant_access_token.
+    let token_url = format!("{base_url}/open-apis/auth/v3/tenant_access_token/internal");
+    let token_resp = match client
+        .post(&token_url)
+        .json(&json!({ "app_id": app_id, "app_secret": app_secret }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return LarkProbeOutcome {
+                ok: false,
+                error: Some(format!("cannot reach Lark at {base_url}: {e}")),
+                bot_name: None,
+                bot_open_id: None,
+            };
+        }
+    };
+
+    let body: Value = match token_resp.json().await {
+        Ok(body) => body,
+        Err(e) => {
+            return LarkProbeOutcome {
+                ok: false,
+                error: Some(format!("tenant_access_token response unreadable: {e}")),
+                bot_name: None,
+                bot_open_id: None,
+            };
+        }
+    };
+
+    let parsed = classify_token_response(&body);
+    let token = match parsed {
+        LarkTokenParse {
+            token: Some(token), ..
+        } => token,
+        LarkTokenParse {
+            error: Some(reason),
+            ..
+        } => {
+            return LarkProbeOutcome {
+                ok: false,
+                error: Some(reason),
+                bot_name: None,
+                bot_open_id: None,
+            };
+        }
+        LarkTokenParse {
+            token: None,
+            error: None,
+        } => {
+            return LarkProbeOutcome {
+                ok: false,
+                error: Some("tenant_access_token response missing token".to_string()),
+                bot_name: None,
+                bot_open_id: None,
+            };
+        }
+    };
+
+    // Step 2 — best-effort bot info. Credentials are already proven valid.
+    let bot_url = format!("{base_url}/open-apis/bot/v3/info");
+    let bot_parse = match client.get(&bot_url).bearer_auth(&token).send().await {
+        Ok(response) => match response.json::<Value>().await {
+            Ok(body) => classify_bot_info(&body),
+            Err(e) => LarkBotParse {
+                warning: Some(format!("bot info response unreadable: {e}")),
+                ..Default::default()
+            },
+        },
+        Err(e) => LarkBotParse {
+            warning: Some(format!("bot info request failed: {e}")),
+            ..Default::default()
+        },
+    };
+
+    LarkProbeOutcome {
+        ok: true,
+        error: bot_parse.warning,
+        bot_name: bot_parse.bot_name,
+        bot_open_id: bot_parse.bot_open_id,
     }
 }
 
@@ -2003,6 +2328,80 @@ mod tests {
         assert!(temp.path().join("legion.json.bak").is_file());
     }
 
+    /// Minimal valid config JSON with one telegram channel, used by the
+    /// channel-merge tests.
+    fn existing_config_json() -> Value {
+        json!({
+            "gateway": {
+                "bindHost": "127.0.0.1",
+                "port": 18789,
+                "auth": { "mode": "token", "token": "t" }
+            },
+            "agents": { "defaults": { "model": "minimax" } },
+            "models": {
+                "providers": {
+                    "minimax-openai": {
+                        "id": "minimax-openai",
+                        "kind": "openai",
+                        "authProfile": "minimax-default"
+                    }
+                },
+                "aliases": { "minimax": "minimax-openai/MiniMax-M3" }
+            },
+            "channels": {
+                "telegram": { "token": "old-token" }
+            }
+        })
+    }
+
+    #[test]
+    fn merge_channels_into_config_replaces_only_channels() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("legion.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&existing_config_json()).unwrap(),
+        )
+        .unwrap();
+
+        let channels = vec![
+            ("telegram".to_string(), json!({ "token": "new-token" })),
+            (
+                "slack".to_string(),
+                json!({ "botToken": "xoxb-t", "appToken": "xapp-t" }),
+            ),
+        ];
+        // Validation happens inside the merge; unwrap proves it passed.
+        merge_channels_into_config(&config_path, &channels).unwrap();
+
+        let merged: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(merged["channels"]["telegram"]["token"], "new-token");
+        assert_eq!(merged["channels"]["slack"]["botToken"], "xoxb-t");
+        // Unrelated keys survive untouched.
+        assert_eq!(merged["gateway"]["port"], 18789);
+        assert_eq!(merged["agents"]["defaults"]["model"], "minimax");
+        assert!(temp.path().join("legion.json.bak").is_file());
+    }
+
+    #[test]
+    fn merge_channels_into_config_empty_removes_key() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("legion.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&existing_config_json()).unwrap(),
+        )
+        .unwrap();
+
+        merge_channels_into_config(&config_path, &[]).unwrap();
+
+        let merged: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(merged.get("channels").is_none());
+        assert_eq!(merged["gateway"]["port"], 18789);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn daemon_unit_references_gateway_foreground_and_log() {
@@ -2470,5 +2869,54 @@ mod tests {
             json!({ "type": "aws_sigv4", "access_key": "AK", "secret_key": "sk", "region": "us-east-1" }),
         );
         assert!(!is_setup_needed(temp.path()));
+    }
+
+    #[test]
+    fn lark_probe_parses_successful_credentials() {
+        let body =
+            json!({ "code": 0, "msg": "ok", "tenant_access_token": "t-xxx", "expire": 7200 });
+        let parsed = classify_token_response(&body);
+        assert_eq!(parsed.token.as_deref(), Some("t-xxx"));
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn lark_probe_detects_invalid_secret() {
+        // Feishu returns code != 0 with the specific failure reason.
+        let body = json!({ "code": 99991663, "msg": "app secret is not correct" });
+        let parsed = classify_token_response(&body);
+        assert!(parsed.token.is_none());
+        assert_eq!(parsed.error.as_deref(), Some("app secret is not correct"));
+    }
+
+    #[test]
+    fn lark_probe_detects_missing_token_field() {
+        let body = json!({ "code": 0, "msg": "ok" });
+        let parsed = classify_token_response(&body);
+        assert!(parsed.token.is_none());
+        assert!(parsed.error.is_some());
+    }
+
+    #[test]
+    fn lark_probe_parses_bot_info() {
+        let body = json!({
+            "code": 0,
+            "data": { "bot": { "open_id": "ou_bot", "app_name": "MyBot" } }
+        });
+        let bot = classify_bot_info(&body);
+        assert_eq!(bot.bot_open_id.as_deref(), Some("ou_bot"));
+        assert_eq!(bot.bot_name.as_deref(), Some("MyBot"));
+        assert!(bot.warning.is_none());
+    }
+
+    #[test]
+    fn lark_probe_bot_info_nonzero_code_is_warning() {
+        // Credentials are already proven by the token step; a bot-info failure
+        // must not be treated as a hard error.
+        let body = json!({ "code": 99991661, "msg": "permission denied" });
+        let bot = classify_bot_info(&body);
+        assert!(bot.bot_open_id.is_none());
+        assert!(bot.warning.is_some());
+        assert!(bot.warning.unwrap().contains("permission denied"));
     }
 }

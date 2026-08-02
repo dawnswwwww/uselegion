@@ -1,5 +1,6 @@
 //! Plugin market: catalog of available plugins and install tracking.
 
+use legion_core::util::lock_recover;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -89,7 +90,7 @@ impl PluginMarket {
 
     /// Add plugins to the catalog.
     pub fn seed(&self, plugins: Vec<MarketPlugin>) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         for plugin in plugins {
             state.catalog.insert(plugin.id.clone(), plugin);
         }
@@ -97,13 +98,13 @@ impl PluginMarket {
 
     /// List all plugins in the catalog.
     pub fn list(&self) -> Vec<MarketPlugin> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state.catalog.values().cloned().collect()
     }
 
     /// Mark a plugin as installed. Returns false if the plugin is unknown.
     pub fn install(&self, id: &str) -> bool {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         match state.catalog.get_mut(id) {
             Some(plugin) => {
                 plugin.installed = true;
@@ -115,7 +116,7 @@ impl PluginMarket {
 
     /// Mark a plugin as uninstalled. Returns false if the plugin is unknown.
     pub fn uninstall(&self, id: &str) -> bool {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_recover(&self.inner);
         match state.catalog.get_mut(id) {
             Some(plugin) => {
                 plugin.installed = false;
@@ -127,7 +128,7 @@ impl PluginMarket {
 
     /// Get a single plugin by id.
     pub fn get(&self, id: &str) -> Option<MarketPlugin> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_recover(&self.inner);
         state.catalog.get(id).cloned()
     }
 }

@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{TelemetryError, expand_tilde};
+use crate::TelemetryError;
+use legion_core::fs::expand_tilde;
 
 /// Source component that emitted a log entry.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -80,7 +81,11 @@ pub struct UnifiedLog {
 impl UnifiedLog {
     /// Open (or create) the log file at the expanded path.
     pub fn new(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, TelemetryError> {
-        let path = expand_tilde(path);
+        let path = path.as_ref();
+        let path = path
+            .to_str()
+            .map(expand_tilde)
+            .unwrap_or_else(|| path.to_path_buf());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

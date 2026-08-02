@@ -1,40 +1,22 @@
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use futures::channel::mpsc::Sender;
-use futures::{SinkExt, StreamExt};
-
-use crate::approval::{ApprovalCtx, ApprovalGate, NoOpApprovalNotifier, PermissionMode};
 use crate::auto_extract::AutoExtractor;
 use crate::commitments::CommitmentExtractor;
-use crate::compaction::TwoPassCompactor;
-use crate::context::{
-    Filesystem, SessionContext, TokioFs, assemble_system_prompt_report, resolve_workspace,
-};
 use crate::context_engine::{ContextEngine, LegacyContextEngine};
-use crate::memory::{MemoryBackend, RecallContext};
+use crate::goal::GoalStore;
+use crate::memory::MemoryBackend;
 use crate::messenger::AgentMessenger;
-use crate::question::{NoOpQuestionNotifier, QuestionCtx, QuestionGate};
 use crate::recall_selector::LlmRecallSelector;
-use crate::skill_selector::{KeywordSkillSelector, LlmSkillSelector, SkillSelector};
-use crate::skills_prompt::skill_body_block;
 use crate::subagent::SubagentSpawner;
 use crate::surfaced::SurfacedStore;
 use crate::swarm::SwarmManager;
-use crate::todo_gate::{TodoGate, todo_gate_reminder};
-use crate::tool_pipeline::{partition_tool_calls, run_tool_batches};
-use crate::tools::{ToolCall, ToolRegistry, ToolResult, build_policy_decider};
-use crate::types::{LifecyclePhase, RunEvent, RunRequest, RunStream, RuntimeError};
+use crate::tools::ToolRegistry;
+use crate::types::{RunRequest, RunStream, RuntimeError};
 use legion_core::config::{Config, RecallConfig};
 use legion_provider::router::ProviderRouter;
-use legion_provider::types::{
-    ChatChunk, ChatMessage, ChatRequest, ChatRole, FinishReason, ProviderError,
-    ToolCall as ProviderToolCall,
-};
-use legion_skills::{Skill, SkillRegistry, SkillRegistryImpl};
-use legion_telemetry::{SessionMetric, TelemetryClient};
-use std::time::{Duration, Instant};
+use legion_skills::Skill;
+use legion_telemetry::TelemetryClient;
 
 pub const DEFAULT_MAX_ITERATIONS: usize = 10;
 
@@ -57,6 +39,9 @@ pub struct AgentRuntime {
     recall_config: RecallConfig,
     selector: Option<Arc<LlmRecallSelector>>,
     surfaced: SurfacedStore,
+    /// Store backing the session-goal gate and context injection. Overridable
+    /// for tests; defaults to the real `~/.legion` goal store.
+    goal_store: GoalStore,
     /// Late-bound sub-agent spawner (multi-agent Phase A). Wired by the gateway
     /// after the `Arc<AgentRuntime>` is constructed to break the spawn/runtime
     /// construction cycle. `None` until `set_spawner` is called.
@@ -95,6 +80,7 @@ impl AgentRuntime {
             recall_config,
             selector: None,
             surfaced: SurfacedStore::default(),
+            goal_store: GoalStore::default(),
             spawner: Mutex::new(None),
             messenger: Mutex::new(None),
             swarm: Mutex::new(None),
@@ -121,6 +107,13 @@ impl AgentRuntime {
 
     pub fn with_max_iterations(mut self, max_iterations: Option<usize>) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Override the goal store used for the session-goal gate and context
+    /// injection (tests point it at a temp dir).
+    pub fn with_goal_store(mut self, goal_store: GoalStore) -> Self {
+        self.goal_store = goal_store;
         self
     }
 
@@ -168,6 +161,16 @@ impl AgentRuntime {
         &self.config
     }
 
+    /// The provider router a run for `agent_id` would use: the per-agent
+    /// router with a fallback to the main one. Used by the sub-agent spawner
+    /// to validate model references before starting a child run.
+    pub fn router_for(&self, agent_id: &str) -> Option<Arc<ProviderRouter>> {
+        self.provider_routers
+            .get(agent_id)
+            .cloned()
+            .or_else(|| self.provider_routers.get("main").cloned())
+    }
+
     /// Late-bind the sub-agent spawner (multi-agent Phase A). Called by the
     /// gateway after the `Arc<AgentRuntime>` exists. No-ops if the internal
     /// mutex is poisoned (which cannot happen during single-threaded startup).
@@ -209,736 +212,44 @@ impl AgentRuntime {
 
     /// Start an agent run and return a stream of runtime events.
     pub fn run(&self, request: RunRequest) -> Result<RunStream, RuntimeError> {
-        let provider_router = self
-            .provider_routers
-            .get(&request.agent_id)
-            .cloned()
-            .or_else(|| self.provider_routers.get("main").cloned())
-            .ok_or_else(|| {
-                RuntimeError::Provider(legion_provider::types::ProviderError::ProviderNotFound(
-                    request.agent_id.clone(),
-                ))
-            })?;
+        let provider_router = self.router_for(&request.agent_id).ok_or_else(|| {
+            RuntimeError::Provider(legion_provider::types::ProviderError::ProviderNotFound(
+                request.agent_id.clone(),
+            ))
+        })?;
 
         let context_engine = self.build_context_engine();
         context_engine.run(provider_router, request, self.max_iterations)
     }
 
     fn build_context_engine(&self) -> Arc<dyn ContextEngine> {
-        match self.config.agent_runtime.context_engine.as_deref() {
-            None | Some("legacy") => Arc::new(
-                LegacyContextEngine::new(
-                    self.tool_registry.clone(),
-                    self.memory_backend.clone(),
-                    self.config.clone(),
-                )
-                .with_plugin_skills(self.plugin_skills.clone())
-                .with_auto_extractor(self.auto_extractor.clone())
-                .with_commitment_extractor(self.commitment_extractor.clone())
-                .with_recall_config(self.recall_config.clone())
-                .with_selector(self.selector.clone())
-                .with_surfaced(self.surfaced.clone())
-                .with_spawner(self.spawner())
-                .with_messenger(self.messenger())
-                .with_swarm(self.swarm())
-                .with_telemetry(self.telemetry.clone()),
-            ),
-            Some(other) => {
+        if let Some(other) = self.config.agent_runtime.context_engine.as_deref() {
+            if other != "legacy" {
                 tracing::warn!(
                     engine = other,
                     "unknown context engine; falling back to legacy"
                 );
-                Arc::new(
-                    LegacyContextEngine::new(
-                        self.tool_registry.clone(),
-                        self.memory_backend.clone(),
-                        self.config.clone(),
-                    )
-                    .with_plugin_skills(self.plugin_skills.clone())
-                    .with_auto_extractor(self.auto_extractor.clone())
-                    .with_commitment_extractor(self.commitment_extractor.clone())
-                    .with_recall_config(self.recall_config.clone())
-                    .with_selector(self.selector.clone())
-                    .with_surfaced(self.surfaced.clone())
-                    .with_spawner(self.spawner())
-                    .with_messenger(self.messenger())
-                    .with_swarm(self.swarm())
-                    .with_telemetry(self.telemetry.clone()),
-                )
             }
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_loop(
-    provider_router: Arc<ProviderRouter>,
-    tool_registry: Arc<dyn ToolRegistry>,
-    memory_backend: Arc<dyn MemoryBackend>,
-    compactor: Arc<TwoPassCompactor>,
-    config: Config,
-    request: RunRequest,
-    max_iterations: Option<usize>,
-    plugin_skills: Vec<Skill>,
-    auto_extractor: Option<Arc<AutoExtractor>>,
-    commitment_extractor: Option<Arc<dyn CommitmentExtractor>>,
-    recall_config: RecallConfig,
-    selector: Option<Arc<LlmRecallSelector>>,
-    surfaced: SurfacedStore,
-    spawner: Option<Arc<dyn SubagentSpawner>>,
-    messenger: Option<Arc<dyn AgentMessenger>>,
-    swarm: Option<Arc<SwarmManager>>,
-    todo_gate: TodoGate,
-    telemetry: Option<Arc<TelemetryClient>>,
-    tx: &mut Sender<RunEvent>,
-) -> Result<(), RuntimeError> {
-    send(
-        tx,
-        RunEvent::Lifecycle {
-            phase: LifecyclePhase::Start,
-            error: None,
-        },
-    )
-    .await;
-
-    if let Some(telemetry) = &telemetry {
-        telemetry
-            .log_session_event(SessionMetric::SessionStarted {
-                session_id: request.session_id.clone(),
-                agent_id: request.agent_id.clone(),
-                model_ref: request.model_ref.clone(),
-            })
-            .await;
-    }
-
-    let workspace = resolve_workspace(
-        &config,
-        &request.agent_id,
-        request.workspace_override.as_deref(),
-    );
-    let fs = TokioFs;
-
-    // Session todo store. Enabled by default; when disabled the store is still
-    // created (so the tool can report availability) but no events are emitted.
-    let todo_store: Option<crate::SharedTodoStore> = if config.todos.enabled {
-        let base = crate::expand_tilde("~/.legion");
-        let path =
-            crate::todo::JsonTodoStore::path_for(&base, &request.agent_id, &request.session_id);
-        match crate::todo::JsonTodoStore::open_with_event_tx(path, Some(tx.clone())).await {
-            Ok(store) => Some(Arc::new(store)),
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to open todo store; todo_write will be unavailable");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Snapshot of the todo list for the turn-end gate. Reloaded after each tool
-    // batch so the gate sees the latest state written by todo_write.
-    let mut current_todos = if let Some(store) = &todo_store {
-        match store.load().await {
-            Ok(list) => list,
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to load todo list");
-                crate::todo::TodoList::default()
-            }
-        }
-    } else {
-        crate::todo::TodoList::default()
-    };
-
-    // Plan-mode tracker. Load persisted state for the session when available;
-    // otherwise start fresh in the session directory.
-    let plan_tracker = if let Some(tracker) = request.plan_mode_tracker.clone() {
-        tracker
-    } else {
-        let session_dir =
-            crate::expand_tilde(&format!("~/.legion/sessions/{}", request.session_id));
-        match crate::plan_mode::PlanModeTracker::load(&session_dir).await {
-            Ok(tracker) => Arc::new(tokio::sync::Mutex::new(tracker)),
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to load plan mode state; starting fresh");
-                Arc::new(tokio::sync::Mutex::new(
-                    crate::plan_mode::PlanModeTracker::new(&session_dir),
-                ))
-            }
-        }
-    };
-
-    let skills_config = &config.agents.defaults.skills;
-    let skill_registry = if skills_config.enabled {
-        let mut skill_dirs = skills_config.dirs.clone();
-        for dir in [".agents/skills", ".legion/skills"] {
-            let p = workspace.join(dir);
-            if fs.exists(&p).await {
-                skill_dirs.push(p);
-            }
-        }
-
-        let mut registry = SkillRegistryImpl::new();
-        let report = registry.load(&skill_dirs).await;
-        if !report.loaded.is_empty() || !report.failed.is_empty() || !plugin_skills.is_empty() {
-            tracing::info!(
-                loaded = report.loaded.len(),
-                failed = report.failed.len(),
-                plugin_skills = plugin_skills.len(),
-                "loaded skills"
-            );
-        }
-        for skill in plugin_skills {
-            registry.add(skill);
-        }
-        for (path, err) in &report.failed {
-            tracing::warn!(path = %path.display(), error = %err, "failed to load skill");
-        }
-        Some(registry)
-    } else {
-        None
-    };
-
-    let (skill_block, active_skills, initial_body_block, mut injected_bodies) =
-        if let Some(registry) = skill_registry.as_ref() {
-            let block = registry.summary_block(skills_config.max_summary_tokens);
-            let names: Vec<String> = registry
-                .all()
-                .iter()
-                .map(|s| s.frontmatter.name.clone())
-                .collect();
-            let candidates: Vec<&legion_skills::Skill> = registry.all().iter().collect();
-            let selector: Arc<dyn SkillSelector> =
-                if let Some(model_ref) = &skills_config.selector_model {
-                    Arc::new(LlmSkillSelector::new(provider_router.clone(), model_ref))
-                } else {
-                    Arc::new(KeywordSkillSelector::new())
-                };
-            let selected = selector
-                .select(
-                    &request.user_message,
-                    &candidates,
-                    skills_config.max_triggered_skills,
-                )
-                .await;
-            let relevant: Vec<&legion_skills::Skill> =
-                selected.into_iter().map(|idx| candidates[idx]).collect();
-            let body_block = skill_body_block(&relevant, skills_config.max_body_tokens);
-            let injected: HashSet<String> = relevant
-                .iter()
-                .map(|s| s.frontmatter.name.clone())
-                .collect();
-            (Some(block), names, Some(body_block), injected)
-        } else {
-            (None, Vec::new(), None, HashSet::new())
-        };
-
-    // Phase C: per-turn recall with optional LLM re-ranking and cross-turn
-    // de-duplication via the surfaced store. The assembled notes are handed to
-    // `assemble_system_prompt` directly, bypassing the legacy MEMORY.md-gated
-    // search inside the prompt builder.
-    let recalled_notes = if recall_config.limit == 0 {
-        Vec::new()
-    } else {
-        let already = surfaced.load(&request.agent_id, &request.session_id).await;
-        let recent_tools: Vec<String> = tool_registry
-            .definitions()
-            .iter()
-            .map(|d| d.name.clone())
-            .collect();
-        let limit = recall_config.limit.max(1);
-        let recall_limit = if selector.is_some() { limit * 3 } else { limit };
-        let ctx = RecallContext {
-            already_surfaced: already,
-            recent_tools,
-            limit: recall_limit,
-        };
-        let mut notes = memory_backend
-            .recall(&request.user_message, &ctx)
-            .await
-            .unwrap_or_default();
-        if let Some(sel) = &selector {
-            notes = sel.select(&request.user_message, notes, limit).await;
-        } else {
-            notes.truncate(limit);
-        }
-        let new_ids: Vec<String> = notes.iter().map(|n| n.id.clone()).collect();
-        surfaced
-            .append(&request.agent_id, &request.session_id, &new_ids)
-            .await;
-        notes
-    };
-
-    let agent_cfg = config.agents.list.iter().find(|a| a.id == request.agent_id);
-    // Standing orders (automation-advanced gap Phase A): merge global
-    // (`agents.defaults`) orders first, then the per-agent ones.
-    let mut standing_orders = config.agents.defaults.standing_orders.clone();
-    if let Some(cfg) = agent_cfg {
-        standing_orders.extend(cfg.standing_orders.iter().cloned());
-    }
-    let prompt_report = assemble_system_prompt_report(
-        &workspace,
-        &fs,
-        Some(memory_backend.as_ref()),
-        &request.user_message,
-        request.system_prompt.as_deref(),
-        skill_block.as_deref(),
-        initial_body_block.as_deref(),
-        Some(recalled_notes.as_slice()),
-        agent_cfg,
-        &standing_orders,
-        config.todos.enabled,
-    )
-    .await
-    .map_err(|e| RuntimeError::Context(e.to_string()))?;
-
-    // Prompt dump (prompt-management Phase C): enabled globally via
-    // `promptDump.enabled` or per run via `--dump-prompts`.
-    if config.prompt_dump.enabled || request.dump_prompts {
-        let dump_dir = crate::expand_tilde("~/.legion/dump-prompts");
-        match prompt_report.write_dump(&dump_dir, &request.session_id) {
-            Ok(path) => tracing::debug!(path = %path.display(), "wrote prompt dump"),
-            Err(e) => tracing::warn!(error = %e, "failed to write prompt dump"),
-        }
-    }
-
-    let cache_blocks = prompt_report.split_for_prompt_cache(config.compaction.use_prompt_cache);
-    let system_prompt = prompt_report.text;
-
-    let mut messages = Vec::new();
-    if !system_prompt.is_empty() {
-        // Prompt-cache wiring (providers gap Phase C): when prompt caching is
-        // enabled, mark the stable leading prefix as a cache breakpoint so
-        // providers that support caching (Anthropic `cache_control`) can reuse
-        // it across turns; other providers simply see two system messages.
-        for (block, cache_breakpoint) in cache_blocks {
-            let msg = ChatMessage::system(block);
-            messages.push(if cache_breakpoint {
-                msg.with_cache_breakpoint()
-            } else {
-                msg
-            });
-        }
-    }
-    messages.extend(request.history);
-    messages.push(ChatMessage::user(&request.user_message));
-
-    let session_ctx = SessionContext::new(
-        active_skills,
-        tool_registry.clone(),
-        Some(memory_backend.clone()),
-    );
-
-    let tools: Vec<_> = match &request.allowed_tools {
-        Some(allowed) => tool_registry
-            .definitions()
-            .into_iter()
-            .filter(|d| allowed.iter().any(|a| a == &d.name))
-            .collect(),
-        None => tool_registry.definitions(),
-    };
-    let workspace_path: PathBuf = workspace;
-    let query = request.user_message.clone();
-
-    // Resolve the iteration cap: request override > per-agent config > runtime default.
-    let max_iterations = request
-        .max_iterations
-        .or_else(|| {
-            config
-                .agents
-                .list
-                .iter()
-                .find(|a| a.id == request.agent_id)
-                .and_then(|a| a.max_iterations)
-        })
-        .or(max_iterations);
-
-    let mut iteration = 0usize;
-    loop {
-        if let Some(limit) = max_iterations {
-            if iteration >= limit {
-                return Err(RuntimeError::MaxIterations(limit));
-            }
-        }
-        iteration += 1;
-
-        let input_tokens = crate::token_counter::estimate_total_tokens(&messages, &system_prompt);
-        let turn_start = Instant::now();
-        if let Some(telemetry) = &telemetry {
-            telemetry
-                .log_session_event(SessionMetric::Turn {
-                    session_id: request.session_id.clone(),
-                    turn_number: iteration,
-                    input_tokens,
-                    model_ref: request.model_ref.clone(),
-                })
-                .await;
-        }
-
-        let tokens_before_compaction =
-            crate::token_counter::estimate_total_tokens(&messages, &system_prompt);
-        if let Some((summary, boundary)) = compactor
-            .compact_if_needed(
-                &mut messages,
-                &system_prompt,
-                &provider_router,
-                &request.model_ref,
-                Some(&session_ctx),
-                &query,
+        Arc::new(
+            LegacyContextEngine::new(
+                self.tool_registry.clone(),
+                self.memory_backend.clone(),
+                self.config.clone(),
             )
-            .await?
-        {
-            // The compacted history minus the leading system prompt (rebuilt
-            // from the workspace on resume) is what the transcript must keep
-            // after the boundary marker.
-            let resume_head: Vec<ChatMessage> = match messages.first() {
-                Some(first) if first.role == ChatRole::System => messages[1..].to_vec(),
-                _ => messages.clone(),
-            };
-            send(
-                tx,
-                RunEvent::Compaction {
-                    summary,
-                    boundary,
-                    resume_head,
-                },
-            )
-            .await;
-
-            if let Some(telemetry) = &telemetry {
-                let tokens_after_compaction =
-                    crate::token_counter::estimate_total_tokens(&messages, &system_prompt);
-                telemetry
-                    .log_session_event(SessionMetric::Compaction {
-                        session_id: request.session_id.clone(),
-                        turn_number: iteration,
-                        tokens_before: tokens_before_compaction,
-                        tokens_after: tokens_after_compaction,
-                    })
-                    .await;
-            }
-        }
-
-        let mut req = ChatRequest::new(&request.model_ref, Vec::new());
-        if !tools.is_empty() {
-            req.tools = Some(tools.clone());
-        }
-
-        let mut stream =
-            chat_with_ptl_retry(&provider_router, &request.model_ref, req, &mut messages).await?;
-        let (assistant_text, pending_tool_calls) =
-            consume_assistant_stream(&mut stream, tx).await?;
-
-        let mut assistant_msg = ChatMessage::assistant(&assistant_text);
-        if !pending_tool_calls.is_empty() {
-            assistant_msg.tool_calls = Some(pending_tool_calls.clone());
-        }
-        messages.push(assistant_msg);
-
-        let output_tokens = crate::token_counter::count_tokens(&assistant_text);
-        let turn_duration_ms = turn_start.elapsed().as_millis() as u64;
-        if let Some(telemetry) = &telemetry {
-            telemetry
-                .log_session_event(SessionMetric::TurnCompleted {
-                    session_id: request.session_id.clone(),
-                    turn_number: iteration,
-                    output_tokens,
-                    tool_calls: pending_tool_calls.len(),
-                    duration_ms: turn_duration_ms,
-                })
-                .await;
-        }
-
-        if pending_tool_calls.is_empty() {
-            // Turn-end gating: if required todo patterns are not satisfied,
-            // remind the model instead of ending the turn.
-            match todo_gate.check(&current_todos, &assistant_text) {
-                crate::todo_gate::TodoGateResult::Pass => {
-                    // Final answer reached.
-                    break;
-                }
-                other => {
-                    if let Some(reminder) = todo_gate_reminder(&other) {
-                        messages.push(ChatMessage::system(reminder));
-                    }
-                    continue;
-                }
-            }
-        }
-
-        let runtime_calls: Vec<ToolCall> = pending_tool_calls.iter().map(ToolCall::from).collect();
-        // Permission narrowing (multi-agent Phase A): calls outside the run's
-        // allowed subset are not executed; they get a structured denial result
-        // so the model sees an explicit refusal rather than a silent drop.
-        let (allowed_calls, denied_calls): (Vec<ToolCall>, Vec<ToolCall>) =
-            match &request.allowed_tools {
-                Some(allowed) => runtime_calls
-                    .into_iter()
-                    .partition(|c| allowed.iter().any(|a| a == &c.name)),
-                None => (runtime_calls, Vec::new()),
-            };
-        let batches = partition_tool_calls(tool_registry.as_ref(), &allowed_calls);
-
-        // Build the approval gate and policy decider for this run. The gate is
-        // scoped to the run so session-level denies do not leak across sessions.
-        let approval_gate = request.approval_gate.clone().unwrap_or_else(|| {
-            Arc::new(ApprovalGate::new(
-                Arc::new(NoOpApprovalNotifier),
-                Duration::from_secs(300),
-            ))
-        });
-        let approval_ctx = ApprovalCtx {
-            gate: approval_gate,
-            interactive: request.interactive,
-            permission_mode: PermissionMode::Default,
-        };
-        let question_gate = request.question_gate.clone().unwrap_or_else(|| {
-            Arc::new(QuestionGate::new(
-                Arc::new(NoOpQuestionNotifier),
-                Duration::from_secs(300),
-            ))
-        });
-        let question_ctx = QuestionCtx {
-            gate: question_gate,
-            interactive: request.interactive,
-        };
-        let can_use_tool = build_policy_decider(tool_registry.clone());
-
-        // Snapshot the conversation so a Fork sub-agent spawned by a tool in
-        // this batch inherits the parent's context up to the tool-call turn.
-        let history_snapshot = Arc::new(messages.clone());
-
-        let tool_messages = run_tool_batches(
-            batches,
-            &workspace_path,
-            &request.session_id,
-            &request.agent_id,
-            request.sender.as_deref(),
-            &tool_registry,
-            Some(&can_use_tool),
-            Some(memory_backend.clone()),
-            session_ctx.viewed_files_sink(),
-            Some(approval_ctx),
-            Some(question_ctx),
-            request.allowed_tools.clone(),
-            spawner.clone(),
-            messenger.clone(),
-            swarm.clone(),
-            request.depth,
-            Some(history_snapshot),
-            todo_store.clone(),
-            None,
-            Some(plan_tracker.clone()),
-            telemetry.clone(),
-            iteration,
-            tx,
+            .with_plugin_skills(self.plugin_skills.clone())
+            .with_auto_extractor(self.auto_extractor.clone())
+            .with_commitment_extractor(self.commitment_extractor.clone())
+            .with_recall_config(self.recall_config.clone())
+            .with_selector(self.selector.clone())
+            .with_surfaced(self.surfaced.clone())
+            .with_goal_store(self.goal_store.clone())
+            .with_spawner(self.spawner())
+            .with_messenger(self.messenger())
+            .with_swarm(self.swarm())
+            .with_telemetry(self.telemetry.clone()),
         )
-        .await;
-        messages.extend(tool_messages);
-
-        if let Some(store) = &todo_store {
-            match store.load().await {
-                Ok(list) => current_todos = list,
-                Err(err) => tracing::warn!(error = %err, "failed to reload todo list"),
-            }
-        }
-
-        // Complete any pending plan-mode exit now that the turn has finished,
-        // and persist the tracker state.
-        {
-            let mut guard = plan_tracker.lock().await;
-            guard.finalize_exit_if_pending();
-            if let Err(err) = guard.save().await {
-                tracing::warn!(error = %err, "failed to save plan mode state");
-            }
-        }
-
-        for denied in denied_calls {
-            send(
-                tx,
-                RunEvent::ToolStart {
-                    tool_call: denied.clone(),
-                },
-            )
-            .await;
-            let result = ToolResult::error(format!(
-                "tool '{}' is not permitted in this sub-agent run",
-                denied.name
-            ));
-            send(
-                tx,
-                RunEvent::ToolEnd {
-                    tool_call: denied.clone(),
-                    result: result.clone(),
-                    canonical_meta: None,
-                },
-            )
-            .await;
-            messages.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: result.content,
-                name: None,
-                tool_calls: None,
-                tool_call_id: Some(denied.id),
-                cache_breakpoint: false,
-            });
-        }
-
-        if let Some(registry) = skill_registry.as_ref() {
-            let viewed_files = session_ctx.viewed_files();
-            let touched_files: Vec<String> = {
-                let mut set = HashSet::new();
-                for path in viewed_files {
-                    if let Ok(rel) = path.strip_prefix(&workspace_path) {
-                        let _ = set.insert(rel.to_string_lossy().to_string());
-                    }
-                    if let Some(name) = path.file_name() {
-                        let _ = set.insert(name.to_string_lossy().to_string());
-                    }
-                }
-                set.into_iter().collect()
-            };
-
-            let matched = registry.match_paths(&touched_files);
-            let new_matches: Vec<&legion_skills::Skill> = matched
-                .into_iter()
-                .filter(|s| !injected_bodies.contains(&s.frontmatter.name))
-                .take(skills_config.max_triggered_skills)
-                .collect();
-
-            if !new_matches.is_empty() {
-                let names: Vec<String> = new_matches
-                    .iter()
-                    .map(|s| s.frontmatter.name.clone())
-                    .collect();
-                let body_block = skill_body_block(&new_matches, skills_config.max_body_tokens);
-                if !body_block.trim().is_empty() {
-                    messages.push(ChatMessage::system(body_block));
-                    for name in &names {
-                        injected_bodies.insert(name.clone());
-                    }
-                    tracing::info!(
-                        skill_names = ?names,
-                        "injected skill bodies triggered by file paths"
-                    );
-                }
-            }
-        }
     }
-
-    if let Some(extractor) = auto_extractor {
-        extractor.spawn(
-            request.agent_id.clone(),
-            request.session_id.clone(),
-            messages.clone(),
-        );
-    }
-    if let Some(extractor) = commitment_extractor {
-        extractor.spawn_extract(
-            request.agent_id.clone(),
-            request.session_id.clone(),
-            messages.clone(),
-        );
-    }
-
-    send(
-        tx,
-        RunEvent::Lifecycle {
-            phase: LifecyclePhase::End,
-            error: None,
-        },
-    )
-    .await;
-    Ok(())
-}
-
-async fn consume_assistant_stream(
-    stream: &mut legion_provider::types::ChatStream,
-    tx: &mut Sender<RunEvent>,
-) -> Result<(String, Vec<ProviderToolCall>), RuntimeError> {
-    let mut text = String::new();
-    let mut pending: Vec<ProviderToolCall> = Vec::new();
-
-    while let Some(item) = stream.next().await {
-        let chunk: ChatChunk = item?;
-
-        if !chunk.delta.is_empty() {
-            text.push_str(&chunk.delta);
-            send(tx, RunEvent::AssistantDelta { delta: chunk.delta }).await;
-        }
-
-        if let Some(tcs) = chunk.tool_calls {
-            pending.extend(tcs);
-        }
-
-        match chunk.finish_reason {
-            Some(FinishReason::Stop) | Some(FinishReason::Length) => break,
-            Some(FinishReason::ToolCalls) => break,
-            Some(FinishReason::ContentFilter) => {
-                return Err(RuntimeError::Context("content filtered by provider".into()));
-            }
-            None => {
-                // Keep streaming until the provider signals completion.
-            }
-        }
-    }
-
-    Ok((text, pending))
-}
-
-async fn send(tx: &mut Sender<RunEvent>, event: RunEvent) {
-    let _ = tx.send(event).await;
-}
-
-const MAX_PTL_RETRIES: usize = 3;
-const PTL_TRUNCATE_PCT: f64 = 0.2;
-
-/// Call the provider, automatically truncating the oldest non-system messages
-/// and retrying when the provider reports the prompt is too long.
-async fn chat_with_ptl_retry(
-    provider_router: &ProviderRouter,
-    model_ref: &str,
-    base_req: ChatRequest,
-    messages: &mut Vec<ChatMessage>,
-) -> Result<legion_provider::types::ChatStream, RuntimeError> {
-    for attempt in 0..MAX_PTL_RETRIES {
-        let mut req = base_req.clone();
-        req.messages = messages.clone();
-        match provider_router.chat(model_ref, req).await {
-            Ok(stream) => return Ok(stream),
-            Err(ProviderError::PromptTooLong) => {
-                tracing::warn!(
-                    attempt,
-                    "provider returned prompt too long; truncating oldest messages"
-                );
-                truncate_head_for_ptl(messages);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(ProviderError::PromptTooLong.into())
-}
-
-/// Remove the oldest 20% of non-system messages (at least one) to recover from
-/// a prompt-too-long error.
-fn truncate_head_for_ptl(messages: &mut Vec<ChatMessage>) {
-    let non_system_indices: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role != ChatRole::System)
-        .map(|(i, _)| i)
-        .collect();
-    let remove_count = ((non_system_indices.len() as f64 * PTL_TRUNCATE_PCT)
-        .ceil()
-        .max(1.0) as usize)
-        .min(non_system_indices.len());
-    let remove: HashSet<usize> = non_system_indices.into_iter().take(remove_count).collect();
-
-    let mut i = 0;
-    messages.retain(|_| {
-        let keep = !remove.contains(&i);
-        i += 1;
-        keep
-    });
 }
 
 #[cfg(test)]
@@ -948,6 +259,7 @@ mod tests {
     use crate::tools::{
         Approval, Policy, Tool, ToolContext, ToolDefinitionExt, ToolError, ToolRegistry, ToolResult,
     };
+    use crate::types::{LifecyclePhase, RunEvent};
     use async_trait::async_trait;
     use futures::StreamExt;
 
@@ -966,10 +278,10 @@ mod tests {
     use legion_provider::router::ProviderRouter;
     use legion_provider::types::ChatRole;
     use legion_provider::types::{
-        ChatChunk, ChatRequest, ChatStream, EmbedRequest, Embedding, FinishReason, FunctionCall,
-        ModelInfo, ProviderError, ToolCall as ProviderToolCall, ToolDefinition,
+        ChatChunk, ChatMessage, ChatRequest, ChatStream, EmbedRequest, Embedding, FinishReason,
+        FunctionCall, ModelInfo, ProviderError, ToolCall as ProviderToolCall, ToolDefinition,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct EchoTool;
@@ -2199,23 +1511,6 @@ mod tests {
         assert!(result.content.contains("not found"));
     }
 
-    #[test]
-    fn truncate_head_for_ptl_removes_oldest_non_system_messages() {
-        let mut messages = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old1"),
-            ChatMessage::user("old2"),
-            ChatMessage::user("old3"),
-            ChatMessage::user("old4"),
-            ChatMessage::user("recent"),
-        ];
-        truncate_head_for_ptl(&mut messages);
-        // 20% of 5 non-system messages rounded up = 1 removed.
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[0].role, ChatRole::System);
-        assert_eq!(messages[1].content, "old2");
-    }
-
     struct PtlThenTextProvider {
         calls: AtomicUsize,
     }
@@ -2314,7 +1609,7 @@ mod tests {
         );
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
-            MAX_PTL_RETRIES,
+            crate::run_loop::MAX_PTL_RETRIES,
             "provider should be called once per retry attempt before giving up"
         );
     }
@@ -3154,5 +2449,193 @@ mod tests {
             contents.contains("\"event\":\"turn_completed\""),
             "metrics should contain turn_completed: {contents}"
         );
+    }
+
+    /// Provider that replies with plain text (no tool calls), captures the
+    /// user/system messages it sees, and marks the session goal complete
+    /// after a fixed number of calls — simulating the model finishing a goal.
+    struct GoalAwareProvider {
+        calls: AtomicUsize,
+        complete_after: usize,
+        store: GoalStore,
+        session_key: String,
+        captured_users: std::sync::Mutex<Vec<String>>,
+        captured_systems: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for GoalAwareProvider {
+        fn id(&self) -> &str {
+            "goal-aware"
+        }
+
+        fn supported_models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+
+        async fn chat(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let join = |role| {
+                req.messages
+                    .iter()
+                    .filter(|m| m.role == role)
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            self.captured_users
+                .lock()
+                .unwrap()
+                .push(join(ChatRole::User));
+            self.captured_systems
+                .lock()
+                .unwrap()
+                .push(join(ChatRole::System));
+            if call >= self.complete_after {
+                let mut goal = self
+                    .store
+                    .load(&self.session_key)
+                    .await
+                    .unwrap()
+                    .expect("goal should exist");
+                goal.set_status(crate::goal::GoalStatus::Complete, Some("done".to_string()));
+                self.store.save(&self.session_key, &goal).await.unwrap();
+            }
+            let chunk = ChatChunk {
+                index: 0,
+                delta: "done".to_string(),
+                finish_reason: Some(FinishReason::Stop),
+                tool_calls: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        async fn embed(&self, _req: EmbedRequest) -> Result<Vec<Embedding>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    const GOAL_SESSION_KEY: &str = "agent:main:dm:cli:default:direct:goal-peer";
+
+    fn goal_test_provider(store: GoalStore, complete_after: usize) -> Arc<GoalAwareProvider> {
+        Arc::new(GoalAwareProvider {
+            calls: AtomicUsize::new(0),
+            complete_after,
+            store,
+            session_key: GOAL_SESSION_KEY.to_string(),
+            captured_users: std::sync::Mutex::new(Vec::new()),
+            captured_systems: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn goal_test_runtime(
+        provider: Arc<GoalAwareProvider>,
+        tmp: &tempfile::TempDir,
+    ) -> AgentRuntime {
+        let mut router = ProviderRouter::new();
+        router.register_provider(provider);
+        // Point the workspace at the temp dir so the run does not load the
+        // developer machine's real bootstrap files.
+        let config = Config::from_json(&format!(
+            r#"{{ "gateway": {{ "auth": {{ "token": "x" }} }}, "agents": {{ "defaults": {{ "workspace": "{}" }} }} }}"#,
+            tmp.path().display()
+        ))
+        .unwrap();
+        AgentRuntime::new(
+            Arc::new(router),
+            Arc::new(FakeToolRegistry::new(vec![Arc::new(EchoTool)])),
+            Arc::new(FakeMemoryBackend),
+            config,
+        )
+        .with_surfaced(SurfacedStore::new(tmp.path()))
+        .with_goal_store(GoalStore::new(tmp.path()))
+    }
+
+    #[tokio::test]
+    async fn goal_gate_continues_run_until_goal_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = GoalStore::new(tmp.path());
+        store
+            .save(
+                GOAL_SESSION_KEY,
+                &crate::goal::Goal::new("ship the release"),
+            )
+            .await
+            .unwrap();
+
+        let provider = goal_test_provider(store, 2);
+        let runtime = goal_test_runtime(provider.clone(), &tmp);
+
+        let request = RunRequest::new(GOAL_SESSION_KEY, "main", "get to work", "goal-aware/gpt");
+        let events = collect_events(runtime.run(request).unwrap()).await;
+
+        assert!(
+            matches!(
+                events.last(),
+                Some(RunEvent::Lifecycle {
+                    phase: LifecyclePhase::End,
+                    error: None
+                })
+            ),
+            "run should end cleanly once the goal completes, got {events:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "goal gate should force one extra goal turn, got {events:?}"
+        );
+
+        // The active goal context line is injected into the first user message.
+        let users = provider.captured_users.lock().unwrap();
+        assert!(
+            users[0].contains("Active goal: ship the release"),
+            "first request should carry the goal context line: {}",
+            users[0]
+        );
+        assert!(users[0].contains("get to work"));
+        // The goal-turn reminder reaches the provider as a system message.
+        let systems = provider.captured_systems.lock().unwrap();
+        assert!(
+            systems
+                .iter()
+                .any(|s| s.contains("The session goal is still active")),
+            "a goal-turn reminder should reach the provider: {systems:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_gate_pursuit_is_not_cut_short_by_iteration_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = GoalStore::new(tmp.path());
+        store
+            .save(GOAL_SESSION_KEY, &crate::goal::Goal::new("long haul"))
+            .await
+            .unwrap();
+
+        // The provider completes the goal only on the 12th call — well past
+        // the configured 10-iteration cap. Goal pursuit lifts the cap.
+        let provider = goal_test_provider(store.clone(), 12);
+        let runtime = goal_test_runtime(provider.clone(), &tmp).with_max_iterations(Some(10));
+
+        let request = RunRequest::new(GOAL_SESSION_KEY, "main", "get to work", "goal-aware/gpt");
+        let events = collect_events(runtime.run(request).unwrap()).await;
+
+        assert!(
+            matches!(
+                events.last(),
+                Some(RunEvent::Lifecycle {
+                    phase: LifecyclePhase::End,
+                    error: None
+                })
+            ),
+            "goal pursuit should run past the iteration cap and end cleanly, got {events:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            12,
+            "the goal gate should keep the run going until the goal completes, got {events:?}"
+        );
+        let goal = store.load(GOAL_SESSION_KEY).await.unwrap().unwrap();
+        assert_eq!(goal.status, crate::goal::GoalStatus::Complete);
     }
 }

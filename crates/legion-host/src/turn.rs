@@ -4,10 +4,13 @@
 //! These functions are transport-neutral: they are used by the Gateway's
 //! WebSocket `agent` RPC and by embedded CLI hosts.
 
-use crate::routing::Router;
+use crate::routing::{Router, build_router_message};
 use crate::session::SessionStore;
 use futures::StreamExt;
+use legion_core::util::iso_now;
+use legion_plugin_sdk::session_key::{build_session_key, is_safe_segment, parse_session_key};
 use legion_protocol::{AgentAccepted, AgentParams, WsFrame};
+use legion_provider::model_ref::resolve_agent_model;
 use legion_provider::types::{
     ChatMessage as ProviderChatMessage, ChatRole, FunctionCall, ToolCall as ProviderToolCall,
 };
@@ -64,6 +67,29 @@ pub async fn prepare_run(
     Ok((stream, accepted, session_key))
 }
 
+/// Load the resumable history for `session_key` exactly as the model will see
+/// it: resolve the key against the router, load the transcript, and apply the
+/// same orphan repair as the resume path. Unsafe peer segments are rejected
+/// explicitly instead of silently answering with an empty history
+/// (`resolve_session_key` only checks the key shape; `SessionStore` would just
+/// resolve no path and return `[]`).
+///
+/// Returns the resolved session key and the repaired messages. Shared by the
+/// gateway's `sessions.history` RPC and the embedded CLI host.
+pub async fn load_session_history(
+    router: &Router,
+    session_store: &SessionStore,
+    orphan_policy: legion_core::config::OrphanPolicy,
+    session_key: &str,
+) -> Result<(String, Vec<ProviderChatMessage>), String> {
+    let resolved = crate::routing::resolve_session_key(session_key, router)
+        .filter(|key| parse_session_key(key).is_some_and(|parts| is_safe_segment(&parts.peer_id)))
+        .ok_or_else(|| format!("invalid session key: {session_key}"))?;
+    let mut messages = session_store.load_for_resume(&resolved).await;
+    let _ = crate::session::repair::recover_orphaned_tool_results(&mut messages, orphan_policy);
+    Ok((resolved, messages))
+}
+
 /// Start an agent run and return an event stream plus the accepted metadata.
 ///
 /// The session key is parsed to obtain the channel/account/peer, the agent is
@@ -80,22 +106,25 @@ pub fn start_agent_run(
     approval_gate: Option<Arc<ApprovalGate>>,
     question_gate: Option<Arc<QuestionGate>>,
 ) -> Result<(RunStream, AgentAccepted), String> {
-    let parts = crate::routing::parse_session_key(&params.session_key)
+    let parts = parse_session_key(&params.session_key)
         .ok_or_else(|| format!("invalid session key: {}", params.session_key))?;
 
     let router_msg = build_router_message(&parts, &params.message.content);
     let agent_id = router.resolve_agent(&router_msg);
-    let session_key = crate::routing::build_session_key(&agent_id, &parts);
-    let model_ref = resolve_model(config, &agent_id);
+    let session_key = build_session_key(&agent_id, &parts);
+    let model_ref = resolve_agent_model(config, &agent_id);
     let run_id = params
         .idempotency_key
         .clone()
-        .unwrap_or_else(|| format!("run-{}", uuid_like()));
+        .unwrap_or_else(|| format!("run-{}", legion_core::util::next_id()));
 
     let mut request = RunRequest::new(session_key, agent_id, params.message.content, model_ref)
         .with_history(params.history)
         .with_dump_prompts(params.dump_prompts)
         .with_workspace_override(params.workspace);
+    if let Some(sender) = params.sender {
+        request = request.with_sender(sender);
+    }
     if let Some(gate) = approval_gate {
         request = request.with_approval_gate(gate);
     }
@@ -111,65 +140,6 @@ pub fn start_agent_run(
     };
 
     Ok((stream, accepted))
-}
-
-fn build_router_message(
-    parts: &crate::routing::SessionKeyParts,
-    content: &str,
-) -> legion_plugin_sdk::channel::InboundMessage {
-    use legion_plugin_sdk::channel::{InboundMessage, Peer, Sender};
-    InboundMessage {
-        channel: parts.channel.clone(),
-        account_id: parts.account_id.clone(),
-        peer: Peer {
-            kind: parts.peer_kind.clone(),
-            id: parts.peer_id.clone(),
-            name: None,
-            thread_id: None,
-        },
-        sender: Sender {
-            id: parts.peer_id.clone(),
-            display_name: None,
-            username: None,
-        },
-        message_id: "rpc".into(),
-        text: Some(content.into()),
-        media: vec![],
-        reply_to: None,
-        timestamp: iso_now(),
-        is_mentioned: false,
-        ambient: false,
-        guild_id: None,
-        team_id: None,
-    }
-}
-
-fn resolve_model(config: &legion_core::config::Config, agent_id: &str) -> String {
-    if agent_id == "main" {
-        config.agents.defaults.model.clone()
-    } else {
-        config
-            .agents
-            .list
-            .iter()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.model.clone())
-            .or_else(|| config.agents.defaults.model.clone())
-    }
-    .unwrap_or_else(|| "openai/gpt-4o".to_string())
-}
-
-fn uuid_like() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!("run-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
-}
-
-fn iso_now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| format!("{}.{:03}Z", d.as_secs(), d.subsec_millis()))
-        .unwrap_or_default()
 }
 
 /// Convert a runtime event into the payload used by the `agent` event frame.
@@ -248,10 +218,10 @@ pub async fn drive_run_stream(
     user_content: String,
     run_id: String,
     mut emit: impl FnMut(WsFrame),
-) {
+) -> std::io::Result<()> {
     session_store
         .append(&session_key, &[ProviderChatMessage::user(user_content)])
-        .await;
+        .await?;
     let mut accumulator = SessionAccumulator::new();
     let mut end_event = None;
     while let Some(event) = stream.next().await {
@@ -271,22 +241,25 @@ pub async fn drive_run_stream(
             ..
         } = &event
         {
-            session_store.append_boundary(&session_key, boundary).await;
+            session_store
+                .append_boundary(&session_key, boundary)
+                .await?;
             // Persist the compacted head right after the boundary so
             // `load_for_resume` reconstructs the effective context from the
             // tail.
-            session_store.append(&session_key, resume_head).await;
+            session_store.append(&session_key, resume_head).await?;
         }
         accumulator.on_event(&event);
         let payload = run_event_to_payload(&run_id, &event);
         emit(WsFrame::event("agent", payload));
     }
     let new_messages = accumulator.into_history();
-    session_store.append(&session_key, &new_messages).await;
+    session_store.append(&session_key, &new_messages).await?;
     if let Some(event) = end_event {
         let payload = run_event_to_payload(&run_id, &event);
         emit(WsFrame::event("agent", payload));
     }
+    Ok(())
 }
 
 /// Accumulates runtime events into a conversation history for a single run.

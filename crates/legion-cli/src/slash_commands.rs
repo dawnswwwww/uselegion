@@ -5,8 +5,9 @@
 //! interception happens in `handle_key_event` before the driver).
 //!
 //! Three command kinds:
-//! - **Local** (`/help`, `/clear`, `/status`, `/quit`, `/skills`, `/goal`, `/theme`):
-//!   executed entirely in-process; the agent never sees them.
+//! - **Local** (`/help`, `/clear`, `/status`, `/quit`, `/skills`, `/goal`,
+//!   `/mcp`, `/theme`): executed entirely in-process; the agent never sees
+//!   them.
 //! - **Prompt** (`/skills:<name>`): injects `body` as a system message, then
 //!   sends the user's args to the agent as a normal turn.
 //! - **ScheduleLoop** (`/loop`): parsed locally, then scheduled as a recurring
@@ -142,6 +143,15 @@ pub fn builtins() -> Vec<SlashCommand> {
             description: "switch between fullscreen and inline viewport".into(),
             arg_hint: "<fullscreen|inline>".into(),
             kind: CommandKind::Local { run: cmd_mode },
+        },
+        SlashCommand {
+            name: "mcp".into(),
+            aliases: vec![],
+            description: "inspect and manage MCP servers".into(),
+            arg_hint: "[status|tools|resources|prompts|enable|disable|add|remove] ...".into(),
+            kind: CommandKind::Local {
+                run: crate::mcp_cmd::cmd_mcp,
+            },
         },
     ]
 }
@@ -588,14 +598,14 @@ mod tests {
     #[test]
     fn suggestions_empty_query_returns_builtins_with_help_first() {
         let all = suggestions("", &[]);
-        // 9 builtins, no skills, but empty query is capped at MAX_SUGGESTIONS (8).
+        // 10 builtins, no skills, but empty query is capped at MAX_SUGGESTIONS (8).
         assert_eq!(all.len(), 8);
         assert_eq!(all[0].name, "help");
     }
 
     #[test]
     fn suggestions_empty_query_caps_at_max() {
-        // With 9 builtins + 5 skills = 14 commands, the empty-query menu
+        // With 10 builtins + 5 skills = 15 commands, the empty-query menu
         // must cap at MAX_SUGGESTIONS (8), builtins first.
         let skills = vec![
             test_skill("alpha", "a"),

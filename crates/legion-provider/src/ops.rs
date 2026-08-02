@@ -6,7 +6,7 @@ use futures::{StreamExt, stream};
 use legion_core::config::{BackoffConfig, ModelCost, RateLimitConfig, RetryConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -323,7 +323,7 @@ impl CostTracker {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Err(err) = atomic_write(path, &text) {
+                    if let Err(err) = legion_core::fs::atomic_write(path, text.as_bytes()) {
                         tracing::warn!(
                             path = %path.display(),
                             error = %err,
@@ -344,31 +344,6 @@ impl CostTracker {
             models: inner.clone(),
         }
     }
-}
-
-/// Crash-safe write: serialize into a uniquely-named temp file in the same
-/// directory, then rename over the target so a crash mid-write never leaves a
-/// truncated snapshot behind. On failure the temp file is removed on a
-/// best-effort basis.
-fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "costs".to_string());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = path.with_file_name(format!("{file_name}.tmp-{}-{nanos}", std::process::id()));
-    if let Err(err) = std::fs::write(&tmp, contents) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
 }
 
 /// Wrap a chat stream so its accumulated output text is cost-tracked when the
