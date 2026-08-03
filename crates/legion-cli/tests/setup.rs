@@ -146,11 +146,11 @@ fn interactive_setup_reconfigure_writes_backup_and_merges_auth() {
         .assert()
         .success();
 
-    // 3 = Reconfigure; 2 = OpenAI; key; default model; skip test; defaults;
+    // 4 = Reconfigure; 2 = OpenAI; key; default model; skip test; defaults;
     // no channels; no daemon.
     let mut cmd = legion(&home);
     cmd.arg("setup")
-        .write_stdin("3\n2\nsk-two\n\n2\n\n\n6\n2\n")
+        .write_stdin("4\n2\nsk-two\n\n2\n\n\n6\n2\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("backed up"));
@@ -184,10 +184,10 @@ fn interactive_setup_abort_leaves_files_untouched() {
         .success();
     let before = config_text(&home);
 
-    // 4 = Abort on the existing-config prompt.
+    // 5 = Abort on the existing-config prompt.
     let mut cmd = legion(&home);
     cmd.arg("setup")
-        .write_stdin("4\n")
+        .write_stdin("5\n")
         .assert()
         .failure()
         .stderr(predicate::str::contains("setup aborted"));

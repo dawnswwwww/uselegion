@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "legion-acp"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "legion-automation"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "legion-channel"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1703,7 +1703,7 @@ dependencies = [
 
 [[package]]
 name = "legion-cli"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -1760,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "legion-core"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "dirs",
  "rstest",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "legion-gateway"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "legion-host"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "legion-mcp"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "legion-memory"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "legion-plugin-sdk"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "legion-core",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "legion-protocol"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "legion-provider",
  "serde",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "legion-provider"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "legion-runtime"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "legion-skills"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "glob",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "legion-telemetry"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "chrono",
  "dirs",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "legion-tools"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "legion-web"
-version = "0.1.0"
+version = "0.0.1-rc.1"
 dependencies = [
  "axum",
  "legion-core",

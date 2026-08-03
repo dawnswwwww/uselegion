@@ -285,6 +285,7 @@ fn helper_binary(name: &str) -> Option<PathBuf> {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn shell_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }

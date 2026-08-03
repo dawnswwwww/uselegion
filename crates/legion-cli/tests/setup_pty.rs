@@ -254,7 +254,7 @@ fn pty_setup_arrow_keys_and_masked_input() {
 }
 
 #[test]
-fn pty_setup_horizontal_menu_arrows_then_abort() {
+fn pty_setup_vertical_menu_arrows_then_abort() {
     let home = TempDir::new().unwrap();
     // Seed a config non-interactively first.
     let mut seed = Command::new(env!("CARGO_BIN_EXE_legion"));
@@ -279,10 +279,10 @@ fn pty_setup_horizontal_menu_arrows_then_abort() {
     let mut child = spawn_setup(&home, &slave);
     drop(slave);
 
-    // Horizontal menu Keep / Add provider / Reconfigure / Abort:
-    // → ×3 lands on Abort; Enter confirms.
+    // Vertical menu Keep / Add provider / Configure channels / Reconfigure /
+    // Abort: ↓ ×4 lands on Abort; Enter confirms.
     pty.expect("What would you like to do?");
-    pty.send("\x1b[C\x1b[C\x1b[C");
+    pty.send("\x1b[B\x1b[B\x1b[B\x1b[B");
     pty.send("\r");
 
     let status = wait_exit(&mut pty, &mut child);

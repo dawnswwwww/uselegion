@@ -77,6 +77,24 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+    env:
+      # musl C toolchain wiring (inert on non-musl targets): C sources are
+      # compiled with musl-gcc (apt musl-tools) for x86_64 and the musl.cc
+      # cross gcc for aarch64.
+      # Linking is asymmetric on purpose:
+      # - x86_64 keeps the default rust-lld self-contained link (static-pie);
+      #   Debian's musl-gcc spec would force a dynamic /lib/ld-musl loader.
+      # - aarch64 must override the linker: rust drives host `cc` there, which
+      #   cannot link aarch64 objects. musl.cc's gcc honors -static.
+      CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
+      CC_aarch64_unknown_linux_musl: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
+      # sqlite-vec 0.1.9 typedefs u_int8_t/16/64 without <sys/types.h>, which
+      # musl headers reject. Macro-aliasing them to the stdint types turns the
+      # typedefs into legal C11 same-type redefinitions. Plain -D flags (unlike
+      # `-include`) are also safe when cc-rs assembles ring's .S files.
+      CFLAGS_x86_64_unknown_linux_musl: -Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t
+      CFLAGS_aarch64_unknown_linux_musl: -Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t
     steps:
       - uses: actions/checkout@v4
 
@@ -89,17 +107,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config build-essential
+          sudo apt-get install -y pkg-config build-essential musl-tools
 
-      # For musl targets, use cargo-zigbuild: Zig bundles a complete musl +
-      # cross C toolchain, sidestepping the Docker/cross toolchain issues that
-      # break bundled-sqlite/sqlite-vec builds. (cargo-dist and many Rust
-      # projects use this for musl.)
-      - name: Install Zig + cargo-zigbuild (musl targets)
-        if: startsWith(matrix.target, 'unknown-linux-musl')
+      # aarch64 musl has no apt toolchain on x86_64 runners; use the prebuilt
+      # musl.cc cross compiler (x86_64 musl is covered by musl-tools above).
+      - name: Install aarch64 musl cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          pipx install ziglang
-          cargo install --locked cargo-zigbuild
+          curl -sSfL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -109,20 +124,16 @@ jobs:
       - name: Build legion-cli
         shell: bash
         run: |
+          # Capture build log to an artifact on failure so we can diagnose
+          # cross-compile errors without authenticated log access.
           set -o pipefail
-          if [ "${{ startsWith(matrix.target, 'unknown-linux-musl') }}" = "true" ]; then
-            # Capture build log to an artifact on failure so we can diagnose
-            # musl cross-compile errors without authenticated log access.
-            if ! cargo zigbuild --release --target ${{ matrix.target }} -p legion-cli 2>&1 | tee build-cli.log; then
-              echo "::warning::musl build failed; see build-cli.log artifact"
-              exit 1
-            fi
-          else
-            cargo build --release --target ${{ matrix.target }} -p legion-cli
+          if ! cargo build --release --target ${{ matrix.target }} -p legion-cli 2>&1 | tee build-cli.log; then
+            echo "::warning::build failed; see build-cli.log artifact"
+            exit 1
           fi
 
-      - name: Upload build log on failure (musl diagnostics)
-        if: failure() && startsWith(matrix.target, 'unknown-linux-musl')
+      - name: Upload build log on failure (diagnostics)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: buildlog-${{ matrix.target }}
@@ -132,11 +143,7 @@ jobs:
       - name: Build legion-gateway
         shell: bash
         run: |
-          if [ "${{ startsWith(matrix.target, 'unknown-linux-musl') }}" = "true" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }} -p legion-gateway
-          else
-            cargo build --release --target ${{ matrix.target }} -p legion-gateway
-          fi
+          cargo build --release --target ${{ matrix.target }} -p legion-gateway
 
       - name: Stage binaries + docs
         shell: bash
@@ -158,10 +165,19 @@ jobs:
           echo "$STAGE"
 
       - name: Verify static linking (Linux musl)
-        if: startsWith(matrix.target, 'x86_64-unknown-linux-musl')
+        if: contains(matrix.target, 'unknown-linux-musl')
         run: |
-          file target/${{ matrix.target }}/release/legion
-          ldd target/${{ matrix.target }}/release/legion 2>&1 || true
+          # Portable release binaries must be fully static: a dynamic
+          # /lib/ld-musl*.so.1 interpreter means the binary only runs where
+          # musl is installed. Fail the build rather than ship that.
+          for bin in legion legion-gateway; do
+            out=$(file target/${{ matrix.target }}/release/$bin)
+            echo "$out"
+            case "$out" in
+              *"statically linked"*|*"static-pie linked"*) ;;
+              *) echo "::error::$bin is not statically linked"; exit 1 ;;
+            esac
+          done
 
       - name: Archive (tar.gz)
         if: matrix.archive == 'tar.gz'
