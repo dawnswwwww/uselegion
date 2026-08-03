@@ -79,16 +79,16 @@ jobs:
             archive: zip
     env:
       # musl C toolchain wiring (inert on non-musl targets): C sources are
-      # compiled with musl-gcc (apt musl-tools) for x86_64 and the musl.cc
+      # compiled with musl-gcc (apt musl-tools) for x86_64 and the Bootlin
       # cross gcc for aarch64.
       # Linking is asymmetric on purpose:
       # - x86_64 keeps the default rust-lld self-contained link (static-pie);
       #   Debian's musl-gcc spec would force a dynamic /lib/ld-musl loader.
       # - aarch64 must override the linker: rust drives host `cc` there, which
-      #   cannot link aarch64 objects. musl.cc's gcc honors -static.
+      #   cannot link aarch64 objects. Bootlin's gcc honors -static.
       CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
-      CC_aarch64_unknown_linux_musl: /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: /opt/aarch64--musl--stable-2024.05-1/bin/aarch64-linux-gcc
+      CC_aarch64_unknown_linux_musl: /opt/aarch64--musl--stable-2024.05-1/bin/aarch64-linux-gcc
       # sqlite-vec 0.1.9 typedefs u_int8_t/16/64 without <sys/types.h>, which
       # musl headers reject. Macro-aliasing them to the stdint types turns the
       # typedefs into legal C11 same-type redefinitions. Plain -D flags (unlike
@@ -110,11 +110,15 @@ jobs:
           sudo apt-get install -y pkg-config build-essential musl-tools
 
       # aarch64 musl has no apt toolchain on x86_64 runners; use the prebuilt
-      # musl.cc cross compiler (x86_64 musl is covered by musl-tools above).
+      # Bootlin cross compiler (x86_64 musl is covered by musl-tools above).
+      # Bootlin is used instead of musl.cc because musl.cc is unreachable from
+      # GitHub-hosted runners (connect timeout).
       - name: Install aarch64 musl cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          curl -sSfL https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar -xz -C /opt
+          curl -sSfL --retry 3 --connect-timeout 30 \
+            https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2024.05-1.tar.xz \
+            | sudo tar -xJ -C /opt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
