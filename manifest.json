@@ -1,0 +1,48 @@
+{
+  "formatVersion": 1,
+  "channel": "stable",
+  "publishedAt": "2026-08-03T07:43:57.215Z",
+  "releases": [
+    {
+      "releaseId": "0.0.1-rc.1",
+      "cliVersionRange": ">=0.0.0 <0.1.0",
+      "gatewayVersion": "0.0.1-rc.1",
+      "protocol": {
+        "minPeerRevision": 1,
+        "maxPeerRevision": 1
+      },
+      "artifacts": [
+        {
+          "target": "aarch64-apple-darwin",
+          "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-aarch64-apple-darwin.tar.gz",
+          "sha256": "7cad77b94cb09adf59a4d3091ab7cd59b073d92a77fd7b8bcfbe9c629690e604",
+          "sizeBytes": 22484277
+        },
+        {
+          "target": "aarch64-unknown-linux-musl",
+          "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-aarch64-unknown-linux-musl.tar.gz",
+          "sha256": "5434591589a799a6c9536f873a5ec96515be138de8c0017e5e822f58f7f9006a",
+          "sizeBytes": 24816350
+        },
+        {
+          "target": "x86_64-apple-darwin",
+          "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-x86_64-apple-darwin.tar.gz",
+          "sha256": "644b9e3afbdf215e99476d487a9e39c564564415143b3bc187653be99cd3fdfb",
+          "sizeBytes": 23405479
+        },
+        {
+          "target": "x86_64-pc-windows-msvc",
+          "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-x86_64-pc-windows-msvc.zip",
+          "sha256": "2cd607c3693fa60b8a32ac45c31808ff9f548c889e141795b6129a2252861ede",
+          "sizeBytes": 20745640
+        },
+        {
+          "target": "x86_64-unknown-linux-musl",
+          "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-x86_64-unknown-linux-musl.tar.gz",
+          "sha256": "9c150a9ddba4a68cb0098bf96108e7760d18be1a17b3e1eb8f457e5d193e404e",
+          "sizeBytes": 25508565
+        }
+      ]
+    }
+  ]
+}
