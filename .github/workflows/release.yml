@@ -133,7 +133,7 @@ jobs:
           # Capture build log to an artifact on failure so we can diagnose
           # cross-compile errors without authenticated log access.
           set -o pipefail
-          if ! cargo build --release --target ${{ matrix.target }} -p legion-cli 2>&1 | tee build-cli.log; then
+          if ! cargo build --release --target ${{ matrix.target }} -p uselegion-cli 2>&1 | tee build-cli.log; then
             echo "::warning::build failed; see build-cli.log artifact"
             exit 1
           fi
@@ -149,7 +149,7 @@ jobs:
       - name: Build legion-gateway
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} -p legion-gateway
+          cargo build --release --target ${{ matrix.target }} -p uselegion-gateway
 
       - name: Stage binaries + docs
         shell: bash
