@@ -198,14 +198,19 @@ jobs:
 
       - name: Archive (zip)
         if: matrix.archive == 'zip'
-        shell: pwsh
+        # bash (Git Bash on windows runners): the previous pwsh variant
+        # silently produced no .sha256 sidecar, which later broke
+        # build-manifest.mjs. ls at the end makes the step self-verifying.
+        shell: bash
         run: |
-          $env:VERSION = "${{ needs.version-check.outputs.version }}"
-          $env:TARGET = "${{ matrix.target }}"
-          $stage = "legion-$env:VERSION-$env:TARGET"
-          Compress-Archive -Path "$stage" -DestinationPath "$stage.zip"
-          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -NoNewline "$stage.zip.sha256" $hash
+          set -euo pipefail
+          command -v 7z >/dev/null || 7z() { "/c/Program Files/7-Zip/7z.exe" "$@"; }
+          VERSION="${{ needs.version-check.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="legion-${VERSION}-${TARGET}"
+          7z a -tzip "${STAGE}.zip" "$STAGE" >/dev/null
+          sha256sum "${STAGE}.zip" | awk '{print $1}' > "${STAGE}.zip.sha256"
+          ls -la "${STAGE}.zip" "${STAGE}.zip.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

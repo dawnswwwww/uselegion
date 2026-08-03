@@ -12,7 +12,7 @@
 // never drifts from the compiled CLI. Outputs camelCase JSON matching
 // `ReleaseManifest` in crates/legion-protocol/src/manifest.rs.
 
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 const [, , version, distDir] = process.argv;
@@ -57,7 +57,7 @@ for (const archive of archives) {
   }
   const target = base.slice(prefix.length);
 
-  const { size } = await readFile(join(distDir, archive));
+  const { size } = await stat(join(distDir, archive));
   const url = `https://github.com/dawnswwwww/uselegion/releases/download/v${version}/${archive}`;
 
   artifacts.push({ target, url, sha256, sizeBytes: size });
