@@ -369,7 +369,7 @@ jobs:
               echo "$out"
             else
               echo "$out"
-              if echo "$out" | grep -q "already uploaded"; then
+              if echo "$out" | grep -qE "already (uploaded|exists)"; then
                 echo "  (already published: $1)"
               else
                 echo "::error::publish failed for $1"
