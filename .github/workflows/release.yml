@@ -378,20 +378,24 @@ jobs:
             fi
             echo "::endgroup::"
           }
+          # Topological order (verified against each crate's internal deps).
+          # Notably: plugin-sdk needs skills; host must be published because
+          # gateway and cli depend on it.
           publish uselegion-core
-          publish uselegion-plugin-sdk
-          publish uselegion-protocol
-          publish uselegion-provider
-          publish uselegion-runtime
-          publish uselegion-memory
-          publish uselegion-tools
-          publish uselegion-channel
-          publish uselegion-automation
           publish uselegion-skills
+          publish uselegion-telemetry
           publish uselegion-mcp
           publish uselegion-web
-          publish uselegion-telemetry
+          publish uselegion-plugin-sdk
+          publish uselegion-provider
+          publish uselegion-protocol
+          publish uselegion-runtime
+          publish uselegion-automation
+          publish uselegion-channel
           publish uselegion-acp
+          publish uselegion-memory
+          publish uselegion-tools
+          publish uselegion-host
           publish uselegion-gateway
           publish uselegion-cli   # last: depends on all of the above
 
