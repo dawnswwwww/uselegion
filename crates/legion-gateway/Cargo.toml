@@ -14,19 +14,19 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk" }
-legion-protocol = { path = "../legion-protocol" }
-legion-host = { path = "../legion-host" }
-legion-runtime = { path = "../legion-runtime" }
-legion-tools = { path = "../legion-tools" }
-legion-memory = { path = "../legion-memory" }
-legion-provider = { path = "../legion-provider" }
-legion-channel = { path = "../legion-channel" }
-legion-web = { path = "../legion-web" }
-legion-acp = { path = "../legion-acp" }
-legion-automation = { path = "../legion-automation" }
-legion-mcp = { path = "../legion-mcp" }
+legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+legion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
+legion-host = { path = "../legion-host", version = "0.0.1-rc.1" }
+legion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
+legion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
+legion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
+legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+legion-channel = { path = "../legion-channel", version = "0.0.1-rc.1" }
+legion-web = { path = "../legion-web", version = "0.0.1-rc.1" }
+legion-acp = { path = "../legion-acp", version = "0.0.1-rc.1" }
+legion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
+legion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
 
 async-trait = { workspace = true }
 axum = { workspace = true }

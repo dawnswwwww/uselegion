@@ -14,12 +14,12 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk" }
-legion-runtime = { path = "../legion-runtime" }
-legion-provider = { path = "../legion-provider" }
-legion-mcp = { path = "../legion-mcp" }
-legion-automation = { path = "../legion-automation" }
+legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+legion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
+legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+legion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
+legion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

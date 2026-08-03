@@ -21,7 +21,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
-legion-core = { path = "../legion-core" }
+legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

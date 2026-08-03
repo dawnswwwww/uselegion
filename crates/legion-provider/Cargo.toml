@@ -14,8 +14,8 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk" }
+legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
 async-trait = { workspace = true }
 dirs = { workspace = true }
 eventsource-stream = { workspace = true }

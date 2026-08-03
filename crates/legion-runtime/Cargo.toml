@@ -14,11 +14,11 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core" }
-legion-provider = { path = "../legion-provider" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk" }
-legion-skills = { path = "../legion-skills" }
-legion-telemetry = { path = "../legion-telemetry" }
+legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+legion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
+legion-telemetry = { path = "../legion-telemetry", version = "0.0.1-rc.1" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

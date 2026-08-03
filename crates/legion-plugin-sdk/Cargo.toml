@@ -14,8 +14,8 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core" }
-legion-skills = { path = "../legion-skills" }
+legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+legion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

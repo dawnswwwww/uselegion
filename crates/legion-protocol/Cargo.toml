@@ -16,7 +16,7 @@ readme = "../../README.md"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-legion-provider = { path = "../legion-provider" }
+legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
