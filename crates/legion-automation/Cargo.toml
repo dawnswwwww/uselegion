@@ -1,5 +1,5 @@
 [package]
-name = "legion-automation"
+name = "uselegion-automation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,10 +14,10 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
-legion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
-legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+uselegion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
+uselegion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -34,3 +34,6 @@ sha2 = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
+
+[lib]
+name = "legion_automation"

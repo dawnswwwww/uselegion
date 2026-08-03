@@ -1,5 +1,5 @@
 [package]
-name = "legion-gateway"
+name = "uselegion-gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,19 +14,19 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
-legion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
-legion-host = { path = "../legion-host", version = "0.0.1-rc.1" }
-legion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
-legion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
-legion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
-legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
-legion-channel = { path = "../legion-channel", version = "0.0.1-rc.1" }
-legion-web = { path = "../legion-web", version = "0.0.1-rc.1" }
-legion-acp = { path = "../legion-acp", version = "0.0.1-rc.1" }
-legion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
-legion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+uselegion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
+uselegion-host = { path = "../legion-host", version = "0.0.1-rc.1" }
+uselegion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
+uselegion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
+uselegion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
+uselegion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+uselegion-channel = { path = "../legion-channel", version = "0.0.1-rc.1" }
+uselegion-web = { path = "../legion-web", version = "0.0.1-rc.1" }
+uselegion-acp = { path = "../legion-acp", version = "0.0.1-rc.1" }
+uselegion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
+uselegion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
 
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -48,3 +48,10 @@ tempfile = { workspace = true }
 temp-env = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+
+[lib]
+name = "legion_gateway"
+
+[[bin]]
+name = "legion-gateway"
+path = "src/main.rs"

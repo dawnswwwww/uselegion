@@ -1,5 +1,5 @@
 [package]
-name = "legion-protocol"
+name = "uselegion-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,7 +16,10 @@ readme = "../../README.md"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+uselegion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[lib]
+name = "legion_protocol"

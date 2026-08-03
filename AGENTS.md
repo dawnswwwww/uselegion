@@ -59,7 +59,7 @@ E2E tests in `crates/legion-gateway/tests/e2e_minimax*.rs` and `crates/legion-pr
 - **Providers:** `crates/legion-provider/src/router.rs`
 - **Session goals:** model/store/turn-end gate in `crates/legion-runtime/src/goal.rs` / `goal_gate.rs`, model-facing tools in `crates/legion-host/src/goal_tools.rs`, `/goal` command in `crates/legion-cli/src/slash_commands.rs`
 - **CLI / Gateway distribution:** `crates/legion-cli/src/gateway_manager.rs`, `crates/legion-cli/src/lib.rs`, `crates/legion-cli/src/main.rs`, and `crates/legion-protocol/src/compatibility.rs` / `manifest.rs`
-- Keep `cargo tree -p legion-cli` free of `legion-gateway`.
+- Keep `cargo tree -p uselegion-cli` free of `uselegion-gateway`.
 
 ## Testing
 

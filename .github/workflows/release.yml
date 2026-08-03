@@ -267,7 +267,7 @@ jobs:
 
             **Cargo**:
             ```bash
-            cargo install legion-cli
+            cargo install uselegion-cli
             ```
 
             **Direct download**: grab the archive for your platform below,
@@ -378,22 +378,22 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          publish legion-core
-          publish legion-plugin-sdk
-          publish legion-protocol
-          publish legion-provider
-          publish legion-runtime
-          publish legion-memory
-          publish legion-tools
-          publish legion-channel
-          publish legion-automation
-          publish legion-skills
-          publish legion-mcp
-          publish legion-web
-          publish legion-telemetry
-          publish legion-acp
-          publish legion-gateway
-          publish legion-cli   # last: depends on all of the above
+          publish uselegion-core
+          publish uselegion-plugin-sdk
+          publish uselegion-protocol
+          publish uselegion-provider
+          publish uselegion-runtime
+          publish uselegion-memory
+          publish uselegion-tools
+          publish uselegion-channel
+          publish uselegion-automation
+          publish uselegion-skills
+          publish uselegion-mcp
+          publish uselegion-web
+          publish uselegion-telemetry
+          publish uselegion-acp
+          publish uselegion-gateway
+          publish uselegion-cli   # last: depends on all of the above
 
   # ──────────────────────────────────────────────────────────────────────
   # 6. Update the Homebrew tap formula.

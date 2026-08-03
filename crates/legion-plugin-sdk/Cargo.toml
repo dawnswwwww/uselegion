@@ -1,5 +1,5 @@
 [package]
-name = "legion-plugin-sdk"
+name = "uselegion-plugin-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,8 +14,8 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
-legion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -25,3 +25,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+
+[lib]
+name = "legion_plugin_sdk"

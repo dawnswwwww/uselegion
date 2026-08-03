@@ -1,5 +1,5 @@
 [package]
-name = "legion-cli"
+name = "uselegion-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,17 +14,17 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
-legion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
-legion-host = { path = "../legion-host", version = "0.0.1-rc.1" }
-legion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
-legion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
-legion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
-legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
-legion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
-legion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
-legion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
+uselegion-host = { path = "../legion-host", version = "0.0.1-rc.1" }
+uselegion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
+uselegion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
+uselegion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+uselegion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
+uselegion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+uselegion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
+uselegion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
+uselegion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
 clap = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
@@ -73,3 +73,6 @@ anyhow = { workspace = true }
 [[bin]]
 name = "legion"
 path = "src/main.rs"
+
+[lib]
+name = "legion_cli"

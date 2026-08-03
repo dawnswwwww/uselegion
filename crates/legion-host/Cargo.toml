@@ -1,5 +1,5 @@
 [package]
-name = "legion-host"
+name = "uselegion-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,19 +14,19 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
-legion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
-legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
-legion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
-legion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
-legion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
-legion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
-legion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
-legion-acp = { path = "../legion-acp", version = "0.0.1-rc.1" }
-legion-channel = { path = "../legion-channel", version = "0.0.1-rc.1" }
-legion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
-legion-telemetry = { path = "../legion-telemetry", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-protocol = { path = "../legion-protocol", version = "0.0.1-rc.1" }
+uselegion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+uselegion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+uselegion-runtime = { path = "../legion-runtime", version = "0.0.1-rc.1" }
+uselegion-mcp = { path = "../legion-mcp", version = "0.0.1-rc.1" }
+uselegion-memory = { path = "../legion-memory", version = "0.0.1-rc.1" }
+uselegion-tools = { path = "../legion-tools", version = "0.0.1-rc.1" }
+uselegion-automation = { path = "../legion-automation", version = "0.0.1-rc.1" }
+uselegion-acp = { path = "../legion-acp", version = "0.0.1-rc.1" }
+uselegion-channel = { path = "../legion-channel", version = "0.0.1-rc.1" }
+uselegion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
+uselegion-telemetry = { path = "../legion-telemetry", version = "0.0.1-rc.1" }
 
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -41,3 +41,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[lib]
+name = "legion_host"

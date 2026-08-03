@@ -1,5 +1,5 @@
 [package]
-name = "legion-runtime"
+name = "uselegion-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,11 +14,11 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
-legion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
-legion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
-legion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
-legion-telemetry = { path = "../legion-telemetry", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-provider = { path = "../legion-provider", version = "0.0.1-rc.1" }
+uselegion-plugin-sdk = { path = "../legion-plugin-sdk", version = "0.0.1-rc.1" }
+uselegion-skills = { path = "../legion-skills", version = "0.0.1-rc.1" }
+uselegion-telemetry = { path = "../legion-telemetry", version = "0.0.1-rc.1" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -37,3 +37,6 @@ rstest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-test = { workspace = true }
+
+[lib]
+name = "legion_runtime"

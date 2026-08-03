@@ -1641,392 +1641,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "legion-acp"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "futures",
- "legion-core",
- "legion-plugin-sdk",
- "legion-provider",
- "legion-runtime",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-automation"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "chrono",
- "cron",
- "dirs",
- "futures",
- "hmac",
- "legion-core",
- "legion-plugin-sdk",
- "legion-provider",
- "legion-runtime",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-channel"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "futures",
- "legion-core",
- "legion-plugin-sdk",
- "legion-runtime",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "legion-cli"
-version = "0.0.1-rc.1"
-dependencies = [
- "ansi-to-tui",
- "anyhow",
- "assert_cmd",
- "async-trait",
- "atty",
- "base64",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "ed25519-dalek",
- "flate2",
- "fs2",
- "futures",
- "hex",
- "legion-automation",
- "legion-core",
- "legion-host",
- "legion-mcp",
- "legion-memory",
- "legion-plugin-sdk",
- "legion-protocol",
- "legion-provider",
- "legion-runtime",
- "legion-skills",
- "legion-tools",
- "libc",
- "linkify",
- "portable-pty",
- "predicates",
- "pulldown-cmark",
- "rand 0.9.4",
- "ratatui",
- "regex",
- "reqwest",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "syntect",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
- "tui-textarea",
- "unicode-width 0.2.0",
- "uuid",
- "zip",
-]
-
-[[package]]
-name = "legion-core"
-version = "0.0.1-rc.1"
-dependencies = [
- "dirs",
- "rstest",
- "serde",
- "serde_json",
- "serde_json5",
- "temp-env",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-gateway"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "dirs",
- "futures",
- "hmac",
- "legion-acp",
- "legion-automation",
- "legion-channel",
- "legion-core",
- "legion-host",
- "legion-mcp",
- "legion-memory",
- "legion-plugin-sdk",
- "legion-protocol",
- "legion-provider",
- "legion-runtime",
- "legion-tools",
- "legion-web",
- "reqwest",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "temp-env",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "legion-host"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "base64",
- "dirs",
- "futures",
- "legion-acp",
- "legion-automation",
- "legion-channel",
- "legion-core",
- "legion-mcp",
- "legion-memory",
- "legion-plugin-sdk",
- "legion-protocol",
- "legion-provider",
- "legion-runtime",
- "legion-skills",
- "legion-telemetry",
- "legion-tools",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-mcp"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "eventsource-stream",
- "futures",
- "legion-core",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "legion-memory"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "dirs",
- "legion-core",
- "legion-plugin-sdk",
- "legion-provider",
- "legion-runtime",
- "libsqlite3-sys",
- "serde",
- "serde_json",
- "sqlite-vec",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-plugin-sdk"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "legion-core",
- "legion-skills",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "legion-protocol"
-version = "0.0.1-rc.1"
-dependencies = [
- "legion-provider",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "legion-provider"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "dirs",
- "eventsource-stream",
- "futures",
- "hmac",
- "legion-core",
- "legion-plugin-sdk",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tiktoken-rs",
- "tokio",
- "tokio-test",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "legion-runtime"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "chrono",
- "dirs",
- "futures",
- "jsonschema",
- "legion-core",
- "legion-plugin-sdk",
- "legion-provider",
- "legion-skills",
- "legion-telemetry",
- "regex",
- "rstest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tiktoken-rs",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "legion-skills"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "glob",
- "serde",
- "serde_yaml",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-telemetry"
-version = "0.0.1-rc.1"
-dependencies = [
- "chrono",
- "dirs",
- "legion-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "legion-tools"
-version = "0.0.1-rc.1"
-dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "cron",
- "dirs",
- "futures",
- "glob",
- "legion-automation",
- "legion-core",
- "legion-mcp",
- "legion-plugin-sdk",
- "legion-provider",
- "legion-runtime",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "legion-web"
-version = "0.0.1-rc.1"
-dependencies = [
- "axum",
- "legion-core",
- "mime",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4310,6 +3924,392 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "uselegion-acp"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uselegion-core",
+ "uselegion-plugin-sdk",
+ "uselegion-provider",
+ "uselegion-runtime",
+]
+
+[[package]]
+name = "uselegion-automation"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cron",
+ "dirs",
+ "futures",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uselegion-core",
+ "uselegion-plugin-sdk",
+ "uselegion-provider",
+ "uselegion-runtime",
+]
+
+[[package]]
+name = "uselegion-channel"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uselegion-core",
+ "uselegion-plugin-sdk",
+ "uselegion-runtime",
+ "wiremock",
+]
+
+[[package]]
+name = "uselegion-cli"
+version = "0.0.1-rc.1"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "assert_cmd",
+ "async-trait",
+ "atty",
+ "base64",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "ed25519-dalek",
+ "flate2",
+ "fs2",
+ "futures",
+ "hex",
+ "libc",
+ "linkify",
+ "portable-pty",
+ "predicates",
+ "pulldown-cmark",
+ "rand 0.9.4",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syntect",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "tui-textarea",
+ "unicode-width 0.2.0",
+ "uselegion-automation",
+ "uselegion-core",
+ "uselegion-host",
+ "uselegion-mcp",
+ "uselegion-memory",
+ "uselegion-plugin-sdk",
+ "uselegion-protocol",
+ "uselegion-provider",
+ "uselegion-runtime",
+ "uselegion-skills",
+ "uselegion-tools",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "uselegion-core"
+version = "0.0.1-rc.1"
+dependencies = [
+ "dirs",
+ "rstest",
+ "serde",
+ "serde_json",
+ "serde_json5",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "uselegion-gateway"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "dirs",
+ "futures",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "uselegion-acp",
+ "uselegion-automation",
+ "uselegion-channel",
+ "uselegion-core",
+ "uselegion-host",
+ "uselegion-mcp",
+ "uselegion-memory",
+ "uselegion-plugin-sdk",
+ "uselegion-protocol",
+ "uselegion-provider",
+ "uselegion-runtime",
+ "uselegion-tools",
+ "uselegion-web",
+]
+
+[[package]]
+name = "uselegion-host"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "dirs",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uselegion-acp",
+ "uselegion-automation",
+ "uselegion-channel",
+ "uselegion-core",
+ "uselegion-mcp",
+ "uselegion-memory",
+ "uselegion-plugin-sdk",
+ "uselegion-protocol",
+ "uselegion-provider",
+ "uselegion-runtime",
+ "uselegion-skills",
+ "uselegion-telemetry",
+ "uselegion-tools",
+]
+
+[[package]]
+name = "uselegion-mcp"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uselegion-core",
+ "wiremock",
+]
+
+[[package]]
+name = "uselegion-memory"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "libsqlite3-sys",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uselegion-core",
+ "uselegion-plugin-sdk",
+ "uselegion-provider",
+ "uselegion-runtime",
+]
+
+[[package]]
+name = "uselegion-plugin-sdk"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uselegion-core",
+ "uselegion-skills",
+]
+
+[[package]]
+name = "uselegion-protocol"
+version = "0.0.1-rc.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uselegion-provider",
+]
+
+[[package]]
+name = "uselegion-provider"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "eventsource-stream",
+ "futures",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uselegion-core",
+ "uselegion-plugin-sdk",
+ "wiremock",
+]
+
+[[package]]
+name = "uselegion-runtime"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dirs",
+ "futures",
+ "jsonschema",
+ "regex",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uselegion-core",
+ "uselegion-plugin-sdk",
+ "uselegion-provider",
+ "uselegion-skills",
+ "uselegion-telemetry",
+]
+
+[[package]]
+name = "uselegion-skills"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "glob",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "uselegion-telemetry"
+version = "0.0.1-rc.1"
+dependencies = [
+ "chrono",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uselegion-core",
+]
+
+[[package]]
+name = "uselegion-tools"
+version = "0.0.1-rc.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "cron",
+ "dirs",
+ "futures",
+ "glob",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uselegion-automation",
+ "uselegion-core",
+ "uselegion-mcp",
+ "uselegion-plugin-sdk",
+ "uselegion-provider",
+ "uselegion-runtime",
+ "wiremock",
+]
+
+[[package]]
+name = "uselegion-web"
+version = "0.0.1-rc.1"
+dependencies = [
+ "axum",
+ "mime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uselegion-core",
 ]
 
 [[package]]

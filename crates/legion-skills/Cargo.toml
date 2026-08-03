@@ -1,5 +1,5 @@
 [package]
-name = "legion-skills"
+name = "uselegion-skills"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,3 +25,6 @@ glob = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[lib]
+name = "legion_skills"

@@ -1,5 +1,5 @@
 [package]
-name = "legion-mcp"
+name = "uselegion-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,7 +14,7 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-legion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
+uselegion-core = { path = "../legion-core", version = "0.0.1-rc.1" }
 async-trait = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
@@ -30,3 +30,6 @@ tracing = { workspace = true }
 tokio-tungstenite = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }
+
+[lib]
+name = "legion_mcp"
