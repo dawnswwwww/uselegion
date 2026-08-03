@@ -1,7 +1,7 @@
 {
   "formatVersion": 1,
   "channel": "stable",
-  "publishedAt": "2026-08-03T08:47:49.380Z",
+  "publishedAt": "2026-08-03T09:02:29.265Z",
   "releases": [
     {
       "releaseId": "0.0.1-rc.1",
@@ -15,32 +15,32 @@
         {
           "target": "aarch64-apple-darwin",
           "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-aarch64-apple-darwin.tar.gz",
-          "sha256": "800860c853e217428cac355195ccdb8f4e20f51bb8aec5691fe44716b2228b5e",
-          "sizeBytes": 22483630
+          "sha256": "c2770192b186a65b7e65522e3db717d502c34c752791681b40bb60130f103207",
+          "sizeBytes": 22483639
         },
         {
           "target": "aarch64-unknown-linux-musl",
           "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-aarch64-unknown-linux-musl.tar.gz",
-          "sha256": "dc94812bd560572e296455185f035083971b39e0de318f5794c29e241436da8e",
-          "sizeBytes": 24814131
+          "sha256": "2b9fdce4a5ffe9a31249c0ffa6f7438b916cb9c32917a9ef4ddf16af5c5921c5",
+          "sizeBytes": 24814129
         },
         {
           "target": "x86_64-apple-darwin",
           "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-x86_64-apple-darwin.tar.gz",
-          "sha256": "683ba324ad1fd1ca31df825b281ff1482ddba4478cfe5ef5bb058cc59df8a678",
-          "sizeBytes": 23406932
+          "sha256": "a3bfb613843e861526b6353a1bebf70d686b27dbc89aa4f70420716e00541d26",
+          "sizeBytes": 23406929
         },
         {
           "target": "x86_64-pc-windows-msvc",
           "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-x86_64-pc-windows-msvc.zip",
-          "sha256": "af4b217b4f326081d17832602c2e426627989bf4436fa6dd326abda94c24a057",
-          "sizeBytes": 20747247
+          "sha256": "6fc97674039482e12b05a7340064b8590e8a0134c3d3235b9da436d221949cdb",
+          "sizeBytes": 20746517
         },
         {
           "target": "x86_64-unknown-linux-musl",
           "url": "https://github.com/dawnswwwww/uselegion/releases/download/v0.0.1-rc.1/legion-0.0.1-rc.1-x86_64-unknown-linux-musl.tar.gz",
-          "sha256": "68aaa126d87c84691619a2ca63fb15881b85fc1d89990b8dcabc2a8900deee31",
-          "sizeBytes": 25505191
+          "sha256": "93b362139a0bac9dc3fcf6e036a98f35ca293fa7f1fc380a9880c8e4bb1b0f03",
+          "sizeBytes": 25505140
         }
       ]
     }
