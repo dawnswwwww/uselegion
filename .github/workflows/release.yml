@@ -299,6 +299,8 @@ jobs:
           cat manifest.json
 
       - name: Sign manifest
+        env:
+          LEGION_RELEASE_SIGNING_KEY: ${{ secrets.LEGION_RELEASE_SIGNING_KEY }}
         run: |
           node scripts/sign-manifest.mjs manifest.json manifest.json.sig
           echo "--- signature ---"
