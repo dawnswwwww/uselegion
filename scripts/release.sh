@@ -42,6 +42,22 @@ if [ "$BRANCH" != "main" ]; then
   exit 1
 fi
 
+# Resolve the push remote: prefer main's configured upstream, fall back to
+# the only remote if there is exactly one. Don't hardcode 'origin' — clones
+# may name it anything (e.g. 'uselegion').
+REMOTE="$(git config "branch.${BRANCH}.remote" 2>/dev/null || true)"
+if [ -z "$REMOTE" ]; then
+  REMOTES="$(git remote)"
+  if [ "$(echo "$REMOTES" | wc -l | tr -d ' ')" = "1" ]; then
+    REMOTE="$REMOTES"
+  else
+    echo "error: no upstream configured for '$BRANCH' and multiple remotes exist:" >&2
+    echo "$REMOTES" >&2
+    echo "set one with: git branch --set-upstream-to=<remote>/$BRANCH" >&2
+    exit 1
+  fi
+fi
+
 # Bump version in the workspace root (single source of truth).
 CURRENT=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 if [ "$CURRENT" = "$VERSION" ]; then
@@ -71,12 +87,12 @@ git commit -m "release: v${VERSION}"
 git tag "v${VERSION}"
 echo
 echo "created tag v${VERSION}. Push to trigger the release workflow:"
-echo "  git push origin main --tags"
+echo "  git push $REMOTE main --tags"
 echo
 read -r -p "push now? [y/N] " ans
 if [[ "$ans" =~ ^[Yy]$ ]]; then
-  git push origin main --tags
+  git push "$REMOTE" main --tags
   echo "pushed. Watch: https://github.com/dawnswwwww/uselegion/actions"
 else
-  echo "not pushed. Run when ready: git push origin main --tags"
+  echo "not pushed. Run when ready: git push $REMOTE main --tags"
 fi
