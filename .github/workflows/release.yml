@@ -523,13 +523,19 @@ jobs:
                 ;;
             esac
           done
-          # Stamp version into every package.json.
+          # Stamp version into every package.json. The main package's
+          # optionalDependencies must be pinned to the same version —
+          # otherwise npm silently skips the platform packages (unresolvable
+          # optional deps are not fatal) and the wrapper installs with no
+          # binary.
           for pj in npm/*/package.json; do
             python3 - "$pj" "$VERSION" <<'PY'
           import json, sys
           f, ver = sys.argv[1], sys.argv[2]
           d = json.load(open(f))
           d["version"] = ver
+          if "optionalDependencies" in d:
+              d["optionalDependencies"] = {k: ver for k in d["optionalDependencies"]}
           json.dump(d, open(f, "w"), indent=2)
           print(f"stamped {f} -> {ver}")
           PY

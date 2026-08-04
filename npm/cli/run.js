@@ -8,8 +8,8 @@
 // optional dep was pruned).
 
 const { spawn } = require("node:child_process");
-const { existsSync } = require("node:fs");
-const { join } = require("node:path");
+const { existsSync, realpathSync } = require("node:fs");
+const { join, delimiter } = require("node:path");
 
 // Map the current process to a platform package suffix.
 const PLATFORMS = {
@@ -44,25 +44,38 @@ function resolveBinary() {
   return null;
 }
 
+// Find a `legion` binary on PATH that is NOT this wrapper. A global npm
+// install puts a `legion` shim on PATH that symlinks right back to run.js;
+// spawning it would recurse until the kernel refuses with EAGAIN.
+function findOnPath() {
+  const self = realpathSync(__filename);
+  const exe = process.platform === "win32" ? "legion.exe" : "legion";
+  for (const dir of (process.env.PATH || "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, exe);
+    if (!existsSync(candidate)) continue;
+    let real;
+    try {
+      real = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    if (real === self) continue; // the npm shim pointing back at us
+    return candidate;
+  }
+  return null;
+}
+
 function main() {
-  let bin = resolveBinary();
   const args = process.argv.slice(2);
+  const bin = resolveBinary() ?? findOnPath();
 
   if (!bin) {
-    // Fall back to a `legion` on PATH (e.g. installed via cargo/brew).
-    const child = spawn("legion", args, { stdio: "inherit" });
-    child.on("error", (err) => {
-      if (err.code === "ENOENT") {
-        console.error(
-          "legion: no platform binary installed and `legion` not found on PATH.\n" +
-            "Install via Homebrew (`brew install dawnswwwww/tap/legion`) or Cargo (`cargo install legion-cli`).",
-        );
-        process.exit(127);
-      }
-      throw err;
-    });
-    child.on("exit", (code) => process.exit(code ?? 1));
-    return;
+    console.error(
+      "legion: no platform binary installed and `legion` not found on PATH.\n" +
+        "Reinstall (`npm i -g @uselegion/cli`) or use Homebrew (`brew install dawnswwwww/tap/legion`) or Cargo (`cargo install uselegion-cli`).",
+    );
+    process.exit(127);
   }
 
   const child = spawn(bin, args, { stdio: "inherit" });
